@@ -1,0 +1,48 @@
+# Copyright 2023 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:enforce_glob.bzl", "enforce_glob")
+load("//build_tools/bazel:iree_lit_test.bzl", "iree_lit_test_suite")
+
+package(
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_lit_test_suite(
+    name = "lit",
+    srcs = enforce_glob(
+        [
+            "cleanup_numeric_narrowing.mlir",
+            "conv1x1_to_matmul.mlir",
+            "data_layout_propagation.mlir",
+            "demote_contraction_inputs_to_bf16.mlir",
+            "detach_elementwise_from_named_ops.mlir",
+            "expand_tensor_shapes.mlir",
+            "fuse_dequantization_matmul.mlir",
+            "generalize_named_ops.mlir",
+            "global_loop_invariant_code_motion.mlir",
+            "hoist_into_globals.mlir",
+            "infer_numeric_narrowing.mlir",
+            "linalg_quantized_conv_to_conv.mlir",
+            "linalg_quantized_matmul_to_matmul.mlir",
+            "optimize_numerics.mlir",
+            "propagate_linalg_transpose.mlir",
+            "raise_special_ops.mlir",
+            "remove_zero_extent_tensors.mlir",
+            "strided_contraction_to_contraction.mlir",
+            "transformation_pipeline.mlir",
+            "transpose_and_decompose_concat.mlir",
+            "warn_on_uninitialized_values.mlir",
+        ],
+        include = ["*.mlir"],
+    ),
+    cfg = "//compiler:lit.cfg.py",
+    tools = [
+        "//tools:iree-opt",
+        "@llvm-project//llvm:FileCheck",
+    ],
+)

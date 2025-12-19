@@ -1,0 +1,21 @@
+# Copyright 2019 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+package(default_visibility = ["//visibility:public"])
+
+# Exports all headers, including C function prototypes. Useful if statically
+# linking against the Vulkan SDK.
+# Not all headers are hermetic, so they are just included as textual
+# headers to disable additional validation.
+cc_library(
+    name = "vulkan_headers",
+    hdrs = glob([
+        "include/vk_video/*.h",
+        "include/vulkan/*.h",
+    ]),
+    include_prefix = "third_party/vulkan_headers",
+    includes = ["include"],
+)

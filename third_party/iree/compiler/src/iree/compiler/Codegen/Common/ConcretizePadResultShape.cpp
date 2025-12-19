@@ -1,0 +1,179 @@
+// Copyright 2022 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
+#include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#define DEBUG_TYPE "iree-codegen-concretize-pad-result-shape"
+
+namespace mlir::iree_compiler {
+
+#define GEN_PASS_DEF_CONCRETIZEPADRESULTSHAPEPASS
+#include "iree/compiler/Codegen/Common/Passes.h.inc"
+
+/// Gets the given `attrOrValue` as an index value by creating constant ops
+/// for attributes.
+static Value getAsIndexValue(OpFoldResult attrOrValue, OpBuilder &builder,
+                             Location loc) {
+  IntegerAttr attr;
+  if (Value val = dyn_cast<Value>(attrOrValue)) {
+    if (val.getType().isIndex())
+      return val;
+    matchPattern(val, m_Constant(&attr));
+  } else {
+    attr = cast<IntegerAttr>(cast<Attribute>(attrOrValue));
+  }
+  return builder.createOrFold<arith::ConstantIndexOp>(
+      loc, attr.getValue().getSExtValue());
+}
+
+namespace {
+
+/// Concretizes tensor.pad op's result shape if its source op implements
+/// OffsetSizeAndStrideOpInterface. For example, pad(extract_slice).
+struct ConcretizePadResultShape final : public OpRewritePattern<tensor::PadOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(tensor::PadOp padOp,
+                                PatternRewriter &rewriter) const override {
+    // If the result shape is already static, then nothing to do.
+    if (padOp.getResultType().hasStaticShape())
+      return failure();
+
+    int rank = padOp.getResultType().getRank();
+    SmallVector<int64_t> staticShape;
+    staticShape.reserve(rank);
+
+    auto sourceIfxOp = dyn_cast_if_present<OffsetSizeAndStrideOpInterface>(
+        padOp.getSource().getDefiningOp());
+    if (!sourceIfxOp)
+      return failure();
+
+    SmallVector<OpFoldResult> lowPad = padOp.getMixedLowPad();
+    SmallVector<OpFoldResult> source = sourceIfxOp.getMixedSizes();
+    SmallVector<OpFoldResult> highPad = padOp.getMixedHighPad();
+
+    MLIRContext *context = padOp.getContext();
+    Location loc = padOp.getLoc();
+
+    AffineExpr sym0, sym1, sym2;
+    bindSymbols(context, sym0, sym1, sym2);
+    auto addMap = AffineMap::get(0, 3, {sym0 + sym1 + sym2}, context);
+
+    for (int dimIndex = 0; dimIndex < rank; ++dimIndex) {
+      SmallVector<Value, 3> valueSizes = {
+          getAsIndexValue(lowPad[dimIndex], rewriter, loc),
+          getAsIndexValue(source[dimIndex], rewriter, loc),
+          getAsIndexValue(highPad[dimIndex], rewriter, loc)};
+
+      // The pad op's result shape is low padding + source size + high padding.
+      // Try to see if we can get a constant number by composing and
+      // canonicalizing the result. We use affine mechanisms here because
+      // generating arithmetic add ops over dim ops won't work, given they are
+      // SSA values that would need invoking other patterns to simplify. We
+      // cannot invoke patterns in patterns.
+      AffineMap map = addMap;
+      affine::fullyComposeAffineMapAndOperands(&map, &valueSizes);
+      affine::canonicalizeMapAndOperands(&map, &valueSizes);
+
+      auto cstExpr = dyn_cast<AffineConstantExpr>(map.getResult(0));
+      // Specially handle the case where we have both dimensions and symbols and
+      // they map to the same value, e.g.:
+      //   affine_map<(d0, s0) -> (d0 - s0 + 4)>(%v, %v).
+      // Due to the restrictions over dimensions and symbols, the above won't
+      // simplify. Try to change dimensions for symbols for such cases.
+      if (!cstExpr && llvm::all_equal(valueSizes)) {
+        int numDims = map.getNumDims();
+        int numSyms = map.getNumSymbols();
+        DenseMap<AffineExpr, AffineExpr> dimToSymMap;
+        for (int i = 0; i < numDims; ++i) {
+          dimToSymMap[rewriter.getAffineDimExpr(i)] =
+              rewriter.getAffineSymbolExpr(numSyms + i);
+        }
+        map = map.replace(dimToSymMap, /*numResultDims=*/0,
+                          /*numResultSyms=*/numDims + numSyms);
+
+        affine::canonicalizeMapAndOperands(&map, &valueSizes);
+        cstExpr = dyn_cast<AffineConstantExpr>(map.getResult(0));
+      }
+      if (!cstExpr)
+        return failure();
+
+      staticShape.push_back(cstExpr.getValue());
+    }
+
+    auto resultType = RankedTensorType::get(
+        staticShape, padOp.getResultType().getElementType(),
+        padOp.getResultType().getEncoding());
+
+    rewriter.modifyOpInPlace(padOp,
+                             [&]() { padOp.getResult().setType(resultType); });
+    return success();
+  }
+};
+
+class ConcretizePadResultShapePass final
+    : public impl::ConcretizePadResultShapePassBase<
+          ConcretizePadResultShapePass> {
+public:
+  void runOnOperation() override {
+    MLIRContext *context = &getContext();
+    mlir::FunctionOpInterface funcOp = getOperation();
+
+    ConfigTrackingListener listener;
+    GreedyRewriteConfig config;
+    config.setListener(&listener);
+
+    {
+      RewritePatternSet patterns(context);
+      populateConcretizePadResultShapePatterns(patterns);
+      if (failed(applyPatternsGreedily(funcOp, std::move(patterns), config))) {
+        return signalPassFailure();
+      }
+    }
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "--- After concretizing pad result shape and "
+                      "canonicalization ---\n";
+      funcOp.print(llvm::dbgs(), OpPrintingFlags().useLocalScope());
+      llvm::dbgs() << "\n\n";
+    });
+  }
+};
+
+} // namespace
+
+void populateConcretizePadResultShapePatterns(RewritePatternSet &patterns,
+                                              ArrayRef<int64_t> numWorkgroups) {
+  MLIRContext *context = patterns.getContext();
+  linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
+  // Pulling in upstream scf.for and affine.min canonicalization patterns.
+  // They work on tiled (but not distributed) loops.
+  scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+  // Pulling in iree_tensor_ext.dispatch.tensor.load op canonicalization
+  // patterns. Tiling can generate dim ops taking them as operands.
+  IREE::TensorExt::DispatchTensorLoadOp::getCanonicalizationPatterns(patterns,
+                                                                     context);
+  // Pull in tensor dialect canonicalization patterns to fold tensor.cast
+  // into producers when possible.
+  context->getLoadedDialect<tensor::TensorDialect>()
+      ->getCanonicalizationPatterns(patterns);
+  patterns.add<ConcretizePadResultShape>(context);
+}
+
+} // namespace mlir::iree_compiler

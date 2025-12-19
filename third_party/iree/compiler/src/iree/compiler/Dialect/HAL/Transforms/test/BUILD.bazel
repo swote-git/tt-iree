@@ -1,0 +1,61 @@
+# Copyright 2019 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:enforce_glob.bzl", "enforce_glob")
+load("//build_tools/bazel:iree_lit_test.bzl", "iree_lit_test_suite")
+
+package(
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_lit_test_suite(
+    name = "lit",
+    srcs = enforce_glob(
+        [
+            "annotate_target_devices.mlir",
+            "assign_legacy_target_devices.mlir",
+            "assign_target_devices.mlir",
+            "capture_executable_sources.mlir",
+            "convert_to_hal.mlir",
+            "dump_executable_benchmarks.mlir",
+            "dump_executable_sources.mlir",
+            "elide_redundant_commands.mlir",
+            "hoist_executable_objects.mlir",
+            "initialize_devices.mlir",
+            "inline_memoize_regions.mlir",
+            "materialize_dispatch_instrumentation.mlir",
+            "materialize_interfaces.mlir",
+            "materialize_resource_caches.mlir",
+            "materialize_target_devices.mlir",
+            "memoize_device_queries.mlir",
+            "memoize_device_selection.mlir",
+            "outline_memoize_regions.mlir",
+            "preprocess_executables.mlir",
+            "prune_executables.mlir",
+            "repeat_dispatches.mlir",
+            "resolve_device_aliases.mlir",
+            "resolve_device_promises.mlir",
+            "resolve_export_ordinals.mlir",
+            "resolve_ranked_shaped_type.mlir",
+            "resolve_topology_queries.mlir",
+            "strip_executable_contents.mlir",
+            "substitute_executables.mlir",
+            "verify_devices.mlir",
+        ],
+        include = ["*.mlir"],
+        exclude = ["substitute_executables_replacement.mlir"],
+    ),
+    cfg = "//compiler:lit.cfg.py",
+    data = [
+        "substitute_executables_replacement.mlir",
+        "substitute_executables_replacement.obj",
+    ],
+    tools = [
+        "//tools:iree-opt",
+        "@llvm-project//llvm:FileCheck",
+    ],
+)

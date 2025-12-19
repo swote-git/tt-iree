@@ -1,0 +1,46 @@
+# Copyright 2024 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:enforce_glob.bzl", "enforce_glob")
+load("//build_tools/bazel:iree_lit_test.bzl", "iree_lit_test_suite")
+
+package(
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_lit_test_suite(
+    name = "lit",
+    srcs = enforce_glob(
+        [
+            "conv2d_to_winograd.mlir",
+            "conv_to_im2col.mlir",
+            "convert_to_loops.mlir",
+            "convert_to_online_attention.mlir",
+            "decompose_aggregated_ops.mlir",
+            "decompose_aggregated_ops_filtered.mlir",
+            "decompose_aggregated_ops_invalid_bad_op_name.mlir",
+            "decompose_aggregated_ops_invalid_unimplemented_interface.mlir",
+            "decompose_aggregated_ops_noop.mlir",
+            "decompose_im2col.mlir",
+            "decompose_map_scatter.mlir",
+            "decompose_winograd.mlir",
+            "distribution.mlir",
+            "fold_unit_dims.mlir",
+            "pad_contraction_to_block_size.mlir",
+            "reshape_fusion.mlir",
+            "split_reduction.mlir",
+            "tiling.mlir",
+            "vectorize_iree_linalg_ext_ops.mlir",
+        ],
+        include = ["*.mlir"],
+    ),
+    cfg = "//compiler:lit.cfg.py",
+    tools = [
+        "//tools:iree-opt",
+        "@llvm-project//llvm:FileCheck",
+    ],
+)

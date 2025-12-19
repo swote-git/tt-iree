@@ -1,0 +1,32 @@
+{
+    "inputs": [
+        "1x4x128x128xf16"
+    ],
+    "function_run": "main",
+    "benchmark_flags": [
+        "--benchmark_repetitions=10",
+        "--benchmark_min_warmup_time=3.0",
+        "--device_allocator=caching"
+    ],
+    "golden_time_tolerance_multiplier": {
+        "mi250": 1.3,
+        "mi300": 1.1,
+        "mi308": 1.1
+    },
+    "device": "hip",
+    "golden_time_ms": {
+        "mi250": 260.0,
+        "mi300": 59.6,
+        "mi308": 66.0
+    },
+    "golden_dispatch": {
+        "mi250": 173,
+        "mi300": 173,
+        "mi308": 173
+    },
+    "golden_size": {
+        "mi250": 370000,
+        "mi300": 371000,
+        "mi308": 370000
+    }
+}

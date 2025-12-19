@@ -1,0 +1,1236 @@
+// Copyright 2024 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#ifndef IREE_DIALECT_HAL_IR_HAL_ATTRS
+#define IREE_DIALECT_HAL_IR_HAL_ATTRS
+
+include "iree/compiler/Dialect/HAL/IR/HALBase.td"
+include "iree/compiler/Dialect/HAL/IR/HALInterfaces.td"
+include "iree/compiler/Dialect/Stream/IR/StreamInterfaces.td"
+include "iree/compiler/Dialect/Util/IR/UtilInterfaces.td"
+include "iree/compiler/Dialect/Util/IR/UtilTypes.td"
+include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/BuiltinAttributeInterfaces.td"
+include "mlir/IR/EnumAttr.td"
+
+//===----------------------------------------------------------------------===//
+// General enums
+//===----------------------------------------------------------------------===//
+
+// Wrapper over base I32EnumAttr to set common fields for HAL enums.
+class HAL_I32Enum<string name, string description, list<I32EnumAttrCase> cases>
+    : I32EnumAttr<name, description, cases> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+class HAL_I32EnumAttr<string name, string description, string mnemonic,
+                      list<I32EnumAttrCase> cases>
+    : EnumAttr<HAL_Dialect, HAL_I32Enum<name, description, cases>, mnemonic> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
+class HAL_I64BitEnumAttr<string name, string summary, list<BitEnumAttrCaseBase> cases>
+    : I64BitEnumAttr<name, summary, cases> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+//===----------------------------------------------------------------------===//
+// Lifetime enum
+//===----------------------------------------------------------------------===//
+
+// Note: This is a copy from the Stream dialect.
+// Indicates a value whose lifetime is not yet analyzed.
+def HAL_Lifetime_Unknown : I32EnumAttrCase<"Unknown", 0, "*">;
+// An externally managed value.
+def HAL_Lifetime_External : I32EnumAttrCase<"External", 1, "external">;
+// A staging buffer for uploads/downloads.
+def HAL_Lifetime_Staging : I32EnumAttrCase<"Staging", 2, "staging">;
+// A short-lived value that is used across streams.
+def HAL_Lifetime_Transient : I32EnumAttrCase<"Transient", 3, "transient">;
+// A long-lived value that persists across streams.
+def HAL_Lifetime_Variable : I32EnumAttrCase<"Variable", 4, "variable">;
+// An immutable value that persist for the duration of the program.
+def HAL_Lifetime_Constant : I32EnumAttrCase<"Constant", 5, "constant">;
+def HAL_LifetimeAttr :
+    I32EnumAttr<"Lifetime", "IREE HAL value lifetime", [
+      HAL_Lifetime_Unknown,
+      HAL_Lifetime_External,
+      HAL_Lifetime_Staging,
+      HAL_Lifetime_Transient,
+      HAL_Lifetime_Variable,
+      HAL_Lifetime_Constant,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+//===----------------------------------------------------------------------===//
+// Access scope and memory enums
+//===----------------------------------------------------------------------===//
+
+def HAL_AccessScope_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_AccessScope_IndirectCommandRead : I32BitEnumAttrCase<"IndirectCommandRead", 0x0001>;
+def HAL_AccessScope_ConstantRead : I32BitEnumAttrCase<"ConstantRead", 0x0002>;
+def HAL_AccessScope_DispatchRead : I32BitEnumAttrCase<"DispatchRead", 0x0004>;
+def HAL_AccessScope_DispatchWrite : I32BitEnumAttrCase<"DispatchWrite", 0x0008>;
+def HAL_AccessScope_TransferRead : I32BitEnumAttrCase<"TransferRead", 0x0010>;
+def HAL_AccessScope_TransferWrite : I32BitEnumAttrCase<"TransferWrite", 0x0020>;
+def HAL_AccessScope_HostRead : I32BitEnumAttrCase<"HostRead", 0x0040>;
+def HAL_AccessScope_HostWrite : I32BitEnumAttrCase<"HostWrite", 0x0080>;
+def HAL_AccessScope_MemoryRead : I32BitEnumAttrCase<"MemoryRead", 0x0100>;
+def HAL_AccessScope_MemoryWrite : I32BitEnumAttrCase<"MemoryWrite", 0x0200>;
+def HAL_AccessScopeBitfieldAttr :
+    I32BitEnumAttr<"AccessScopeBitfield", "valid AccessScope", [
+      HAL_AccessScope_None,
+      HAL_AccessScope_IndirectCommandRead,
+      HAL_AccessScope_ConstantRead,
+      HAL_AccessScope_DispatchRead,
+      HAL_AccessScope_DispatchWrite,
+      HAL_AccessScope_TransferRead,
+      HAL_AccessScope_TransferWrite,
+      HAL_AccessScope_HostRead,
+      HAL_AccessScope_HostWrite,
+      HAL_AccessScope_MemoryRead,
+      HAL_AccessScope_MemoryWrite
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_AllocaFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_AllocaFlag_IndeterminateLifetime : I64BitEnumAttrCase<"IndeterminateLifetime", 0x0001>;
+def HAL_AllocaFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"AllocaFlagBitfield", "valid AllocaFlag", [
+      HAL_AllocaFlag_None,
+      HAL_AllocaFlag_IndeterminateLifetime,
+    ]>;
+
+def HAL_BufferUsage_None                         : I32BitEnumAttrCase<"None",                         0x00000000>;
+def HAL_BufferUsage_TransferSource               : I32BitEnumAttrCase<"TransferSource",               0x00000001>;
+def HAL_BufferUsage_TransferTarget               : I32BitEnumAttrCase<"TransferTarget",               0x00000002>;
+def HAL_BufferUsage_Transfer                     : I32BitEnumAttrCase<"Transfer",                     0x00000003>;
+def HAL_BufferUsage_DispatchIndirectParameters   : I32BitEnumAttrCase<"DispatchIndirectParameters",   0x00000100>;
+def HAL_BufferUsage_DispatchUniformRead          : I32BitEnumAttrCase<"DispatchUniformRead",          0x00000200>;
+def HAL_BufferUsage_DispatchStorageRead          : I32BitEnumAttrCase<"DispatchStorageRead",          0x00000400>;
+def HAL_BufferUsage_DispatchStorageWrite         : I32BitEnumAttrCase<"DispatchStorageWrite",         0x00000800>;
+def HAL_BufferUsage_DispatchStorage              : I32BitEnumAttrCase<"DispatchStorage",              0x00000C00>;
+def HAL_BufferUsage_DispatchImageRead            : I32BitEnumAttrCase<"DispatchImageRead",            0x00001000>;
+def HAL_BufferUsage_DispatchImageWrite           : I32BitEnumAttrCase<"DispatchImageWrite",           0x00002000>;
+def HAL_BufferUsage_DispatchImage                : I32BitEnumAttrCase<"DispatchImage",                0x00003000>;
+def HAL_BufferUsage_SharingExport                : I32BitEnumAttrCase<"SharingExport",                0x00010000>;
+def HAL_BufferUsage_SharingReplicate             : I32BitEnumAttrCase<"SharingReplicate",             0x00020000>;
+def HAL_BufferUsage_SharingConcurrent            : I32BitEnumAttrCase<"SharingConcurrent",            0x00040000>;
+def HAL_BufferUsage_SharingImmutable             : I32BitEnumAttrCase<"SharingImmutable",             0x00080000>;
+def HAL_BufferUsage_MappingScoped                : I32BitEnumAttrCase<"MappingScoped",                0x01000000>;
+def HAL_BufferUsage_MappingPersistent            : I32BitEnumAttrCase<"MappingPersistent",            0x02000000>;
+def HAL_BufferUsage_MappingOptional              : I32BitEnumAttrCase<"MappingOptional",              0x04000000>;
+def HAL_BufferUsage_MappingAccessRandom          : I32BitEnumAttrCase<"MappingAccessRandom",          0x08000000>;
+def HAL_BufferUsage_MappingAccessSequentialWrite : I32BitEnumAttrCase<"MappingAccessSequentialWrite", 0x10000000>;
+def HAL_BufferUsage_Mapping                      : I32BitEnumAttrCase<"Mapping",                      0x09000000>;
+def HAL_BufferUsageBitfieldAttr :
+    I32BitEnumAttr<"BufferUsageBitfield", "valid BufferUsage", [
+      HAL_BufferUsage_None,
+      HAL_BufferUsage_TransferSource,
+      HAL_BufferUsage_TransferTarget,
+      HAL_BufferUsage_Transfer,
+      HAL_BufferUsage_DispatchIndirectParameters,
+      HAL_BufferUsage_DispatchUniformRead,
+      HAL_BufferUsage_DispatchStorageRead,
+      HAL_BufferUsage_DispatchStorageWrite,
+      HAL_BufferUsage_DispatchStorage,
+      HAL_BufferUsage_DispatchImageRead,
+      HAL_BufferUsage_DispatchImageWrite,
+      HAL_BufferUsage_DispatchImage,
+      HAL_BufferUsage_SharingExport,
+      HAL_BufferUsage_SharingReplicate,
+      HAL_BufferUsage_SharingConcurrent,
+      HAL_BufferUsage_SharingImmutable,
+      HAL_BufferUsage_MappingScoped,
+      HAL_BufferUsage_MappingPersistent,
+      HAL_BufferUsage_MappingOptional,
+      HAL_BufferUsage_MappingAccessRandom,
+      HAL_BufferUsage_MappingAccessSequentialWrite,
+      HAL_BufferUsage_Mapping,
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CallingConvention_Default : I32EnumAttrCase<"Default", 0>;
+def HAL_CallingConventionAttr :
+    I32EnumAttr<
+        "CallingConvention",
+        "Calling conversions for linked functions",[
+          HAL_CallingConvention_Default,
+        ]>{
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_ExecutionModel_Synchronous : I32EnumAttrCase<"Synchronous", 0, "synchronous">;
+def HAL_ExecutionModel_CoarseFences : I32EnumAttrCase<"CoarseFences", 1, "coarse_fences">;
+def HAL_ExecutionModelAttr :
+    I32EnumAttr<
+      "ExecutionModel",
+      "Execution model for function invocation", [
+        HAL_ExecutionModel_Synchronous,
+        HAL_ExecutionModel_CoarseFences,
+      ]>{
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_ChannelFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_ChannelFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_ChannelFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"ChannelFlagBitfield", "valid ChannelFlag", [
+      HAL_ChannelFlag_None,
+      HAL_ChannelFlag_Reserved,
+    ]>;
+
+def HAL_CommandBufferMode_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_CommandBufferMode_OneShot : I32BitEnumAttrCase<"OneShot", 0x0001>;
+def HAL_CommandBufferMode_AllowInlineExecution : I32BitEnumAttrCase<"AllowInlineExecution", 0x0010>;
+def HAL_CommandBufferModeBitfieldAttr :
+    I32BitEnumAttr<"CommandBufferModeBitfield", "valid CommandBufferMode", [
+      HAL_CommandBufferMode_None,
+      HAL_CommandBufferMode_OneShot,
+      HAL_CommandBufferMode_AllowInlineExecution,
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CommandCategory_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_CommandCategory_Transfer : I32BitEnumAttrCase<"Transfer", 0x0001>;
+def HAL_CommandCategory_Dispatch : I32BitEnumAttrCase<"Dispatch", 0x0002>;
+def HAL_CommandCategoryBitfieldAttr :
+    I32BitEnumAttr<"CommandCategoryBitfield", "valid CommandCategory", [
+      HAL_CommandCategory_None,
+      HAL_CommandCategory_Transfer,
+      HAL_CommandCategory_Dispatch,
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CopyFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_CopyFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_CopyFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"CopyFlagBitfield", "valid CopyFlag", [
+      HAL_CopyFlag_None,
+      HAL_CopyFlag_Reserved,
+    ]>;
+
+def HAL_DeallocaFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_DeallocaFlag_PreferOrigin : I64BitEnumAttrCase<"PreferOrigin", 0x0001>;
+def HAL_DeallocaFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"DeallocaFlagBitfield", "valid DeallocaFlag", [
+      HAL_DeallocaFlag_None,
+      HAL_DeallocaFlag_PreferOrigin,
+    ]>;
+
+def HAL_DescriptorType_UniformBuffer : I32EnumAttrCase<"UniformBuffer", 6, "uniform_buffer">;
+def HAL_DescriptorType_StorageBuffer : I32EnumAttrCase<"StorageBuffer", 7, "storage_buffer">;
+def HAL_DescriptorTypeAttr :
+    HAL_I32EnumAttr<"DescriptorType", "valid DescriptorType", "descriptor_type", [
+      HAL_DescriptorType_UniformBuffer,
+      HAL_DescriptorType_StorageBuffer,
+    ]>;
+
+def HAL_DescriptorFlags_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_DescriptorFlags_ReadOnly : I32BitEnumAttrCase<"ReadOnly", 0x0001>;
+def HAL_DescriptorFlags_Indirect : I32BitEnumAttrCase<"Indirect", 0x0002>;
+def HAL_DescriptorFlagsAttr :
+    I32BitEnumAttr<"DescriptorFlags", "valid Descriptor flags", [
+      HAL_DescriptorFlags_None,
+      HAL_DescriptorFlags_ReadOnly,
+      HAL_DescriptorFlags_Indirect,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_DispatchFlags_None : I64BitEnumAttrCase<"None", 0x0000>;
+// HACK: workaround tblgen bug on enums that only have a None value. This can be
+// repurposed for any use in the future as the runtime does not know about it.
+def HAL_DispatchFlags_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_DispatchFlagsAttr :
+    HAL_I64BitEnumAttr<"DispatchFlags", "valid dispatch flags", [
+      HAL_DispatchFlags_None,
+      HAL_DispatchFlags_Reserved,
+    ]>;
+
+def HAL_ExecuteFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_ExecuteFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_ExecuteFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"ExecuteFlagBitfield", "valid ExecuteFlag", [
+      HAL_ExecuteFlag_None,
+      HAL_ExecuteFlag_Reserved,
+    ]>;
+
+def HAL_ExecutionStage_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_ExecutionStage_CommandIssue : I32BitEnumAttrCase<"CommandIssue", 0x0001>;
+def HAL_ExecutionStage_CommandProcess : I32BitEnumAttrCase<"CommandProcess", 0x0002>;
+def HAL_ExecutionStage_Dispatch : I32BitEnumAttrCase<"Dispatch", 0x0004>;
+def HAL_ExecutionStage_Transfer : I32BitEnumAttrCase<"Transfer", 0x0008>;
+def HAL_ExecutionStage_CommandRetire : I32BitEnumAttrCase<"CommandRetire", 0x0010>;
+def HAL_ExecutionStage_Host : I32BitEnumAttrCase<"Host", 0x0020>;
+def HAL_ExecutionStageBitfieldAttr :
+    I32BitEnumAttr<"ExecutionStageBitfield", "valid ExecutionStage", [
+      HAL_ExecutionStage_None,
+      HAL_ExecutionStage_CommandIssue,
+      HAL_ExecutionStage_CommandProcess,
+      HAL_ExecutionStage_Dispatch,
+      HAL_ExecutionStage_Transfer,
+      HAL_ExecutionStage_CommandRetire,
+      HAL_ExecutionStage_Host
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_ExecutionBarrierFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_ExecutionBarrierFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_ExecutionBarrierFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"ExecutionBarrierFlagBitfield", "valid ExecutionBarrierFlag", [
+      HAL_ExecutionBarrierFlag_None,
+      HAL_ExecutionBarrierFlag_Reserved,
+    ]>;
+
+def HAL_FenceFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_FenceFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_FenceFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"FenceFlagBitfield", "valid FenceFlag", [
+      HAL_FenceFlag_None,
+      HAL_FenceFlag_Reserved,
+    ]>;
+
+def HAL_FillFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_FillFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_FillFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"FillFlagBitfield", "valid FillFlag", [
+      HAL_FillFlag_None,
+      HAL_FillFlag_Reserved,
+    ]>;
+
+def HAL_MemoryAccess_None                        : I32BitEnumAttrCase<"None",                         0x00000000>;
+def HAL_MemoryAccess_Read                        : I32BitEnumAttrCase<"Read",                         0x00000001>;
+def HAL_MemoryAccess_Write                       : I32BitEnumAttrCase<"Write",                        0x00000002>;
+def HAL_MemoryAccess_Discard                     : I32BitEnumAttrCase<"Discard",                      0x00000004>;
+def HAL_MemoryAccess_MayAlias                    : I32BitEnumAttrCase<"MayAlias",                     0x00000008>;
+def HAL_MemoryAccess_Unaligned                   : I32BitEnumAttrCase<"Unaligned",                    0x00000010>;
+def HAL_MemoryAccess_Any                         : I32BitEnumAttrCase<"Any",                          0x00000020>;
+def HAL_MemoryAccessBitfieldAttr :
+    I32BitEnumAttr<"MemoryAccessBitfield", "valid MemoryAccess", [
+      HAL_MemoryAccess_None,
+      HAL_MemoryAccess_Read,
+      HAL_MemoryAccess_Write,
+      HAL_MemoryAccess_Discard,
+      HAL_MemoryAccess_MayAlias,
+      HAL_MemoryAccess_Unaligned,
+      HAL_MemoryAccess_Any,
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_MemoryModel_Unified : I32EnumAttrCase<"Unified", 0>;
+def HAL_MemoryModel_Discrete : I32EnumAttrCase<"Discrete", 1>;
+def HAL_MemoryModelAttr :
+    I32EnumAttr<"MemoryModel", "IREE HAL MemoryModel", [
+      HAL_MemoryModel_Unified,
+      HAL_MemoryModel_Discrete,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_MemoryType_None             : I32BitEnumAttrCase<"None",             0x0000>;  // ?
+def HAL_MemoryType_Optimal          : I32BitEnumAttrCase<"Optimal",          0x0001>;  // !
+def HAL_MemoryType_HostVisible      : I32BitEnumAttrCase<"HostVisible",      0x0002>;  // h
+def HAL_MemoryType_HostCoherent     : I32BitEnumAttrCase<"HostCoherent",     0x0004>;  // c
+def HAL_MemoryType_HostCached       : I32BitEnumAttrCase<"HostCached",       0x0008>;  // C
+def HAL_MemoryType_HostLocal        : I32BitEnumAttrCase<"HostLocal",        0x0046>;  // H
+def HAL_MemoryType_DeviceVisible    : I32BitEnumAttrCase<"DeviceVisible",    0x0010>;  // d
+def HAL_MemoryType_DeviceLocal      : I32BitEnumAttrCase<"DeviceLocal",      0x0030>;  // D
+def HAL_MemoryTypeBitfieldAttr :
+    I32BitEnumAttr<"MemoryTypeBitfield", "valid MemoryType", [
+      HAL_MemoryType_None,
+      HAL_MemoryType_Optimal,
+      HAL_MemoryType_HostVisible,
+      HAL_MemoryType_HostCoherent,
+      HAL_MemoryType_HostCached,
+      HAL_MemoryType_HostLocal,
+      HAL_MemoryType_DeviceVisible,
+      HAL_MemoryType_DeviceLocal,
+    ]> {
+  let cppNamespace = "mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_PipelineLayoutFlags_None : I32BitEnumAttrCase<"None", 0x0000>;
+def HAL_PipelineLayoutFlags_Indirect : I32BitEnumAttrCase<"Indirect", 0x0001>;
+def HAL_PipelineLayoutFlagsAttr :
+    I32BitEnumAttr<"PipelineLayoutFlags", "valid PipelineLayout flags", [
+      HAL_PipelineLayoutFlags_None,
+      HAL_PipelineLayoutFlags_Indirect,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_ReadFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_ReadFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_ReadFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"ReadFlagBitfield", "valid ReadFlag", [
+      HAL_ReadFlag_None,
+      HAL_ReadFlag_Reserved,
+    ]>;
+
+def HAL_UpdateFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_UpdateFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_UpdateFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"UpdateFlagBitfield", "valid UpdateFlag", [
+      HAL_UpdateFlag_None,
+      HAL_UpdateFlag_Reserved,
+    ]>;
+
+def HAL_WaitFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_WaitFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_WaitFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"WaitFlagBitfield", "valid WaitFlag", [
+      HAL_WaitFlag_None,
+      HAL_WaitFlag_Reserved,
+    ]>;
+
+def HAL_WriteFlag_None : I64BitEnumAttrCase<"None", 0x0000>;
+def HAL_WriteFlag_Reserved : I64BitEnumAttrCase<"Reserved", 0x0001>;
+def HAL_WriteFlagBitfieldAttr :
+    HAL_I64BitEnumAttr<"WriteFlagBitfield", "valid WriteFlag", [
+      HAL_WriteFlag_None,
+      HAL_WriteFlag_Reserved,
+    ]>;
+
+//===----------------------------------------------------------------------===//
+// #hal.abi.convention<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_ABIConventionAttr : HAL_AttrDef<"ABIConvention", [
+  Util_CallAnnotationAttrInterface,
+]> {
+  let mnemonic = "abi.convention";
+  let summary = "ABI calling convention for cross-module host functions.";
+  let description = [{
+    Specifies the ABI calling convention and execution model for functions
+    that cross host module boundaries (imports/exports). This determines:
+    * Whether fences are added for async execution (coarse-fences)
+    * How the function participates in timeline scheduling
+    * Marshaling behavior at ABI boundaries
+  }];
+
+  let parameters = (ins
+    AttrParameter<"ExecutionModel", "">:$executionModel
+  );
+
+  let assemblyFormat = "`<` $executionModel `>`";
+
+  let extraClassDeclaration = [{
+    // Ensures call sites are annotated with this attribute so we can control
+    // local optimizations.
+    bool shouldPropagateToCallSite() const { return true; }
+
+    // Returns the execution model of a call-like operation.
+    // Returns `Synchronous` if the attribute is not present.
+    static ExecutionModel lookupExecutionModel(Operation *op) {
+      auto attr = op->getAttrOfType<ABIConventionAttr>("hal.abi.convention");
+      return attr ? attr.getExecutionModel() : ExecutionModel::Synchronous;
+    }
+
+    // Set the ABI convention attribute on an operation.
+    static void setExecutionModel(Operation *op, ExecutionModel model) {
+      op->setAttr("hal.abi.convention", get(op->getContext(), model));
+    }
+  }];
+
+  let builders = [
+    AttrBuilder<(ins), [{
+      return $_get($_ctxt, HAL::ExecutionModel::Synchronous);
+    }]>,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.collective<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_CollectiveKind_AllGather : I32EnumAttrCase<"AllGather", 0, "all_gather">;
+def HAL_CollectiveKind_AllReduce : I32EnumAttrCase<"AllReduce", 1, "all_reduce">;
+def HAL_CollectiveKind_AllToAll : I32EnumAttrCase<"AllToAll", 2, "all_to_all">;
+def HAL_CollectiveKind_Broadcast : I32EnumAttrCase<"Broadcast", 3, "broadcast">;
+def HAL_CollectiveKind_Reduce : I32EnumAttrCase<"Reduce", 4, "reduce">;
+def HAL_CollectiveKind_ReduceScatter : I32EnumAttrCase<"ReduceScatter", 5, "reduce_scatter">;
+def HAL_CollectiveKind_Send : I32EnumAttrCase<"Send", 6, "send">;
+def HAL_CollectiveKind_Recv : I32EnumAttrCase<"Recv", 7, "recv">;
+def HAL_CollectiveKind_SendRecv: I32EnumAttrCase<"SendRecv", 8, "send_recv">;
+def HAL_CollectiveKindAttr :
+    I32EnumAttr<"CollectiveKind", "valid CollectiveKind", [
+      HAL_CollectiveKind_AllGather,
+      HAL_CollectiveKind_AllReduce,
+      HAL_CollectiveKind_AllToAll,
+      HAL_CollectiveKind_Broadcast,
+      HAL_CollectiveKind_Reduce,
+      HAL_CollectiveKind_ReduceScatter,
+      HAL_CollectiveKind_Send,
+      HAL_CollectiveKind_Recv,
+      HAL_CollectiveKind_SendRecv,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CollectiveReductionOp_None : I32EnumAttrCase<"None", 0, "none">;
+def HAL_CollectiveReductionOp_ReductionSum : I32EnumAttrCase<"ReductionSum", 1, "sum">;
+def HAL_CollectiveReductionOp_ReductionProduct : I32EnumAttrCase<"ReductionProduct", 2, "product">;
+def HAL_CollectiveReductionOp_ReductionMinimum : I32EnumAttrCase<"ReductionMinimum", 3, "minimum">;
+def HAL_CollectiveReductionOp_ReductionMaximum : I32EnumAttrCase<"ReductionMaximum", 4, "maximum">;
+def HAL_CollectiveReductionOp_ReductionAverage : I32EnumAttrCase<"ReductionAverage", 5, "average">;
+def HAL_CollectiveReductionOpAttr :
+    I32EnumAttr<"CollectiveReductionOp", "valid CollectiveReductionOp", [
+      HAL_CollectiveReductionOp_None,
+      HAL_CollectiveReductionOp_ReductionSum,
+      HAL_CollectiveReductionOp_ReductionProduct,
+      HAL_CollectiveReductionOp_ReductionMinimum,
+      HAL_CollectiveReductionOp_ReductionMaximum,
+      HAL_CollectiveReductionOp_ReductionAverage,
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CollectiveElementType_Sint8 : I32EnumAttrCase<"Sint8", 0, "si8">;
+def HAL_CollectiveElementType_Uint8 : I32EnumAttrCase<"Uint8", 1, "ui8">;
+def HAL_CollectiveElementType_Sint16 : I32EnumAttrCase<"Sint16", 2, "si16">;
+def HAL_CollectiveElementType_Uint16 : I32EnumAttrCase<"Uint16", 3, "ui16">;
+def HAL_CollectiveElementType_Sint32 : I32EnumAttrCase<"Sint32", 4, "si32">;
+def HAL_CollectiveElementType_Uint32 : I32EnumAttrCase<"Uint32", 5, "ui32">;
+def HAL_CollectiveElementType_Sint64 : I32EnumAttrCase<"Sint64", 6, "si64">;
+def HAL_CollectiveElementType_Uint64 : I32EnumAttrCase<"Uint64", 7, "ui64">;
+def HAL_CollectiveElementType_Float16 : I32EnumAttrCase<"Float16", 8, "f16">;
+def HAL_CollectiveElementType_Float32 : I32EnumAttrCase<"Float32", 9, "f32">;
+def HAL_CollectiveElementType_Float64 : I32EnumAttrCase<"Float64", 10, "f64">;
+def HAL_CollectiveElementType_BFloat16 : I32EnumAttrCase<"BFloat16", 11, "bf16">;
+def HAL_CollectiveElementType_Float8E5M2 : I32EnumAttrCase<"Float8E5M2", 12, "f8E5M2">;
+def HAL_CollectiveElementType_Float8E4M3FN : I32EnumAttrCase<"Float8E4M3FN", 13, "f8E4M3FN">;
+def HAL_CollectiveElementType_Float8E5M2FNUZ : I32EnumAttrCase<"Float8E5M2FNUZ", 14, "f8E5M2FNUZ">;
+def HAL_CollectiveElementType_Float8E4M3FNUZ : I32EnumAttrCase<"Float8E4M3FNUZ", 15, "f8E4M3FNUZ">;
+
+def HAL_CollectiveElementTypeAttr :
+    I32EnumAttr<"CollectiveElementType", "valid CollectiveElementType", [
+      HAL_CollectiveElementType_Sint8,
+      HAL_CollectiveElementType_Uint8,
+      HAL_CollectiveElementType_Sint16,
+      HAL_CollectiveElementType_Uint16,
+      HAL_CollectiveElementType_Sint32,
+      HAL_CollectiveElementType_Uint32,
+      HAL_CollectiveElementType_Sint64,
+      HAL_CollectiveElementType_Uint64,
+      HAL_CollectiveElementType_Float16,
+      HAL_CollectiveElementType_Float32,
+      HAL_CollectiveElementType_Float64,
+      HAL_CollectiveElementType_BFloat16,
+      HAL_CollectiveElementType_Float8E5M2,
+      HAL_CollectiveElementType_Float8E4M3FN,
+      HAL_CollectiveElementType_Float8E5M2FNUZ,
+      HAL_CollectiveElementType_Float8E4M3FNUZ
+    ]> {
+  let cppNamespace = "::mlir::iree_compiler::IREE::HAL";
+}
+
+def HAL_CollectiveAttr : HAL_AttrDef<"Collective"> {
+  let mnemonic = "collective";
+  let summary = [{Collective operation and specification.}];
+  let description = [{
+    Specifies the collective operation to perform and any mode bits required.
+  }];
+  let parameters = (ins
+    AttrParameter<"CollectiveKind", "">:$kind,
+    OptionalParameter<"std::optional<CollectiveReductionOp>">:$reduction,
+    AttrParameter<"CollectiveElementType", "">:$element_type
+  );
+  let assemblyFormat = [{
+    `<` $kind (`with` $reduction^)? `:` $element_type `>`
+  }];
+  let extraClassDeclaration = [{
+    // Returns the runtime encoding of the collective attribute.
+    uint32_t getEncodedValue() const;
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// hal.pipeline.binding<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_PipelineBindingAttr : HAL_AttrDef<"PipelineBinding"> {
+  let mnemonic = "pipeline.binding";
+  let summary = [{Pipeline binding specification.}];
+  let description = [{
+    Specifies a single binding within a pipeline layout.
+  }];
+  let parameters = (ins
+    AttrParameter<"DescriptorType", "">:$type,
+    OptionalParameter<"DescriptorFlags", "DescriptorFlags::None">:$flags
+  );
+  let assemblyFormat = [{
+    `<` $type (`,` $flags^)? `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// hal.pipeline.layout<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_PipelineLayoutAttr : HAL_AttrDef<"PipelineLayout"> {
+  let mnemonic = "pipeline.layout";
+  let summary = [{Executable entry point layout specification.}];
+  let description = [{
+    Specifies the layout information used for interacting with executable
+    functions. This allows host code to correctly map parameters to the
+    lower-level target-specific argument passing behavior.
+  }];
+  let parameters = (ins
+    OptionalArrayRefParameter<"PipelineBindingAttr", "">:$bindings,
+    OptionalParameter<"int64_t", "0">:$constants,
+    OptionalParameter<"std::optional<PipelineLayoutFlags>">:$flags
+  );
+  let assemblyFormat = [{
+    `<`
+    (`constants` `=` $constants^ `,` ` `)?
+    `bindings` `=` `[` (`]`) : (qualified($bindings)^ `]`)?
+    (`,` `flags` `=` $flags^)?
+    `>`
+  }];
+  let extraClassDeclaration = [{
+    IREE::HAL::PipelineBindingAttr getBinding(int64_t ordinal) const;
+    IREE::HAL::PipelineBindingAttr getBinding(APInt ordinal) const {
+      return getBinding(ordinal.getSExtValue());
+    }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.executable.target<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_ExecutableTargetAttr : HAL_AttrDef<"ExecutableTarget"> {
+  let mnemonic = "executable.target";
+  let summary = [{Generic executable target specification.}];
+  let description = [{
+    Specifies how to compile an executable for a specific target backend.
+    A backend is used to translate and serialize the executable into the final
+    form passed to the runtime. The format of the executable is a
+    target-specific value indicating the required runtime support to load the
+    deployed artifact. An optionally provided configuration dictionary overrides
+    backend-specific defaults.
+
+    Example:
+    ```mlir
+      // Produce a system-native ELF for x86-64 systems using the LLVM backend:
+      #hal.executable.target<"llvm-cpu", "system-elf-x86_64", {
+        triple = "x86_64-unknown-linux-elf",
+        cpu = "host",
+        cpu_features = "host",
+        abi = "lp32",
+        ...
+      }>
+    ```
+
+    The same compilation backend may be used to translate executables for
+    several different runtime devices. Likewise the same runtime device may use
+    one of many different executable targets. Assume an N:M mapping between the
+    two in all cases.
+  }];
+
+  let parameters = (ins
+    AttrParameter<"StringAttr", "">:$backend,
+    AttrParameter<"StringAttr", "">:$format,
+    AttrParameter<"DictionaryAttr", "">:$configuration
+  );
+
+  let builders = [
+    AttrBuilder<(ins "StringRef":$backend, "StringRef":$format)>,
+  ];
+
+  let extraClassDeclaration = [{
+    // Returns a symbol-compatible name that pseudo-uniquely identifies this
+    // target. Callers must perform deduplication when required.
+    std::string getSymbolNameFragment() const;
+
+    // Returns true if there's an attribute with the given name in the
+    // configuration dictionary.
+    bool hasConfigurationAttr(StringRef name);
+
+    // Returns true if this attribute is a generic version of |specificAttr|.
+    // A more generic version will match with many specific versions.
+    bool isGenericOf(IREE::HAL::ExecutableTargetAttr specificAttr);
+
+    // Returns the executable target configuration for the given operation.
+    // This will recursively walk parent operations until one with the
+    // `hal.executable.target` attribute is found or a `hal.executable.variant`
+    // specifies a value. Returns nullptr if no target specification can be found.
+    //
+    // If present, sets |annotationSite| to the operation where the target
+    // configuration was found.
+    static IREE::HAL::ExecutableTargetAttr lookup(Operation *op, Operation **annotationSite = nullptr);
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.executable.object<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_ExecutableObjectAttr : HAL_AttrDef<"ExecutableObject"> {
+  let mnemonic = "executable.object";
+  let summary = [{Object file reference.}];
+  let description = [{
+    Defines an object file that can be linked into executables.
+    Today this is only supported for external file references with paths the
+    compiler can successfully resolve from its current working directory.
+    Inlined data can optionally be provided to avoid the need for file system
+    access and ensure the data source is attached to the IR as it makes its way
+    through multiple compiler stages or reproducers.
+
+    Future revisions may change this to an interface that allows both internal
+    and external resources to define the object contents. Linking needs to be
+    updated to support various object compositions and certain backends may
+    require additional infrastructure support.
+
+    In the long term the goal is to allow combinations of declared objects and
+    generated code in order to give control of linking behavior to frontends.
+    Instead of needing global command line flags to link in additional blobs
+    the frontend can emit executables with the dependencies already defined per
+    variant without needing to reach into the IREE compiler code.
+
+    Example:
+    ```mlir
+    #hal.executable.object<{path = "some/file.obj"}>
+    #hal.executable.object<{
+      path = "some/embedded/file.obj",
+      data = dense<[...]> : vector<2048xi8>
+    }>
+    ```
+  }];
+
+  let parameters = (ins
+    AttrParameter<"StringAttr", "">:$path,
+    OptionalParameter<"IREE::Util::SerializableAttrInterface", "">:$data
+  );
+
+  let hasCustomAssemblyFormat = 1;
+
+  let extraClassDeclaration = [{
+    // Returns a list of all objects with a path matching one of the provided
+    // file extensions.
+    static void filterObjects(
+        ArrayAttr objectAttrs, ArrayRef<StringRef> extensions,
+        SmallVectorImpl<ExecutableObjectAttr> &filteredAttrs);
+
+    // Returns the absolute path of the referenced object file if it exists.
+    FailureOr<std::string> getAbsolutePath();
+
+    // Returns the contents of the object file or None if loading failed.
+    // TODO(benvanik): better return type to support mapping/etc? eh
+    std::optional<std::string> loadData();
+  }];
+}
+
+def HAL_ExecutableObjectArrayAttr :
+    TypedArrayAttrBase<HAL_ExecutableObjectAttr,
+                       "HAL executable object references">;
+
+//===----------------------------------------------------------------------===//
+// #hal.executable.objects<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_ExecutableObjectsAttr : HAL_AttrDef<"ExecutableObjects"> {
+  let mnemonic = "executable.objects";
+  let summary = [{Target-specific object file references.}];
+  let description = [{
+    A dictionary mapping executable target specifications to a list of objects.
+    This is used to allow layers of the stack that support multi-targeting to
+    specify information used during lowering into each particular target.
+
+    The key attributes are matched against each target variant based on the
+    backend and format as well as any configuration data provided. When
+    comparing the configuration only fields present in both the key and
+    target variant will be checked and must match. This allows specification of
+    generic sets ("all x86_64 targets get these objects") as well as specific
+    ones ("only x86_64 targets with vector_size = 64 get these objects").
+
+    Example:
+    ```mlir
+    #hal.executable.objects<{
+      #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64"> = [
+        #hal.executable.object<{path = "some/file_arm_64.obj"}>
+      ],
+      #hal.executable.target<"llvm-cpu", "embedded-elf-x86_64"> = [
+        #hal.executable.object<{path = "some/file_x86_64.obj"}>
+      ]
+    }>
+    ```
+  }];
+
+  let parameters = (ins
+    AttrParameter<"ArrayAttr", "">:$targets,
+    AttrParameter<"ArrayAttr", "">:$targetObjects
+  );
+
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
+
+  let extraClassDeclaration = [{
+    // Returns the objects specified for the given generic target.
+    std::optional<ArrayAttr> getApplicableObjects(
+        IREE::HAL::ExecutableTargetAttr specificTargetAttr);
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.alias<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceAliasAttr : HAL_AttrDef<"DeviceAlias", [
+  TypedAttrInterface,
+]> {
+  let mnemonic = "device.alias";
+  let summary = [{Device target named alias.}];
+  let description = [{
+    Specifies a device target by named alias whose configuration will be
+    expanded based on compiler configuration and flags. Any configuration
+    provided will override any defaults provided by the configuration.
+
+    Example:
+    ```mlir
+    // Default `vulkan` device:
+    #hal.device.alias<"vulkan"> : !hal.device
+    // Default `vulkan` device with configuration overrides:
+    #hal.device.alias<"vulkan", {
+      device_config = 123 : index
+    }> : !hal.device
+    // The 3rd default `vulkan` device detected at runtime (ordinal = 3):
+    #hal.device.alias<"vulkan"[3]> : !hal.device
+    ```
+  }];
+
+  let parameters = (ins
+    AttributeSelfTypeParameter<"">:$type,
+    AttrParameter<"StringAttr", "">:$deviceID,
+    OptionalParameter<"std::optional<int64_t>", "">:$ordinal,
+    OptionalParameter<"DictionaryAttr", "">:$configuration
+  );
+
+  let builders = [
+    AttrBuilder<(ins "StringRef":$deviceID)>,
+  ];
+
+  let assemblyFormat = [{
+    `<`
+    $deviceID
+    `` (`[` $ordinal^ `]`)?
+    (`,` $configuration^)?
+    `>`
+  }];
+
+  let extraClassDeclaration = [{
+    Type getType() { return IREE::HAL::DeviceType::get(getContext()); }
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.target<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceTargetAttr : HAL_AttrDef<"DeviceTarget", [
+  DeclareAttrInterfaceMethods<HAL_DeviceInitializationAttrInterface>,
+]> {
+  let mnemonic = "device.target";
+  let summary = [{Generic device target specification.}];
+  let description = [{
+    Specifies the properties of a target runtime device.
+    Target devices are specified with a canonical identifier matching those used
+    by the runtime (such as `cpu`, `vulkan`, etc). Target devices may support
+    several target executable formats specified with `#hal.executable.target`.
+    An optional configuration dictionary allows for overriding backend defaults.
+
+    If used to initialize a device global returns the first device matching the
+    target requirements or null if no devices match. An optional `ordinal`
+    index may be provided that selects the N-th matching device and is used to
+    select between multiple homogeneous devices.
+
+    Example:
+    ```mlir
+    #hal.device.target<"local", {
+      device_configuration = ...
+    }, [
+      #hal.executable.target<"llvm-cpu", "embedded-elf-arm_32">,
+      #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64">,
+    ]> : !hal.device
+    ```
+  }];
+  let parameters = (ins
+    AttrParameter<"StringAttr", "">:$deviceID,
+    AttrParameter<"DictionaryAttr", "">:$configuration,
+    ArrayRefParameter<"ExecutableTargetAttr", "">:$executable_targets
+  );
+  let builders = [
+    AttrBuilder<(ins "StringRef":$deviceID)>,
+  ];
+
+  let extraClassDeclaration = [{
+    Type getType() { return IREE::HAL::DeviceType::get(getContext()); }
+
+    // Returns a symbol-compatible name that pseudo-uniquely identifies this
+    // target. Callers must perform deduplication when required.
+    std::string getSymbolNameFragment();
+
+    // Returns true if there's an attribute with the given name in the
+    // configuration dictionary.
+    bool hasConfigurationAttr(StringRef name);
+    // Returns the configuration attribute with the given name if found.
+    Attribute getConfigurationAttr(StringRef name);
+
+    // Returns zero or more executable targets that this device supports.
+    void getExecutableTargets(
+        SetVector<IREE::HAL::ExecutableTargetAttr> &resultAttrs);
+
+    // Builds an expression that returns an i1 indicating whether the given
+    // |device| matches the device ID string pattern and executable target
+    // requirements.
+    static Value buildDeviceIDAndExecutableFormatsMatch(
+        Location loc, Value device, StringRef deviceIDPattern,
+        ArrayRef<IREE::HAL::ExecutableTargetAttr> executableTargetAttrs,
+        OpBuilder &builder);
+
+    // Builds a match expression that returns an i1 indicating whether the given
+    // |device| supports any one of the |executableTargetAttrs|.
+    static Value buildExecutableFormatMatch(
+        Location loc, Value device,
+        ArrayRef<IREE::HAL::ExecutableTargetAttr> executableTargetAttrs,
+        OpBuilder &builder);
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.ordinal<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceOrdinalAttr : HAL_AttrDef<"DeviceOrdinal", [
+  DeclareAttrInterfaceMethods<HAL_DeviceInitializationAttrInterface>,
+]> {
+  let mnemonic = "device.ordinal";
+  let summary = [{Specifies a device by runtime registration ordinal.}];
+  let description = [{
+    Represents the device registered with the runtime in the order it was
+    registered with ordinal 0 being the first registered. Returns null during
+    initialization if the device ordinal is out of range.
+  }];
+
+  let parameters = (ins
+    AttributeSelfTypeParameter<"">:$type,
+    AttrParameter<"int64_t", "">:$ordinal
+  );
+
+  let assemblyFormat = [{
+    `<` $ordinal `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.fallback<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceFallbackAttr : HAL_AttrDef<"DeviceFallback", [
+  DeclareAttrInterfaceMethods<HAL_DeviceInitializationAttrInterface>,
+]> {
+  let mnemonic = "device.fallback";
+  let summary = [{Specifies a reference to another device.}];
+  let description = [{
+    Specifies by symbol a device that has already been initialized.
+    Returns null during initialization if the device specified as a fallback is
+    null.
+  }];
+
+  let parameters = (ins
+    AttributeSelfTypeParameter<"">:$type,
+    AttrParameter<"FlatSymbolRefAttr", "">:$name
+  );
+
+  let assemblyFormat = [{
+    `<` $name `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.select<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceSelectAttr : HAL_AttrDef<"DeviceSelect", [
+  DeclareAttrInterfaceMethods<HAL_DeviceInitializationAttrInterface>,
+]> {
+  let mnemonic = "device.select";
+  let summary = [{Selects a device from one or more options.}];
+  let description = [{
+    Selects a HAL device at runtime by either enumerating and querying for
+    target support or matching the given existing device by affinity.
+    Devices are selected in the order listed. Fails during initialization if no
+    device can be selected.
+
+    Examples:
+    ```mlir
+    // Selects a single device matching the given target.
+    #hal.device.select<[
+      #hal.device.target<"..."> : !hal.device
+    ]> : !hal.device
+    // Selects a specific device with the given symbol.
+    #hal.device.select<[
+      #hal.device.fallback<@device_0> : !hal.device
+    ]> : !hal.device
+    // Selects a specific device by ordinal as registered at runtime.
+    #hal.device.select<[
+      #hal.device.ordinal<0> : !hal.device
+    ]> : !hal.device
+    // Selects an optional device if available and otherwise @fallback.
+    #hal.device.select<[
+      #hal.device.target<"some_optional_device"> : !hal.device,
+      #hal.device.fallback<@fallback> : !hal.device
+    ]> : !hal.device
+    ```
+  }];
+
+  let parameters = (ins
+    AttributeSelfTypeParameter<"">:$type,
+    AttrParameter<"ArrayAttr", "">:$devices
+  );
+
+  let builders = [
+    AttrBuilder<(ins
+      "ArrayRef<Attribute>":$values
+    )>,
+  ];
+
+  let assemblyFormat = [{
+    `<` $devices `>`
+  }];
+
+  let genVerifyDecl = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.affinity<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceAffinityAttr : HAL_AttrDef<"DeviceAffinity", [
+  DeclareAttrInterfaceMethods<Stream_AffinityAttr, [
+    "isExecutableWith",
+    "joinOR",
+    "joinAND",
+  ]>,
+  Util_HoistableAttrInterface,
+  DeclareAttrInterfaceMethods<Util_InliningPolicyAttrInterface, [
+    "isLegalToInline",
+  ]>,
+]> {
+  let mnemonic = "device.affinity";
+  let summary = [{Specifies a named device and optional queue affinity.}];
+  let description = [{
+    Specifies that an annotated operation or scope is only allowed to execute on
+    a specific device and optionally a set of queues (0-64) provided.
+    Operations will not run on other queues. If the queue mask is omitted then
+    any queue on the device is allowed to execute the specified operations.
+
+    Example:
+    ```mlir
+    // Any queue on @device_a.
+    #hal.device.affinity<@device_a>
+    // Queues 4 and 5 on @device_b.
+    #hal.device.affinity<@device_b, [4, 5]>
+    ```
+  }];
+
+  let parameters = (ins
+    AttrParameter<"SymbolRefAttr", "">:$device,
+    AttrParameter<"int64_t", "">:$queue_mask
+  );
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.promise<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DevicePromiseAttr : HAL_AttrDef<"DevicePromise", [
+  DeclareAttrInterfaceMethods<Stream_AffinityAttr, [
+    "isExecutableWith",
+    "joinOR",
+    "joinAND",
+  ]>,
+  DeclareAttrInterfaceMethods<Util_InliningPolicyAttrInterface, [
+    "isLegalToInline",
+  ]>,
+]> {
+  let mnemonic = "device.promise";
+  let summary = [{Promises a named device and optional queue affinity.}];
+  let description = [{
+    Specifies that an annotated operation or scope is only allowed to execute on
+    a specific device that has not yet been declared and optionally a set of
+    queues (0-64) provided. Operations will not run on other queues. If the
+    queue mask is omitted then any queue on the device is allowed to execute the
+    specified operations.
+
+    This is used in input programs to assign operations to particular devices
+    prior to the devices being declared. This allows device categories to be
+    referenced in the program as produced from the frontend and for those
+    device specifications to be provided later on during compilation.
+    Verification is performed as part of the ResolveDevicePromisesPass.
+
+    Example:
+    ```mlir
+    // Any queue on whatever @device_a will be after declaration.
+    #hal.device.promise<@device_a>
+    // Queues 4 and 5 on whatever @device_b will be after declaration.
+    #hal.device.promise<@device_b, [4, 5]>
+    ```
+  }];
+
+  let parameters = (ins
+    AttrParameter<"StringAttr", "">:$device,
+    AttrParameter<"int64_t", "">:$queue_mask
+  );
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.optimal<*>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceOptimalAttr : HAL_AttrDef<"DeviceOptimal", [
+  DeclareAttrInterfaceMethods<Stream_AffinityAttr, [
+    "isExecutableWith",
+    "joinOR",
+    "joinAND",
+  ]>,
+  Util_HoistableAttrInterface,
+  DeclareAttrInterfaceMethods<Util_InliningPolicyAttrInterface, [
+    "isLegalToInline",
+  ]>,
+]> {
+  let mnemonic = "device.optimal";
+  let summary = [{Selects an optimal device for the assigned operation.}];
+  let description = [{
+    Specifies that an annotated operation or scope may execute on one device
+    in the provided affinity set based on whichever is "optimal" for the
+    operation. Resolution of the specific device may happen during compilation
+    if required information is available or be deferred to runtime.
+
+    Example:
+    ```mlir
+    // Run on either @device_a (any queue) or @device_b (queues 4 and 5).
+    #hal.device.optimal<[
+      #hal.device.affinity<@device_a>,
+      #hal.device.affinity<@device_b, [4, 5]>
+    ]>
+    ```
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"IREE::Stream::AffinityAttr", "">:$affinities
+  );
+
+  let assemblyFormat = [{
+    `<` `[` $affinities `]` `>`
+  }];
+
+  let genVerifyDecl = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// #hal.device.topology<...>
+//===----------------------------------------------------------------------===//
+
+def HAL_DeviceTopologyAttr : HAL_AttrDef<"DeviceTopology", [
+  DeclareAttrInterfaceMethods<Stream_AffinityTopologyAttr, [
+    "hasTransparentAccess",
+    "hasUnifiedMemory",
+  ]>
+]> {
+  let mnemonic = "device.topology";
+  let summary = [{Device connection topology specification.}];
+  let description = [{
+    Specifies the topology of connections between devices, including
+    information about memory sharing and access characteristics between devices.
+
+    This attribute is attached to the top-level module as `stream.topology`
+    to inform Stream dialect passes about device connectivity.
+
+    Example:
+    ```mlir
+    module {
+      stream.topology = #hal.device.topology<
+        links = [
+          (@device_gpu_0 -> @device_cpu = {transparent_access = true, unified_memory = true}),
+          (@device_gpu_1 -> @device_cpu = {transparent_access = true}),
+          (@device_cpu -> @device_gpu_0 = {unified_memory = true}),
+          (@device_cpu -> @device_gpu_1 = {})
+        ]
+      >
+    }
+    ```
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"DeviceLinkAttr", "links">:$links
+  );
+
+  let assemblyFormat = [{
+    `<` `links` `=` `[` $links `]` `>`
+  }];
+}
+
+def HAL_DeviceLinkAttr : HAL_AttrDef<"DeviceLink"> {
+  let mnemonic = "device.link";
+  let summary = [{Connection between devices.}];
+  let description = [{
+    Describes a directional relationship between devices in terms of memory
+    and access properties.
+
+    Currently the following properties are supported:
+    - `unified_memory`: Whether the devices share a unified memory space
+    - `transparent_access`: Whether the source device can access the target device's memory without staging
+
+    The assembly format uses directional links:
+    ```mlir
+    // GPU can access CPU memory transparently with unified memory
+    (@device_gpu -> @device_cpu = {transparent_access = true, unified_memory = true})
+    // CPU needs explicit transfers to access GPU memory (both properties false)
+    (@device_cpu -> @device_gpu = {})
+    // GPU can access CPU memory transparently but without unified memory
+    (@device_gpu -> @device_cpu = {transparent_access = true})
+    // Its possible to add arbitrary properties to the link that are not specified here
+    (@device_gpu -> @device_cpu = {}, {optional_flag = true})
+    ```
+
+    Future extensions may include properties like bandwidth, latency, and target-specific
+    information for specialized connections (e.g., GPUs sharing an SoC, InfiniBand, PCIe).
+  }];
+
+  let parameters = (ins
+    AttrParameter<"SymbolRefAttr", "source_device">:$sourceDevice,
+    AttrParameter<"SymbolRefAttr", "target_device">:$targetDevice,
+    OptionalParameter<"bool", "false">:$unified_memory,
+    OptionalParameter<"bool", "false">:$transparent_access,
+    OptionalParameter<"DictionaryAttr">:$extra_properties
+  );
+
+  let assemblyFormat = [{
+    `(` $sourceDevice `->` $targetDevice `=`
+   `{` struct($unified_memory, $transparent_access)`}`
+    (`,` $extra_properties^)?
+    `)`
+  }];
+}
+
+#endif  // IREE_DIALECT_HAL_IR_HAL_ATTRS

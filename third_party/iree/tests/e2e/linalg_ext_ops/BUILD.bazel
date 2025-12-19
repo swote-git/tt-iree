@@ -1,0 +1,248 @@
+# Copyright 2021 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:enforce_glob.bzl", "enforce_glob")
+load("//build_tools/bazel:iree_check_test.bzl", "iree_check_single_backend_test_suite")
+
+package(
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+ALL_SRCS = enforce_glob(
+    # keep sorted
+    [
+        "arg_compare.mlir",
+        "attention.mlir",
+        "attention_i1_mask_encoding.mlir",
+        "gather.mlir",
+        "map_scatter.mlir",
+        "scan.mlir",
+        "scatter.mlir",
+        "sort.mlir",
+        "top-k.mlir",
+        "winograd_input.mlir",
+        "winograd_output.mlir",
+    ],
+    include = ["*.mlir"],
+    exclude = [
+        "attention_i1_mask.mlir",
+    ],
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_llvm-cpu_local-task",
+    srcs = ALL_SRCS,
+    compiler_flags = ["--iree-llvmcpu-target-cpu=generic"],
+    driver = "local-task",
+    tags = [
+        # attention fails with a wasm target, just disable all tests there for now
+        #   error: Yield operand #2 is not equivalent to the corresponding iter bbArg
+        "nowasm",
+    ],
+    target_backend = "llvm-cpu",
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_llvm-cpu_local-task_i1",
+    srcs = [
+        "attention_i1_mask.mlir",
+    ],
+    compiler_flags = [
+        "--iree-llvmcpu-target-cpu=generic",
+        "--iree-experimental-packed-i1-storage",
+    ],
+    driver = "local-task",
+    tags = [
+        # attention fails with a wasm target, just disable the tests there for now
+        #   error: Yield operand #2 is not equivalent to the corresponding iter bbArg
+        "nowasm",
+    ],
+    target_backend = "llvm-cpu",
+)
+
+VMVX_SRCS = enforce_glob(
+    # keep sorted
+    [
+        "arg_compare.mlir",
+        "gather.mlir",
+        "map_scatter.mlir",
+        "scan.mlir",
+        "scatter.mlir",
+        "sort.mlir",
+        "top-k.mlir",
+        "winograd_input.mlir",
+        "winograd_output.mlir",
+    ],
+    include = ["*.mlir"],
+    exclude = [
+        "attention.mlir",
+        "attention_i1_mask.mlir",
+        "attention_i1_mask_encoding.mlir",
+    ],
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_vmvx_local-task",
+    srcs = VMVX_SRCS,
+    driver = "local-task",
+    target_backend = "vmvx",
+)
+
+LLVM_GPU_SRCS = enforce_glob(
+    # keep sorted
+    [
+        "arg_compare.mlir",
+        "gather.mlir",
+        "scan.mlir",
+        "scatter.mlir",
+        "sort.mlir",
+        "top-k.mlir",
+        "winograd_input.mlir",
+        "winograd_output.mlir",
+    ],
+    include = ["*.mlir"],
+    exclude = [
+        "attention.mlir",
+        "attention_i1_mask.mlir",
+        "attention_i1_mask_encoding.mlir",
+        "map_scatter.mlir",
+    ],
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_cuda",
+    srcs = LLVM_GPU_SRCS,
+    driver = "cuda",
+    tags = [
+        # CUDA cuInit fails with sanitizer on.
+        "noasan",
+        "nomsan",
+        "notsan",
+        "noubsan",
+        "requires-gpu-nvidia",
+    ],
+    target_backend = "cuda",
+)
+
+# TODO(#18649): Add back top-k.mlir test once MI250 correctness is resolved.
+ROCM_HIP_SRCS = enforce_glob(
+    # keep sorted
+    [
+        "arg_compare.mlir",
+        "gather.mlir",
+        "map_scatter.mlir",
+        "scan.mlir",
+        "scatter.mlir",
+        "sort.mlir",
+        "winograd_input.mlir",
+        "winograd_output.mlir",
+    ],
+    include = ["*.mlir"],
+    exclude = [
+        "top-k.mlir",
+        "attention.mlir",
+        "attention_i1_mask.mlir",
+        "attention_i1_mask_encoding.mlir",
+    ],
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_rocm_hip",
+    srcs = ROCM_HIP_SRCS,
+    driver = "hip",
+    target_backend = "rocm",
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_metal-spirv_vulkan",
+    srcs = enforce_glob(
+        # keep sorted
+        [
+            "arg_compare.mlir",
+            "gather.mlir",
+            "scan.mlir",
+            "scatter.mlir",
+            "sort.mlir",
+            "winograd_input.mlir",
+            "winograd_output.mlir",
+        ],
+        include = ["*.mlir"],
+        exclude = [
+            "attention.mlir",
+            "attention_i1_mask.mlir",
+            "attention_i1_mask_encoding.mlir",
+            "map_scatter.mlir",
+            "top-k.mlir",
+        ],
+    ),
+    driver = "metal",
+    target_backend = "metal-spirv",
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_vulkan-spirv_vulkan",
+    srcs = enforce_glob(
+        # keep sorted
+        [
+            "arg_compare.mlir",
+            "gather.mlir",
+            "scan.mlir",
+            "scatter.mlir",
+            "sort.mlir",
+            "winograd_input.mlir",
+            "winograd_output.mlir",
+        ],
+        include = ["*.mlir"],
+        exclude = [
+            "attention.mlir",
+            "attention_i1_mask.mlir",
+            "attention_i1_mask_encoding.mlir",
+            "map_scatter.mlir",
+            "top-k.mlir",
+        ],
+    ),
+    driver = "vulkan",
+    target_backend = "vulkan-spirv",
+)
+
+# TODO: Remove topk-split-reduction tests? The flag looks like an unfinished experiment.
+
+iree_check_single_backend_test_suite(
+    name = "check_cuda-topk-split-reduction",
+    srcs = [
+        "top-k.mlir",
+    ],
+    compiler_flags = ["--iree-dispatch-creation-topk-split-reduction=2"],
+    driver = "cuda",
+    tags = [
+        # CUDA cuInit fails with sanitizer on.
+        "noasan",
+        "nomsan",
+        "notsan",
+        "noubsan",
+        "requires-gpu-nvidia",
+    ],
+    target_backend = "cuda",
+)
+
+iree_check_single_backend_test_suite(
+    name = "check_cuda-topk-split-reduction-double",
+    srcs = [
+        "top-k.mlir",
+    ],
+    compiler_flags = ["--iree-dispatch-creation-topk-split-reduction=3,2"],
+    driver = "cuda",
+    tags = [
+        # CUDA cuInit fails with sanitizer on.
+        "noasan",
+        "nomsan",
+        "notsan",
+        "noubsan",
+        "requires-gpu-nvidia",
+    ],
+    target_backend = "cuda",
+)

@@ -1,0 +1,328 @@
+site_name: IREE
+site_url: https://iree.dev/
+repo_url: https://github.com/iree-org/iree
+repo_name: iree-org/iree
+edit_uri: blob/main/docs/website/docs/
+
+theme:
+  name: material
+  logo: assets/images/IREE_Logo_Icon_Color.svg
+  logo_alt: IREE
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/file-eye-outline
+  font:
+    text: Noto
+    code: Noto Sans Mono
+  favicon: assets/images/IREE_Logo_Icon_Color.svg
+
+  custom_dir: overrides
+
+  features:
+    - content.action.edit # Link to view/edit documentation source on GitHub
+    - content.code.annotate # Allow inline annotations
+    - content.code.copy # Enable copy button
+    - content.tabs.link # Link content tabs across site (e.g. Windows/Linux)
+
+    - navigation.instant # Ajax-style dynamic loading (faster)
+    - navigation.tracking # Update URL in address bar with the active anchor
+    - navigation.sections # Group sections without collapsible buttons
+    - navigation.expand # Start sections expanded
+    - navigation.tabs # Show primary sections in tabs below the header
+    - navigation.tabs.sticky # Keep tabs visible at the top when scrolled
+    - navigation.top # "Back to top" button
+    - navigation.indexes # Section names can link to index.md pages
+
+    - toc.follow # Scroll the TOC panel to follow the reader
+
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra:
+  homepage: https://iree.dev/
+
+  # TODO(scotttodd): join mkdocs-material insiders and remove notice?
+  #   (we *can* remove the notice without joining)
+  # generator: false
+
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/iree-org/iree
+      name: IREE on GitHub
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/wEWh6Z9nMU
+      name: IREE Discord Server
+    - icon: fontawesome/solid/bullhorn
+      link: https://lists.lfaidata.foundation/g/iree-announce
+      name: IREE Announcement Mailing List
+    - icon: fontawesome/solid/envelope
+      link: https://lists.lfaidata.foundation/g/iree-technical-discussion
+      name: IREE Technical Discussion Mailing List
+
+  status:
+    new: Recently updated
+
+extra_css:
+  - assets/stylesheets/extra.css
+  - assets/stylesheets/iree.css
+
+exclude_docs: |
+  *.gz
+  assets/images/README.md
+  **/snippets/*.md
+
+copyright: |
+  Copyright &copy; 2025 IREE a Series of LF Projects, LLC.
+  For web site terms of use, trademark policy and other project policies please
+  see <a href="https://lfprojects.org">https://lfprojects.org</a>.
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - footnotes
+  - md_in_html
+  - meta
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      options:
+        custom_icons:
+          - overrides/.icons
+  # Support for bare URLs, see https://github.com/mkdocs/mkdocs/issues/1711.
+  # https://facelessuser.github.io/pymdown-extensions/extensions/magiclink/
+  - pymdownx.magiclink:
+      user: iree-org
+      repo: iree
+      repo_url_shorthand: true
+  # Support for embedding external files (e.g. source code samples) via snippets
+  # https://squidfunk.github.io/mkdocs-material/reference/code-blocks/#embedding-external-files
+  - pymdownx.snippets:
+      base_path: ["../../"] # Use paths relative to the repository root
+      check_paths: true
+  # Diagram support, see
+  #   https://squidfunk.github.io/mkdocs-material/reference/diagrams/
+  #   Docs  : https://mermaid.js.org/
+  #   Editor: https://mermaid.live/edit
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - tables
+  - toc: # Table of Contents
+      permalink: "link" # Use Material font's "link" icon; see iree.css
+      toc_depth: 4
+
+# Navigation with explicit ordering and nesting.
+# https://www.mkdocs.org/user-guide/configuration/#nav
+# Note: may include external links and titles are optional for internal links
+nav:
+  - Home: "index.md"
+  - "Building from source":
+      - "building-from-source/index.md"
+      - "building-from-source/getting-started.md"
+      - "building-from-source/android.md"
+      - "building-from-source/ios.md"
+      - "building-from-source/riscv.md"
+  - "Guides":
+      - "guides/index.md"
+      - "ML frameworks":
+          - "guides/ml-frameworks/index.md"
+          - JAX: "guides/ml-frameworks/jax.md"
+          - ONNX: "guides/ml-frameworks/onnx.md"
+          - PyTorch: "guides/ml-frameworks/pytorch.md"
+          - TensorFlow: "guides/ml-frameworks/tensorflow.md"
+          - TensorFlow Lite: "guides/ml-frameworks/tflite.md"
+      - "Deployment configurations":
+          - "guides/deployment-configurations/index.md"
+          - CPU: "guides/deployment-configurations/cpu.md"
+          - CPU - Bare-Metal: "guides/deployment-configurations/bare-metal.md"
+          - GPU - Vulkan: "guides/deployment-configurations/gpu-vulkan.md"
+          - GPU - ROCm: "guides/deployment-configurations/gpu-rocm.md"
+          - GPU - CUDA: "guides/deployment-configurations/gpu-cuda.md"
+          - GPU - Metal: "guides/deployment-configurations/gpu-metal.md"
+      - "General topics":
+          - "guides/parameters.md"
+  - "Reference":
+      - "reference/index.md"
+      - "General topics":
+          - Glossary: "reference/glossary.md"
+          - Optimization options: "reference/optimization-options.md"
+          - Tuning: "reference/tuning.md"
+          - Extensions: "reference/extensions.md"
+      - "API bindings":
+          - "reference/bindings/index.md"
+          - C API: "reference/bindings/c-api.md"
+          - Python: "reference/bindings/python.md"
+      - "MLIR dialects":
+          - "reference/mlir-dialects/index.md"
+          # Note: these files are generated by generate_extra_files.sh.
+          - Core:
+              - Flow: "reference/mlir-dialects/Flow.md"
+              - HAL: "reference/mlir-dialects/HAL.md"
+              - Stream: "reference/mlir-dialects/Stream.md"
+              - Util: "reference/mlir-dialects/Util.md"
+              - VM: "reference/mlir-dialects/VM.md"
+          - MLIR extensions:
+              - Encoding: "reference/mlir-dialects/Encoding.md"
+              - LinalgExt: "reference/mlir-dialects/LinalgExt.md"
+              - TensorExt: "reference/mlir-dialects/TensorExt.md"
+          - Codegen/target-specific:
+              - IREECodegen: "reference/mlir-dialects/IREECodegen.md"
+              - IREEGPU: "reference/mlir-dialects/IREEGPU.md"
+              - IREEVectorExt: "reference/mlir-dialects/IREEVectorExt.md"
+              - VMVX: "reference/mlir-dialects/VMVX.md"
+          - Optional modules:
+              - Check: "reference/mlir-dialects/Check.md"
+              - HAL:
+                  - Inline: "reference/mlir-dialects/HALInline.md"
+                  - Loader: "reference/mlir-dialects/HALLoader.md"
+              - IO:
+                  - Parameters: "reference/mlir-dialects/IOParameters.md"
+      - "MLIR passes":
+          - "reference/mlir-passes/index.md"
+          # Note: these files are generated by generate_extra_files.sh.
+          - Core dialects:
+              - Flow: "reference/mlir-passes/Flow.md"
+              - HAL: "reference/mlir-passes/HAL.md"
+              - Stream: "reference/mlir-passes/Stream.md"
+              - Util: "reference/mlir-passes/Util.md"
+              - VM: "reference/mlir-passes/VM.md"
+          - Pipelines:
+              - ConstEval: "reference/mlir-passes/ConstEval.md"
+              - DispatchCreation: "reference/mlir-passes/DispatchCreation.md"
+              - GlobalOptimization: "reference/mlir-passes/GlobalOptimization.md"
+              - InputConversion: "reference/mlir-passes/InputConversion.md"
+              - Preprocessing: "reference/mlir-passes/Preprocessing.md"
+          - Codegen:
+              - Common: "reference/mlir-passes/CodegenCommon.md"
+              - Common/CPU: "reference/mlir-passes/CodegenCommonCPU.md"
+              - Common/GPU: "reference/mlir-passes/CodegenCommonGPU.md"
+              - Dialect/GPU: "reference/mlir-passes/CodegenDialectGPU.md"
+              - Dialect/VectorExt: "reference/mlir-passes/CodegenDialectVectorExt.md"
+              - LLVMCPU: "reference/mlir-passes/CodegenLLVMCPU.md"
+              - LLVMGPU: "reference/mlir-passes/CodegenLLVMGPU.md"
+              - SPIRV: "reference/mlir-passes/CodegenSPIRV.md"
+              - VMVX: "reference/mlir-passes/CodegenVMVX.md"
+  - "Developers":
+      - "developers/index.md"
+      - "General development topics":
+          - "developers/general/contributing.md"
+          - "developers/general/developer-overview.md"
+          - "developers/general/developer-tips.md"
+          - "developers/general/testing-guide.md"
+          - "developers/general/github-actions.md"
+          - "developers/general/release-management.md"
+          - "developers/general/versioning-scheme.md"
+      - "Building":
+          - "developers/building/bazel.md"
+          - "developers/building/emscripten.md"
+          - "developers/building/cmake-options.md"
+          - "developers/building/cmake-with-ccache.md"
+      - "Debugging":
+          - "developers/debugging/android-with-lldb.md"
+          - "developers/debugging/compile-time-regressions.md"
+          - "developers/debugging/gpu.md"
+          - "developers/debugging/llvm.md"
+          - "developers/debugging/integration-tests.md"
+          - "developers/debugging/model-development.md"
+          - "developers/debugging/releases.md"
+          - "developers/debugging/sanitizers.md"
+      - "Performance":
+          - "developers/performance/benchmarking.md"
+          - "developers/performance/profiling.md"
+          - "developers/performance/profiling-cpu-events.md"
+          - "developers/performance/profiling-gpu-vulkan.md"
+          - "developers/performance/profiling-with-tracy.md"
+      - "Design docs":
+          - "developers/design-docs/design-roadmap.md"
+          - "developers/design-docs/function-abi.md"
+          - "developers/design-docs/invocation-execution-model.md"
+          - "developers/design-docs/cuda-hal-driver.md"
+          - "developers/design-docs/hip-hal-driver.md"
+          - "developers/design-docs/metal-hal-driver.md"
+          - "developers/design-docs/vm.md"
+      - "Other topics":
+          - "developers/usage-best-practices.md"
+          - "developers/update-sdxl-golden-outputs.md"
+          - "developers/vulkan-environment-setup.md"
+  - "Community":
+      - "community/index.md"
+      - "Blog":
+          - "community/blog/index.md"
+      - "community/tags.md"
+
+# https://www.mkdocs.org/user-guide/configuration/#hooks
+hooks:
+  - custom_edit_url.py
+
+plugins:
+  # https://squidfunk.github.io/mkdocs-material/setup/setting-up-a-blog/
+  - blog:
+      blog_dir: "community/blog"
+      blog_toc: true
+      post_url_date_format: yyyy-MM-dd
+      post_url_format: "{date}-{slug}"
+
+  # https://squidfunk.github.io/mkdocs-material/setup/setting-up-site-search/
+  - search
+
+  # https://squidfunk.github.io/mkdocs-material/setup/setting-up-tags/
+  - tags:
+      tags_file: community/tags.md
+
+  # https://github.com/mkdocs/mkdocs-redirects
+  - redirects:
+      redirect_maps: # old -> new
+        "extensions/index.md": "reference/extensions.md"
+
+        # "getting-started/" moved under "guides/ml-frameworks/"
+        "getting-started/index.md": "guides/ml-frameworks/index.md"
+        "getting-started/tensorflow.md": "guides/ml-frameworks/tensorflow.md"
+        "getting-started/tflite.md": "guides/ml-frameworks/tflite.md"
+        "getting-started/jax.md": "guides/ml-frameworks/jax.md"
+        "getting-started/pytorch.md": "guides/ml-frameworks/pytorch.md"
+
+        # "deployment-configurations/" moved under "guides/"
+        "deployment-configurations/index.md": "guides/deployment-configurations/index.md"
+        "deployment-configurations/cpu.md": "guides/deployment-configurations/cpu.md"
+        "deployment-configurations/bare-metal.md": "guides/deployment-configurations/bare-metal.md"
+        "deployment-configurations/gpu-vulkan.md": "guides/deployment-configurations/gpu-vulkan.md"
+        "deployment-configurations/gpu-cuda-rocm.md": "guides/deployment-configurations/gpu-cuda.md"
+        # The CUDA/ROCm page split into two pages
+        "guides/deployment-configurations/gpu-cuda-rocm.md": "guides/deployment-configurations/gpu-cuda.md"
+
+        # "bindings/" moved under "reference/"
+        "bindings/index.md": "reference/bindings/index.md"
+        "bindings/c-api.md": "reference/bindings/c-api.md"
+        "bindings/python.md": "reference/bindings/python.md"
+
+        # "blog/" moved under "community/"
+        "blog/index.md": "community/blog/index.md"
+        "blog/2021-07-19-tflite-tosa.md": "community/blog/posts/tflite-tosa.md"
+        "blog/2021-10-13-mmt4d.md": "community/blog/posts/mmt4d.md"
+        "blog/2021-10-15-cuda-backend.md": "community/blog/posts/cuda-backend.md"
+        # Some blog post names/paths changed when setting up the blog plugin
+        "community/blog/2021-07-19-tflite-tosa.md": "community/blog/posts/tflite-tosa.md"
+        "community/blog/2021-10-13-mmt4d.md": "community/blog/posts/mmt4d.md"
+
+        # "Developers" section was added
+        "guides/developer-tips.md": "developers/general/developer-tips.md"
+        "developers/building/cmake-options-and-variables.md": "developers/building/cmake-options.md"

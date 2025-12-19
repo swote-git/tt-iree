@@ -1,0 +1,132 @@
+# Copyright 2023 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:build_defs.oss.bzl", "iree_runtime_cc_library", "iree_runtime_cc_test")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_runtime_cc_library(
+    name = "file_handle",
+    srcs = [
+        "file_contents.c",
+        "file_handle.c",
+    ],
+    hdrs = [
+        "file_contents.h",
+        "file_handle.h",
+        "stdio_util.h",
+    ],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "file_contents_test",
+    srcs = ["file_contents_test.cc"],
+    tags = ["requires-filesystem"],
+    deps = [
+        ":file_handle",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base:core_headers",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "memory_stream_test",
+    srcs = ["memory_stream_test.cc"],
+    deps = [
+        ":stream",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "parameter_index",
+    srcs = ["parameter_index.c"],
+    hdrs = ["parameter_index.h"],
+    deps = [
+        ":file_handle",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:synchronization",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "parameter_index_provider",
+    srcs = ["parameter_index_provider.c"],
+    hdrs = ["parameter_index_provider.h"],
+    deps = [
+        ":parameter_index",
+        ":parameter_provider",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/utils:file_cache",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "parameter_provider",
+    srcs = ["parameter_provider.c"],
+    hdrs = ["parameter_provider.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "scope_map",
+    srcs = ["scope_map.c"],
+    hdrs = ["scope_map.h"],
+    deps = [
+        ":parameter_index",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "stream",
+    srcs = [
+        "memory_stream.c",
+        "stdio_stream.c",
+        "stream.c",
+        "vec_stream.c",
+    ],
+    hdrs = [
+        "memory_stream.h",
+        "stdio_stream.h",
+        "stream.h",
+        "vec_stream.h",
+    ],
+    deps = [
+        ":file_handle",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "vec_stream_test",
+    srcs = ["vec_stream_test.cc"],
+    deps = [
+        ":stream",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)

@@ -1,0 +1,5 @@
+# In addition to runtime/bindings/python/iree/runtime/build_requirements.txt.
+# Ensure a recent cmake
+cmake>=3.18.4
+ninja
+packaging

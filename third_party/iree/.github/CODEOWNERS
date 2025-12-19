@@ -1,0 +1,95 @@
+# Codeowners for IREE Github Repository.
+# The listed owners will automatically be added as reviewers to PRs that modify
+# paths matching the specified patterns.
+# Refer to https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# for syntax of this file (tl;dr: syntax is like .gitignore. Last matching rule
+# takes precedence).
+# Because of the precedence, rules for directories are listed topologically.
+# @ghost is used to make a pattern have no owners. It is a sentinel GitHub user
+# that takes the place of deleted users.
+
+# No global owners because we don't really want e.g. changing the root
+# CMakeLists.txt file to always ping a bunch of people.
+
+# Third-Party Code
+/.gitmodules @ScottTodd @stellaraccident
+/third_party/ @ScottTodd @stellaraccident
+# Except for routinely-updated submodules
+/third_party/llvm-project @ghost
+/third_party/llvm-project.branch-pin @ghost
+/third_party/stablehlo @ghost
+/third_party/torch-mlir @ghost
+
+# Bindings
+/runtime/bindings/python/ @stellaraccident
+/runtime/bindings/tflite/ @benvanik
+
+# Integrations
+/integrations/ @benvanik @stellaraccident
+/integrations/tensorflow/ @stellaraccident
+/integrations/tensorflow/test/**/iree_tfl_tests/ @rsuderman
+
+# Experimental
+# It's experimental, but we still don't want any old directory added here.
+/experimental/ @benvanik @stellaraccident
+/experimental/web/ @ScottTodd
+/experimental/webgpu/ @benvanik @ScottTodd
+
+# Infra Top-Level Directories
+/build_tools/ @ScottTodd
+/build_tools/python_deploy/ @stellaraccident
+/build_tools/scripts/ @ScottTodd
+/build_tools/third_party/ @ScottTodd @stellaraccident
+/.github/ @ScottTodd @Groverkss
+
+# llvm-external-projects
+/llvm-external-projects/ @stellaraccident
+/llvm-external-projects/iree-dialects/ @MaheshRavishankar
+
+# Other Top-Level Directories
+/docs/ @ScottTodd
+/tools/ @benvanik
+
+# Tests
+/tests/external/iree-test-suites @Groverkss @MaheshRavishankar @kuhar
+/tests/e2e @bjacob
+
+# Compiler
+/compiler/src/iree/compiler/ @benvanik
+/compiler/src/iree/compiler/Codegen/ @MaheshRavishankar
+/compiler/src/iree/compiler/Codegen/Common @hanhanW @Max191 @MaheshRavishankar @qedawkins
+/compiler/src/iree/compiler/Codegen/Common/GPU @qedawkins @Groverkss @kuhar
+/compiler/src/iree/compiler/Codegen/Dialect/Codegen @Max191 @MaheshRavishankar @qedawkins
+/compiler/src/iree/compiler/Codegen/Dialect/CPU @hanhanW
+/compiler/src/iree/compiler/Codegen/Dialect/GPU @qedawkins @Max191 @Groverkss @nirvedhmeshram @krzysz00
+/compiler/src/iree/compiler/Codegen/Dialect/PCF @qedawkins
+/compiler/src/iree/compiler/Codegen/Dialect/VectorExt @Groverkss
+/compiler/src/iree/compiler/Codegen/ExternalInterfaces @hanhanW @Max191 @jtuyls
+/compiler/src/iree/compiler/Codegen/LLVMCPU/ @hanhanW
+/compiler/src/iree/compiler/Codegen/LLVMGPU/ @qedawkins @kuhar @Groverkss @nirvedhmeshram @krzysz00 @Max191
+/compiler/src/iree/compiler/Codegen/SPIRV/ @kuhar
+/compiler/src/iree/compiler/ConstEval/ @hanhanW @MaheshRavishankar
+/compiler/src/iree/compiler/Dialect/Encoding/ @bjacob @hanhanW @Max191 @jtuyls
+/compiler/src/iree/compiler/Dialect/Flow/ @hanhanW @MaheshRavishankar @IanWood1
+/compiler/src/iree/compiler/Dialect/LinalgExt/ @hanhanW @MaheshRavishankar @Groverkss @Max191 @IanWood1
+/compiler/src/iree/compiler/Dialect/Stream/ @benvanik @hanhanW @MaheshRavishankar
+/compiler/src/iree/compiler/Dialect/TensorExt/ @hanhanW @MaheshRavishankar @IanWood1
+/compiler/src/iree/compiler/Dialect/Vulkan/ @kuhar
+/compiler/src/iree/compiler/DispatchCreation/ @MaheshRavishankar @IanWood1
+/compiler/src/iree/compiler/GlobalOptimization/ @MaheshRavishankar @IanWood1
+/compiler/src/iree/compiler/InputConversion/ @MaheshRavishankar
+/compiler/src/iree/compiler/Preprocessing/ @qedawkins @MaheshRavishankar
+
+# Compiler Plugins
+/compiler/plugins/input/StableHLO/ @MaheshRavishankar @rsuderman
+/compiler/plugins/input/TOSA/ @MaheshRavishankar @rsuderman
+/compiler/plugins/target/ROCM/ @kuhar @krzysz00 @jtuyls @Yu-Zhewen
+
+# Runtime
+/runtime/src/iree/ @benvanik
+/runtime/src/iree/hal/cts/ @ScottTodd
+/runtime/src/iree/hal/drivers/amdgpu/ @benvanik @AWoloszyn
+/runtime/src/iree/hal/drivers/cuda/ @antiagainst
+/runtime/src/iree/hal/drivers/hip/ @AWoloszyn
+/runtime/src/iree/hal/drivers/metal/ @antiagainst
+/runtime/src/iree/hal/drivers/vulkan/ @antiagainst @ScottTodd

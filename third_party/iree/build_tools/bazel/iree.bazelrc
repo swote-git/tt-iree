@@ -1,0 +1,334 @@
+# Copyright 2019 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+###############################################################################
+# Common flags that apply to all configurations.
+# Use sparingly for things common to all compilers and platforms.
+###############################################################################
+
+# Enable bzlmod (required for LLVM integration as of Nov 2025)
+common --enable_bzlmod
+
+# Prevent invalid caching if input files are modified during a build.
+build --experimental_guard_against_concurrent_changes
+# Default to optimized builds
+# Override via: "-c dbg" or --compilation_mode=dbg
+build --compilation_mode=opt
+# Legacy from when we depended on TensorFlow, might not be needed in IREE.
+common --experimental_repo_remote_exec
+# Actually printing output on errors is... a useful default
+test --test_output=errors
+
+# Includes a startup option, so we can't put this in a config, but it doesn't
+# hurt anything on non-windows platforms.
+# Enables unix-style runfiles link trees on Windows. Requires enabling symlink
+# permissions: Enable Developer Mode in the Developer Settings page of the
+# system settings. See
+# https://bazel.build/configure/windows#enable-symlink-support
+# and https://blogs.windows.com/windowsdeveloper/2016/12/02/symlinks-windows-10/
+startup --windows_enable_symlinks
+build --enable_runfiles
+
+# TODO: Transition to the explicit init_py mechanism. See #2405
+# This is commented out while considering transition path but left as a
+# breadcrumb.
+# build --incompatible_default_to_explicit_init_py
+
+# Disable split PIC/non-PIC build graphs and disable heuristic to link binaries
+# dynamically by default. See: https://github.com/iree-org/iree/issues/13470
+build --dynamic_mode=off
+build --force_pic
+
+###############################################################################
+# Build settings flag aliases. See https://bazel.build/rules/config
+###############################################################################
+build --flag_alias=iree_drivers=//runtime/src/iree/hal/drivers:enabled_drivers
+build --flag_alias=iree_link_compiler_shared=//compiler/src/iree/compiler/API:link_shared
+# Equivalent to CMake flag IREE_ENABLE_RUNTIME_TRACING + IREE_TRACING_PROVIDER.
+# Builds the runtime with tracing support enabled.
+build --flag_alias=iree_enable_runtime_tracing=//runtime/src/iree/base/tracing:tracing_provider
+
+###############################################################################
+# Options for "generic_gcc" builds
+###############################################################################
+
+# C++17 standard version is required.
+build:generic_gcc --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+
+# TODO: OSS assert builds of TF became non functional around 1/27/2022. RIP.
+# Default to adding back asserts in optimized builds.
+# This is a good compromise between runtime and debugability.
+#build:generic_gcc --copt=-UNDEBUG
+
+# Disable warnings we don't care about or that generally have a low signal/noise
+# ratio.
+build:generic_gcc --copt=-Wno-unused-but-set-parameter
+build:generic_gcc --copt=-Wno-comment
+build:generic_gcc --copt=-Wno-attributes
+
+###############################################################################
+# Options for "generic_clang" builds: these options should generally apply to
+# either clang or gcc and are curated based on need.
+###############################################################################
+
+# C++17 standard version is required.
+build:generic_clang --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+
+# TODO: OSS assert builds of TF became non functional around 1/27/2022. RIP.
+# Default to adding back asserts in optimized builds.
+# This is a good compromise between runtime and debugability.
+#build:generic_clang --copt=-UNDEBUG
+
+# Treat warnings as errors...
+build:generic_clang --copt=-Werror --host_copt=-Werror
+# ...and silence them outside of the workspace.
+build:generic_clang --per_file_copt=external/.*@-w
+# ...and silence them on host builds. There is no host_per_file_copt and
+# everything we build in the host configuration we either also build in the
+# target configuration or is external, so we can't control it.
+# If/when Bazel supports --host_per_file_copt, we could use that instead:
+# https://github.com/bazelbuild/bazel/issues/12406.
+# Would need to then make all the --copt below duplicated with --host_copt.
+build:generic_clang --host_copt=-w
+
+# This is currently flagging the status macros (https://github.com/iree-org/iree/issues/16946)
+build:generic_clang --copt=-Wno-c++20-extensions --host_copt=-Wno-c++20-extensions
+
+# Set clang diagnostics. These largely match the set of warnings used within
+# Google. They have not been audited super carefully by the IREE team but are
+# generally thought to be a good set and consistency with those used internally
+# is very useful when importing. If you feel that some of these should be
+# different, please raise an issue!
+
+# Please keep these in sync with build_tools/cmake/iree_copts.cmake
+
+build:generic_clang --copt=-Wall
+
+# Disable warnings we don't care about or that generally have a low signal/noise
+# ratio.
+build:generic_clang --copt=-Wno-ambiguous-member-template
+build:generic_clang --copt=-Wno-extern-c-compat # Matches upstream. Cannot impact due to extern C inclusion method.
+build:generic_clang --copt=-Wno-invalid-offsetof # Technically UB but needed for intrusive ptrs
+build:generic_clang --copt=-Wno-unused-const-variable
+build:generic_clang --copt=-Wno-unused-function
+build:generic_clang --copt=-Wno-unused-private-field
+
+# Explicitly enable some additional warnings.
+# Some of these aren't on by default, or under -Wall, or are subsets of warnings
+# turned off above.
+# build:generic_clang --copt=-Wc++20-extensions  # See above.
+build:generic_clang --copt=-Wctad-maybe-unsupported
+build:generic_clang --copt=-Wfloat-overflow-conversion
+build:generic_clang --copt=-Wfloat-zero-conversion
+build:generic_clang --copt=-Wfor-loop-analysis
+build:generic_clang --copt=-Wformat-security
+build:generic_clang --copt=-Wgnu-redeclared-enum
+build:generic_clang --copt=-Wimplicit-fallthrough
+build:generic_clang --copt=-Winfinite-recursion
+build:generic_clang --copt=-Wliteral-conversion
+build:generic_clang --copt=-Wnon-virtual-dtor
+build:generic_clang --copt=-Woverloaded-virtual
+build:generic_clang --copt=-Wself-assign
+build:generic_clang --copt=-Wstring-conversion
+build:generic_clang --copt=-Wtautological-overlap-compare
+build:generic_clang --copt=-Wthread-safety
+build:generic_clang --copt=-Wthread-safety-beta
+build:generic_clang --copt=-Wunused-comparison
+build:generic_clang --copt=-Wvla
+
+# Treat backrefs during linking as errors.
+build:generic_clang --linkopt=-Wl,--warn-backrefs
+build:generic_clang --linkopt=-Wl,--fatal-warnings
+
+###############################################################################
+# Additional options for MacOS based clang builds.
+# Try to keep these scoped to exclusions for third_party code and prefer
+# fixing issues local to the project.
+###############################################################################
+
+build:macos_clang --config=generic_clang
+build:macos_clang --per_file_copt=utils@-Wno-range-loop-analysis
+
+build:macos_clang_release --config=macos_clang
+build:macos_clang_release --per_file_copt=utils@-Wno-range-loop-analysis
+build:macos_clang_release --compilation_mode=opt
+build:macos_clang_release --copt=-DNDEBUG
+
+###############################################################################
+# Additional options for release builds. These do *not* automatically pull in
+# the corresponding compiler config (e.g. generic_clang) because this is likely
+# to already be set in the user's configured.bazelrc and setting a config twice
+# causes flags to be passed twice.
+###############################################################################
+build:generic_clang_release --compilation_mode=opt
+build:generic_clang_release --copt=-DNDEBUG
+build:generic_clang_release --linkopt=-Wl,--strip-all
+build:generic_gcc_release --compilation_mode=opt
+build:generic_gcc_release --copt=-DNDEBUG
+build:generic_gcc_release --linkopt=-Wl,--strip-all
+# MSVC doesn't store symbols in the binary (they're in separate .pdb files), so
+# nothing needs to be stripped.
+build:msvc_release --compilation_mode=opt
+
+###############################################################################
+# Options for building with address sanitizer.
+# https://github.com/google/sanitizers/wiki/AddressSanitizer
+###############################################################################
+
+# ASAN (address sanitizer)
+# https://clang.llvm.org/docs/AddressSanitizer.html
+build:asan --config=sanitizer
+build:asan --features=asan
+build:asan --copt=-fsanitize=address
+build:asan --copt=-fsanitize-address-use-after-scope
+build:asan --linkopt=-fsanitize=address
+build:asan --cc_output_directory_tag=asan
+build:asan --copt=-DADDRESS_SANITIZER
+
+# MSAN (memory sanitizer)
+# https://clang.llvm.org/docs/MemorySanitizer.html
+build:msan --config=sanitizer
+build:msan --features=msan
+build:msan --copt=-fsanitize=memory
+build:msan --copt=-fsanitize-memory-track-origins
+build:msan --linkopt=-fsanitize=memory
+build:msan --cc_output_directory_tag=msan
+build:msan --copt=-DMEMORY_SANITIZER
+
+# TSAN (thread sanitizer)
+# https://clang.llvm.org/docs/ThreadSanitizer.html
+build:tsan --config=sanitizer
+build:tsan --features=tsan
+build:tsan --copt=-fsanitize=thread
+build:tsan --linkopt=-fsanitize=thread
+build:tsan --cc_output_directory_tag=tsan
+build:tsan --copt=-DTHREAD_SANITIZER
+
+# UBSAN (undefined behavior sanitizer)
+# https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html
+build:ubsan --config=sanitizer
+build:ubsan --features=ubsan
+build:ubsan --copt=-fsanitize=undefined
+build:ubsan --linkopt=-fsanitize=undefined
+build:ubsan --linkopt=-lubsan
+build:ubsan --cc_output_directory_tag=ubsan
+
+# Don't strip debug info
+build:sanitizer --strip=never
+# Ignore settings of `linkopts = ["-static"]` which can screw up the sanitizer.
+# We don't use this in IREE (that's what linkstatic is for), but it could show
+# up in dependencies.
+build:sanitizer --force_ignore_dash_static
+# sanitizer tests tend to take longer, so increase the timeouts
+build:sanitizer --test_timeout=120,600,1800,-1
+# Get better stack traces
+build:sanitizer --copt=-fno-omit-frame-pointer
+
+###############################################################################
+# Architecture specific options
+###############################################################################
+
+# Enable some default cpu flags for x86 optimization.
+build:x86opt --copt=-mavx2
+
+###############################################################################
+# Configuration for caching remotely using Remote Build Execution (RBE)
+# https://cloud.google.com/remote-build-execution/
+# Based on https://github.com/bazelbuild/bazel-toolchains/blob/master/bazelrc/bazel-1.0.0.bazelrc
+# Writing to the remote cache is limited to the CI to ensure a stable
+# environment. Reading from the remote cache building in a place other than the
+# CI is at your own risk. To do so pass `--noremote_upload_local_results` in
+# addition to the config for the appropriate cache.
+# We gave up on remote execution due to the amount of toolchain configuration
+# required.
+###############################################################################
+
+# Config for executing locally and caching the results to the remote cache.
+# This requires permissions to write to the remote cache, which only the CI
+# machines have.
+
+# Enable authentication. This will pick up application default credentials by
+# default. You can use --google_credentials=some_file.json to use a service
+# account credential instead.
+build:_remote_cache_base --google_default_credentials=true
+# Point to the remote instance constructed in the iree-oss project
+build:_remote_cache_base --remote_instance_name=projects/iree-oss/instances/default_instance
+
+build:_remote_cache_base --remote_cache=grpcs://remotebuildexecution.googleapis.com
+
+# --config=remote_cache_bazel_ci
+build:remote_cache_bazel_ci --config=_remote_cache_base
+# The cache key specifies the environment, which in this case points to the
+# specific docker container the CI Bazel builds are run in. The image URL is
+# included for clarity and so that this reference is automatically updated by
+# manage_images.py
+build:remote_cache_bazel_ci --host_platform_remote_properties_override='properties:{name:"cache-silo-key" value:"gcr.io/iree-oss/base-bleeding-edge@sha256:cf2e78194e64fd0166f4141317366261d7a62432b72e9a324cb8c2ff4e1a515a"}'
+
+
+###############################################################################
+# Configuration for uploading build results to Result Store UI
+# https://cloud.google.com/remote-build-execution/docs/results-ui/getting-started-results-ui
+# Can be used either with or without remote caching.
+###############################################################################
+
+# Options for connecting to the IREE GCP remote build project. These are
+# repeated separately from _remote_cache_base to avoid warnings about configs
+# being expanded more than once when a remote caching config is used together
+# with result store (even though the warnings are spurious).
+
+build:rs --google_default_credentials=true
+build:rs --remote_instance_name=projects/iree-oss/instances/default_instance
+
+build:rs --bes_backend="buildeventservice.googleapis.com"
+build:rs --bes_results_url="https://source.cloud.google.com/results/invocations/"
+build:rs --project_id=iree-oss
+
+###############################################################################
+# Windows specific flags for building with VC.
+###############################################################################
+
+build:_msvc_base --define=iree_is_msvc=true
+
+# Bazel gets confused and sometimes loses track of Bash.
+build:_msvc_base --action_env BAZEL_SH='bash'
+
+# Find the source of truth for these in iree_copts.cmake.
+build:_msvc_base --copt=/DWIN32_LEAN_AND_MEAN
+build:_msvc_base --copt=/DNOMINMAX
+build:_msvc_base --copt=/D_USE_MATH_DEFINES
+build:_msvc_base --copt=/D_CRT_SECURE_NO_WARNINGS
+build:_msvc_base --copt=/D_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES
+build:_msvc_base --copt=/EHsc
+build:_msvc_base --copt=/bigobj
+
+build:_msvc_base --copt=/wd4200
+build:_msvc_base --copt=/wd4018
+build:_msvc_base --copt=/wd4146  # operator applied to unsigned type, result still unsigned
+build:_msvc_base --copt=/wd4244  # possible loss of data
+build:_msvc_base --copt=/wd4267  # initializing: possible loss of data
+build:_msvc_base --copt=/wd4005  # allow: macro redefinition
+build:_msvc_base --copt=/wd4065  # allow: switch statement contains 'default' but no 'case' labels
+build:_msvc_base --copt=/wd4141  # allow: inline used more than once
+build:_msvc_base --copt=/wd4624  # allow: destructor was implicitly defined as deleted
+build:_msvc_base --copt=/wd5105  # macro expansion producing 'defined' has undefined behavior
+
+# And some more explicit disables. For some reason the `/w` on external doesn't
+# work for these, maybe they come from headers?
+# new warning with the standards-compliant preprocessor. winbase itself is not standards-compliant
+build:_msvc_base --per_file_copt=mkl_dnn@/wd4551 # missing argument list
+build:_msvc_base --per_file_copt=mkl_dnn@/wd4068 # unknown pragma
+build:_msvc_base --per_file_copt=farmhash@/wd4319 # zero extending to T of greater size
+
+build:_msvc_base --linkopt=/IGNORE:4217 # mismatch import/export declspec
+build:_msvc_base --linkopt=/IGNORE:4001 # no object files
+
+# Separate configs for different MSVC versions as we might want slightly different options.
+build:msvc2017 --config=_msvc_base
+build:msvc2019 --config=_msvc_base
+
+# Assume the newer version and alias to --config=windows
+build:msvc --config=msvc2019
+build:windows --config=msvc

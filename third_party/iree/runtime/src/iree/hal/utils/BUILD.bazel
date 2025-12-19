@@ -1,0 +1,292 @@
+# Copyright 2021 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:build_defs.oss.bzl", "iree_cmake_extra_content", "iree_runtime_cc_library", "iree_runtime_cc_test")
+load("//build_tools/bazel:cc_binary_benchmark.bzl", "cc_binary_benchmark")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_runtime_cc_library(
+    name = "allocators",
+    srcs = ["allocators.c"],
+    hdrs = ["allocators.h"],
+    deps = [
+        ":caching_allocator",
+        ":debug_allocator",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "collective_batch",
+    srcs = ["collective_batch.c"],
+    hdrs = ["collective_batch.h"],
+    deps = [
+        ":resource_set",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "caching_allocator",
+    srcs = ["caching_allocator.c"],
+    hdrs = ["caching_allocator.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "debug_allocator",
+    srcs = ["debug_allocator.c"],
+    hdrs = ["debug_allocator.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "deferred_command_buffer",
+    srcs = ["deferred_command_buffer.c"],
+    hdrs = ["deferred_command_buffer.h"],
+    deps = [
+        ":resource_set",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "executable_debug_info",
+    srcs = ["executable_debug_info.c"],
+    hdrs = ["executable_debug_info.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal/flatcc:parsing",
+        "//runtime/src/iree/schemas:executable_debug_info_c_fbs",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "executable_header",
+    srcs = ["executable_header.c"],
+    hdrs = ["executable_header.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal/flatcc:parsing",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "file_cache",
+    srcs = ["file_cache.c"],
+    hdrs = ["file_cache.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:file_handle",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "file_transfer",
+    srcs = ["file_transfer.c"],
+    hdrs = ["file_transfer.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "files",
+    srcs = [
+        "fd_file.c",
+        "file_registry.c",
+        "memory_file.c",
+    ],
+    hdrs = [
+        "fd_file.h",
+        "file_registry.h",
+        "memory_file.h",
+    ],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:file_handle",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "libmpi",
+    srcs = ["libmpi.c"],
+    hdrs = [
+        "libmpi.h",
+        "libmpi_dynamic_symbols.h",
+    ],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:dynamic_library",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "libmpi_test",
+    srcs = ["libmpi_test.cc"],
+    deps = [
+        ":libmpi",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "mpi_channel_provider",
+    srcs = ["mpi_channel_provider.c"],
+    hdrs = ["mpi_channel_provider.h"],
+    deps = [
+        ":libmpi",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "queue_emulation",
+    srcs = ["queue_emulation.c"],
+    hdrs = ["queue_emulation.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "resource_set",
+    srcs = ["resource_set.c"],
+    hdrs = ["resource_set.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+cc_binary_benchmark(
+    name = "resource_set_benchmark",
+    srcs = ["resource_set_benchmark.c"],
+    deps = [
+        ":resource_set",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:prng",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:benchmark",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "resource_set_test",
+    srcs = ["resource_set_test.cc"],
+    deps = [
+        ":resource_set",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "semaphore_base",
+    srcs = ["semaphore_base.c"],
+    hdrs = ["semaphore_base.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "semaphore_base_test",
+    srcs = ["semaphore_base_test.cc"],
+    deps = [
+        ":semaphore_base",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:wait_handle",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "stream_tracing",
+    srcs = ["stream_tracing.c"],
+    hdrs = ["stream_tracing.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_cmake_extra_content(
+    content = """
+if(NOT IREE_ENABLE_THREADING)
+  return()
+endif()
+""",
+    inline = True,
+)
+
+iree_runtime_cc_library(
+    name = "deferred_work_queue",
+    srcs = ["deferred_work_queue.c"],
+    hdrs = ["deferred_work_queue.h"],
+    deps = [
+        ":deferred_command_buffer",
+        ":resource_set",
+        ":semaphore_base",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:arena",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/base/internal:threading",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "queue_host_call_emulation",
+    srcs = ["queue_host_call_emulation.c"],
+    hdrs = ["queue_host_call_emulation.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/base/internal:threading",
+        "//runtime/src/iree/hal",
+    ],
+)

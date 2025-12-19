@@ -1,0 +1,228 @@
+# Copyright 2020 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:build_defs.oss.bzl", "iree_runtime_cc_library", "iree_runtime_cc_test")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_runtime_cc_library(
+    name = "buffer_view_matchers",
+    srcs = ["buffer_view_matchers.c"],
+    hdrs = ["buffer_view_matchers.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "buffer_view_matchers_test",
+    srcs = ["buffer_view_matchers_test.cc"],
+    deps = [
+        ":buffer_view_matchers",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal",
+        "//runtime/src/iree/base/internal:span",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "comparison",
+    srcs = ["comparison.cc"],
+    hdrs = ["comparison.h"],
+    deps = [
+        ":buffer_view_matchers",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/base/internal:span",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "comparison_test",
+    srcs = ["comparison_test.cc"],
+    deps = [
+        ":comparison",
+        ":function_io",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:span",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "context_util",
+    srcs = ["context_util.c"],
+    hdrs = ["context_util.h"],
+    deps = [
+        ":device_util",
+        ":parameter_util",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/base/internal:path",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/local/loaders/registration",
+        "//runtime/src/iree/hal/local/plugins/registration",
+        "//runtime/src/iree/io:file_handle",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/modules/hal/inline",
+        "//runtime/src/iree/modules/hal/loader",
+        "//runtime/src/iree/tooling/modules",
+        "//runtime/src/iree/vm",
+        "//runtime/src/iree/vm/bytecode:module",
+        "//runtime/src/iree/vm/dynamic:module",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "device_util",
+    srcs = ["device_util.c"],
+    hdrs = ["device_util.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/base/internal:synchronization",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/drivers",
+        "//runtime/src/iree/hal/utils:allocators",
+        "//runtime/src/iree/hal/utils:mpi_channel_provider",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "function_io",
+    srcs = ["function_io.c"],
+    hdrs = ["function_io.h"],
+    deps = [
+        ":numpy_io",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:stream",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "function_io_test",
+    srcs = ["function_io_test.cc"],
+    deps = [
+        ":function_io",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:stream",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "function_util",
+    srcs = ["function_util.c"],
+    hdrs = ["function_util.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/modules/hal",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "instrument_util",
+    srcs = ["instrument_util.c"],
+    hdrs = ["instrument_util.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/modules/hal:types",
+        "//runtime/src/iree/schemas/instruments",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "numpy_io",
+    srcs = ["numpy_io.c"],
+    hdrs = ["numpy_io.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:stream",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "numpy_io_test",
+    srcs = ["numpy_io_test.cc"],
+    tags = ["requires-filesystem"],
+    deps = [
+        ":device_util",
+        ":numpy_io",
+        "//runtime/src/iree/io:stream",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
+        "//runtime/src/iree/tooling/testdata/npy",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "parameter_util",
+    srcs = ["parameter_util.c"],
+    hdrs = ["parameter_util.h"],
+    deps = [
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:file_handle",
+        "//runtime/src/iree/io:parameter_index",
+        "//runtime/src/iree/io:parameter_index_provider",
+        "//runtime/src/iree/io:parameter_provider",
+        "//runtime/src/iree/io:scope_map",
+        "//runtime/src/iree/io/formats:parser_registry",
+        "//runtime/src/iree/modules/io/parameters",
+        "//runtime/src/iree/vm",
+    ],
+)
+
+iree_runtime_cc_library(
+    name = "run_module",
+    srcs = ["run_module.c"],
+    hdrs = ["run_module.h"],
+    deps = [
+        ":comparison",
+        ":context_util",
+        ":device_util",
+        ":function_io",
+        ":function_util",
+        ":instrument_util",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/base/internal:flags",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/io:stream",
+        "//runtime/src/iree/modules/hal:types",
+        "//runtime/src/iree/vm",
+        "//runtime/src/iree/vm/bytecode:module",
+    ],
+)

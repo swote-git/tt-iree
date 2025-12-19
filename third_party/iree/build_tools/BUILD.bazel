@@ -1,0 +1,40 @@
+# Copyright 2020 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+load("//build_tools/bazel:build_defs.oss.bzl", "iree_cc_library")
+
+package(
+    default_visibility = ["//visibility:public"],
+    features = ["layering_check"],
+    licenses = ["notice"],  # Apache 2.0
+)
+
+iree_cc_library(
+    name = "pthreads",
+    linkopts = select({
+        "//build_tools/bazel:iree_is_msvc": [],
+        "//build_tools/bazel:iree_is_android": [
+            # Android provides its own pthreads support with no linking required.
+        ],
+        "//conditions:default": [
+            # Just include libraries that should be presumed in 2020.
+            "-lpthread",
+        ],
+    }),
+)
+
+iree_cc_library(
+    name = "dl",
+    linkopts = select({
+        "//build_tools/bazel:iree_is_msvc": [],
+        "//build_tools/bazel:iree_is_android": [
+            "-ldl",
+        ],
+        "//conditions:default": [
+            "-ldl",
+        ],
+    }),
+)
