@@ -6,7 +6,7 @@ IREE Backend for Tenstorrent AI Accelerators
 
 ## Overview
 
-tt-iree enables execution of ML models compiled with [IREE](https://github.com/iree-org/iree) on [Tenstorrent](https://tenstorrent.com/) AI accelerators (P100A, Wormhole architecture).
+tt-iree enables execution of ML models compiled with [IREE](https://github.com/iree-org/iree) on [Tenstorrent](https://tenstorrent.com/) AI accelerators (P100A/Wormhole architecture).
 
 ```python
 # Goal: Seamless deployment to Tenstorrent
@@ -32,6 +32,15 @@ result = runtime.invoke(compiled, inputs)
 - [ ] TTNN integration
 - [ ] Hardware execution
 
+## Version Compatibility
+
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| IREE | v3.9.0 | Compiler & runtime infrastructure |
+| tt-metal | v0.65.0 | Tenstorrent SDK (TTNN, TT-Metalium) |
+
+These versions have been tested together. See [VERSIONS.md](VERSIONS.md) for details.
+
 ## Project Structure
 
 ```
@@ -41,8 +50,9 @@ tt-iree/
 ├── runtime/               # IREE HAL driver
 │   └── src/iree/hal/drivers/tenstorrent/
 ├── third_party/
-│   ├── iree/              # IREE (submodule)
-│   └── tt-metal/          # TT-Metal SDK (submodule)
+│   ├── iree/              # IREE v3.9.0 (submodule)
+│   └── tt-metal/          # tt-metal v0.65.0 (submodule)
+├── docs/                  # Documentation
 ├── test/                  # Tests
 └── examples/              # Example programs
 ```
@@ -61,15 +71,19 @@ tt-iree/
 sudo apt-get install cmake ninja-build clang lld python3-pip
 ```
 
-### Clone Repository
+### Clone and Setup
 
 ```bash
 git clone https://github.com/user/tt-iree.git
 cd tt-iree
-git submodule update --init --recursive
+
+# Setup submodules with pinned versions
+./scripts/setup_submodules.sh
 ```
 
-### Build (Mock Mode - No Hardware)
+> **Note**: Submodule initialization takes ~10-20 minutes due to IREE's large dependency tree.
+
+### Build (Mock Mode) **not working in current state**
 
 ```bash
 cmake -G Ninja -B build \
@@ -84,7 +98,7 @@ cmake --build build
 ### Build (With Hardware)
 
 ```bash
-# Set up TT-Metal environment first
+# Set up TT-Metal environment
 source third_party/tt-metal/build/python_env/bin/activate
 export TT_METAL_HOME=$(pwd)/third_party/tt-metal
 
@@ -96,69 +110,61 @@ cmake -G Ninja -B build \
 cmake --build build
 ```
 
-### Verify Installation
-
-```bash
-# Check driver registration
-./build/tools/iree-run-module --list_drivers
-# Should show: tenstorrent
-```
-
-## Quick Start
-
-### Compile and Run (Mock Mode)
-
-```bash
-# Compile MLIR to Tenstorrent target
-./build/tools/iree-compile \
-  --iree-hal-target-backends=tenstorrent \
-  examples/simple_add.mlir \
-  -o /tmp/simple_add.vmfb
-
-# Run on mock device
-./build/tools/iree-run-module \
-  --device=tenstorrent \
-  --module=/tmp/simple_add.vmfb \
-  --function=main \
-  --input="4xf32=1,2,3,4"
-```
-
-## Development
-
-### Running Tests
-
-```bash
-cd build
-ctest -L tt-iree --output-on-failure
-```
-
-### Code Formatting
-
-```bash
-./scripts/format.sh
-```
-
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for detailed design documentation.
+This project implements an out-of-tree IREE backend for Tenstorrent hardware, consisting of two main components:
 
-### Key Components
+### Compiler Backend
+
+Extends IREE's compiler to generate code for Tenstorrent's tile-based architecture:
+
+- Converts IREE's HAL dialect to Tenstorrent-specific representation
+- Handles 32x32 tile layout transformation
+- Maps workloads to 8x8 Tensix core grid
+- Generates TT-Metal kernel code
+
+### Runtime Driver
+
+Implements IREE's Hardware Abstraction Layer (HAL) interface:
 
 | Component | Description |
 |-----------|-------------|
-| `TenstorrentTarget` | IREE compiler backend plugin |
-| `tt_driver` | HAL driver implementation |
-| `tt_device` | Device management |
-| `tt_buffer` | Buffer allocation |
-| `ttnn_bridge` | TTNN library integration |
+| `tt_driver` | Driver registration and device enumeration |
+| `tt_device` | Device lifecycle and capability management |
+| `tt_allocator` | Buffer allocation (DRAM/L1) |
+| `tt_buffer` | Memory management with tile layout |
+| `tt_command_buffer` | Command recording and dispatch |
+| `tt_executable` | Kernel loading and execution |
+
+### Data Flow
+
+```
+PyTorch/JAX/TensorFlow
+        ↓
+   StableHLO/TOSA
+        ↓
+  IREE Compiler (Flow → Stream → HAL)
+        ↓
+  Tenstorrent Backend (HAL → TT-Metal)
+        ↓
+   .vmfb (VM FlatBuffer)
+        ↓
+  IREE Runtime + HAL Driver
+        ↓
+  TT-Metal Runtime → P100A Hardware
+```
+
+For detailed architecture documentation, see [docs/](docs/).
 
 ## Roadmap
 
-- **PoC (Current)**: Single operation, mock execution
-- **MVP**: MNIST inference on P100A
-- **Alpha**: ResNet-18, multi-core dispatch
-- **Beta**: LLM inference (GPT-2 scale)
-- **v1.0**: Production release
+| Phase | Goal | Status |
+|-------|------|--------|
+| **PoC** | Single operation, mock execution | WIP |
+| **MVP** | MNIST inference on P100A | Planned |
+| **Alpha** | ResNet-18, multi-core dispatch | Planned |
+| **Beta** | LLM inference (GPT-2 scale) | Planned |
+| **v1.0** | Production release | Planned |
 
 ## Related Projects
 
@@ -173,5 +179,4 @@ Apache 2.0 with LLVM Exceptions. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- IREE Team for the excellent compiler infrastructure
-- Tenstorrent for open-sourcing tt-metal and tt-mlir
+- Developed as part of the **Tenstorrent Korea Open Source Developer Program**.
