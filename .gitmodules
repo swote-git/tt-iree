@@ -1,9 +1,7 @@
 [submodule "third_party/iree"]
 	path = third_party/iree
 	url = https://github.com/iree-org/iree.git
-	branch = main
 
 [submodule "third_party/tt-metal"]
 	path = third_party/tt-metal
 	url = https://github.com/tenstorrent/tt-metal.git
-	branch = main

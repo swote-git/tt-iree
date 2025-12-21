@@ -18,47 +18,70 @@ echo ""
 
 cd "${ROOT_DIR}"
 
-# Initialize submodules (without recursive for now)
-echo "=== Initializing submodules ==="
-git submodule init
+# Check if this is a git repository
+if [ ! -d ".git" ]; then
+  echo "Error: Not a git repository. Run 'git init' first."
+  exit 1
+fi
 
-# Update IREE to specific version
-echo ""
-echo "=== Fetching IREE ${IREE_VERSION} ==="
+#-------------------------------------------------------------------------------
+# IREE
+#-------------------------------------------------------------------------------
+echo "=== Setting up IREE ${IREE_VERSION} ==="
+
+if [ ! -d "third_party/iree/.git" ] && [ ! -f "third_party/iree/.git" ]; then
+  echo "Adding IREE submodule..."
+  rm -rf third_party/iree
+  git submodule add https://github.com/iree-org/iree.git third_party/iree
+fi
+
 git submodule update --init third_party/iree
 cd third_party/iree
-git fetch --tags
+git fetch --tags --force
 git checkout ${IREE_VERSION}
 echo "IREE checked out to ${IREE_VERSION}"
 
-# Initialize IREE's submodules (this takes a while)
 echo ""
-echo "=== Initializing IREE submodules (this may take a while) ==="
+echo "Initializing IREE submodules (this may take 10-20 minutes)..."
 git submodule update --init --recursive
 
 cd "${ROOT_DIR}"
 
-# Update tt-metal to specific version
+#-------------------------------------------------------------------------------
+# tt-metal
+#-------------------------------------------------------------------------------
 echo ""
-echo "=== Fetching tt-metal ${TT_METAL_VERSION} ==="
+echo "=== Setting up tt-metal ${TT_METAL_VERSION} ==="
+
+if [ ! -d "third_party/tt-metal/.git" ] && [ ! -f "third_party/tt-metal/.git" ]; then
+  echo "Adding tt-metal submodule..."
+  rm -rf third_party/tt-metal
+  git submodule add https://github.com/tenstorrent/tt-metal.git third_party/tt-metal
+fi
+
 git submodule update --init third_party/tt-metal
 cd third_party/tt-metal
-git fetch --tags
+git fetch --tags --force
 git checkout ${TT_METAL_VERSION}
 echo "tt-metal checked out to ${TT_METAL_VERSION}"
 
-# Initialize tt-metal's submodules
 echo ""
-echo "=== Initializing tt-metal submodules ==="
+echo "Initializing tt-metal submodules..."
 git submodule update --init --recursive
 
 cd "${ROOT_DIR}"
 
+#-------------------------------------------------------------------------------
+# Done
+#-------------------------------------------------------------------------------
 echo ""
-echo "=== Submodules initialized ==="
+echo "=== Submodules setup complete ==="
 echo "  - third_party/iree @ ${IREE_VERSION}"
 echo "  - third_party/tt-metal @ ${TT_METAL_VERSION}"
 echo ""
+git add .gitmodules third_party/iree third_party/tt-metal
+git commit -m "Add submodules: IREE ${IREE_VERSION}, tt-metal ${TT_METAL_VERSION}" || echo "(already committed)"
+echo ""
 echo "Next steps:"
-echo "  1. Configure: cmake -G Ninja -B build -DTT_IREE_ENABLE_MOCK=ON"
-echo "  2. Build: cmake --build build"
+echo "  1. cmake -G Ninja -B build -DTT_IREE_ENABLE_MOCK=ON"
+echo "  2. cmake --build build"
