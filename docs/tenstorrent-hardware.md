@@ -4,13 +4,13 @@ Overview of Tenstorrent AI accelerator architecture relevant to tt-iree.
 
 ## Target Hardware
 
-### P100A (Wormhole)
+### P100A (Blackhole)
 
-The primary target for tt-iree is the P100A card based on the Wormhole architecture.
+The primary target for tt-iree is the P100A card based on the Blackhole architecture.
 
 | Specification | Value | Note |
 |---------------|-------|------|
-| Architecture | Wormhole | |
+| Architecture | Blackhole | |
 | Tensix Cores | **120** | Full 10x12 grid active |
 | DRAM | **28GB GDDR6** | 448 GB/s bandwidth |
 | **SRAM** | **180 MB** | **1.5MB per core × 120 cores** |
@@ -265,4 +265,4 @@ Good for: Matrix operations
 
 - [Tenstorrent Documentation](https://docs.tenstorrent.com/)
 - [TT-Metal GitHub](https://github.com/tenstorrent/tt-metal)
-- [Wormhole Architecture](https://tenstorrent.com/technology)
+- [Blackhole Architecture](https://tenstorrent.com/technology)

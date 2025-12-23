@@ -6,7 +6,7 @@ IREE Backend for Tenstorrent AI Accelerators
 
 ## Overview
 
-tt-iree enables execution of ML models compiled with [IREE](https://github.com/iree-org/iree) on [Tenstorrent](https://tenstorrent.com/) AI accelerators (P100A/Wormhole architecture).
+tt-iree enables execution of ML models compiled with [IREE](https://github.com/iree-org/iree) on [Tenstorrent](https://tenstorrent.com/) AI accelerators (P100A/Blackhole architecture).
 
 ```python
 # Goal: Seamless deployment to Tenstorrent

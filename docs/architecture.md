@@ -6,26 +6,26 @@ Technical architecture of the tt-iree project.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    ML Frameworks                             │
-│              PyTorch │ JAX │ TensorFlow                      │
+│                    ML Frameworks                            │
+│              PyTorch │ JAX │ TensorFlow                     │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼ (torch-mlir, jax2mlir, etc.)
 ┌─────────────────────────────────────────────────────────────┐
-│                  MLIR Input Dialects                         │
-│              StableHLO │ TOSA │ Linalg                       │
+│                  MLIR Input Dialects                        │
+│              StableHLO │ TOSA │ Linalg                      │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                 IREE Compiler Pipeline                       │
+│                 IREE Compiler Pipeline                      │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ Flow Dialect    - Dispatch region formation           │  │
 │  │ Stream Dialect  - Async execution modeling            │  │
 │  │ HAL Dialect     - Hardware abstraction                │  │
 │  └───────────────────────────────────────────────────────┘  │
-│                         │                                    │
-│                         ▼                                    │
+│                         │                                   │
+│                         ▼                                  │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ Tenstorrent Target Backend (tt-iree)                  │  │
 │  │  - Linalg → TT-Metal kernel conversion                │  │
@@ -42,7 +42,7 @@ Technical architecture of the tt-iree project.
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    IREE Runtime                              │
+│                    IREE Runtime                             │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ Tenstorrent HAL Driver (tt-iree)                      │  │
 │  │  - Device management                                  │  │
@@ -53,15 +53,15 @@ Technical architecture of the tt-iree project.
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   TT-Metal Runtime                           │
-│              TTNN │ TT-Metal API │ Device Driver             │
+│                   TT-Metal Runtime                          │
+│              TTNN │ TT-Metal API │ Device Driver            │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Tenstorrent Hardware (P100A)                    │
-│                  8x8 Tensix Core Grid                        │
-│                     24GB GDDR6                               │
+│              Tenstorrent Hardware (P100A)                   │
+│                  8x8 Tensix Core Grid                       │
+│                     24GB GDDR6                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 

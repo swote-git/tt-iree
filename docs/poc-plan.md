@@ -8,7 +8,7 @@ Achieve end-to-end execution of a single operation on real P100A hardware via IR
 
 | Attribute | Value |
 |-----------|-------|
-| Target Hardware | Tenstorrent P100A (Wormhole, 120 Cores) |
+| Target Hardware | Tenstorrent P100A (Blackhole, 120 Cores) |
 | SDK Version | tt-metal v0.65.0 |
 | IREE Version | v3.9.0 |
 | Target Operation | Elementwise Add (`x + 1.0`) on 32x32 Tile |
