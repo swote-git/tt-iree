@@ -193,7 +193,6 @@ iree_status_t iree_hal_tt_buffer_create(
         // placement (new parameter) - where buffer is allocated
         (iree_hal_buffer_placement_t){
             .device = (iree_hal_device_t*)device,
-            .allocator = NULL,  // Will be set by allocator
         },
         // allocated_buffer - pointer to the buffer struct
         &buffer->base,

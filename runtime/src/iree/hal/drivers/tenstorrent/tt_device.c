@@ -63,7 +63,7 @@ void* iree_hal_tt_device_get_compute_queue(iree_hal_tt_device_t* device) {
 //===----------------------------------------------------------------------===//
 
 iree_status_t iree_hal_tt_device_create(
-    iree_hal_tt_driver_t* driver,
+    iree_hal_tenstorrent_driver_t* driver,
     iree_hal_device_id_t device_id,
     iree_allocator_t host_allocator,
     iree_hal_device_t** out_device) {

@@ -113,7 +113,7 @@ static iree_status_t iree_hal_tt_allocator_query_memory_heaps(
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .allowed_usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                        IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
-                       IREE_HAL_BUFFER_USAGE_DISPATCH_INDIRECT_PARAMS |
+                       IREE_HAL_BUFFER_USAGE_DISPATCH_INDIRECT_PARAMETERS |
                        IREE_HAL_BUFFER_USAGE_DISPATCH_UNIFORM_READ,
       .max_allocation_size = 28LL * 1024 * 1024 * 1024,  // 28GB
       .min_alignment = 32,  // 32-byte alignment (tile-friendly)

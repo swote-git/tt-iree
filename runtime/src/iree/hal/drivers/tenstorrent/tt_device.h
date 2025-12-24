@@ -12,7 +12,7 @@ extern "C" {
 #endif  // __cplusplus
 
 // Forward declarations
-typedef struct iree_hal_tt_driver_t iree_hal_tt_driver_t;
+typedef struct iree_hal_tenstorrent_driver_t iree_hal_tenstorrent_driver_t;
 typedef struct iree_hal_tt_device_t iree_hal_tt_device_t;
 
 //===----------------------------------------------------------------------===//
@@ -37,7 +37,7 @@ typedef struct iree_hal_tt_device_t iree_hal_tt_device_t;
 //   host_allocator: Host memory allocator
 //   out_device: Receives created device (must be released by caller)
 iree_status_t iree_hal_tt_device_create(
-    iree_hal_tt_driver_t* driver,
+    iree_hal_tenstorrent_driver_t* driver,
     iree_hal_device_id_t device_id,
     iree_allocator_t host_allocator,
     iree_hal_device_t** out_device);

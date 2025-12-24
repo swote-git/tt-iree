@@ -9,10 +9,10 @@
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 
 //===----------------------------------------------------------------------===//
-// iree_hal_tt_driver_t
+// iree_hal_tenstorrent_driver_t
 //===----------------------------------------------------------------------===//
 
-typedef struct iree_hal_tt_driver_t {
+typedef struct iree_hal_tenstorrent_driver_t {
   iree_hal_resource_t resource;
   iree_allocator_t host_allocator;
   
@@ -23,21 +23,21 @@ typedef struct iree_hal_tt_driver_t {
   // #ifndef TT_IREE_ENABLE_MOCK
   // tt_metal_system_t* system;
   // #endif
-} iree_hal_tt_driver_t;
+} iree_hal_tenstorrent_driver_t;
 
-static const iree_hal_driver_vtable_t iree_hal_tt_driver_vtable;
+static const iree_hal_driver_vtable_t iree_hal_tenstorrent_driver_vtable;
 
-static iree_hal_tt_driver_t* iree_hal_tt_driver_cast(
+static iree_hal_tenstorrent_driver_t* iree_hal_tenstorrent_driver_cast(
     iree_hal_driver_t* base_driver) {
-  IREE_HAL_ASSERT_TYPE(base_driver, &iree_hal_tt_driver_vtable);
-  return (iree_hal_tt_driver_t*)base_driver;
+  IREE_HAL_ASSERT_TYPE(base_driver, &iree_hal_tenstorrent_driver_vtable);
+  return (iree_hal_tenstorrent_driver_t*)base_driver;
 }
 
 //===----------------------------------------------------------------------===//
 // Driver creation
 //===----------------------------------------------------------------------===//
 
-iree_status_t iree_hal_tt_driver_create(
+iree_status_t iree_hal_tenstorrent_driver_create(
     iree_string_view_t identifier,
     iree_allocator_t host_allocator,
     iree_hal_driver_t** out_driver) {
@@ -46,12 +46,12 @@ iree_status_t iree_hal_tt_driver_create(
   
   IREE_TRACE_ZONE_BEGIN(z0);
   
-  iree_hal_tt_driver_t* driver = NULL;
+  iree_hal_tenstorrent_driver_t* driver = NULL;
   iree_status_t status = iree_allocator_malloc(
       host_allocator, sizeof(*driver), (void**)&driver);
   
   if (iree_status_is_ok(status)) {
-    iree_hal_resource_initialize(&iree_hal_tt_driver_vtable, &driver->resource);
+    iree_hal_resource_initialize(&iree_hal_tenstorrent_driver_vtable, &driver->resource);
     driver->host_allocator = host_allocator;
     driver->identifier = identifier;
     
@@ -77,8 +77,8 @@ iree_status_t iree_hal_tt_driver_create(
 // Driver vtable implementation
 //===----------------------------------------------------------------------===//
 
-static void iree_hal_tt_driver_destroy(iree_hal_driver_t* base_driver) {
-  iree_hal_tt_driver_t* driver = iree_hal_tt_driver_cast(base_driver);
+static void iree_hal_tenstorrent_driver_destroy(iree_hal_driver_t* base_driver) {
+  iree_hal_tenstorrent_driver_t* driver = iree_hal_tenstorrent_driver_cast(base_driver);
   iree_allocator_t host_allocator = driver->host_allocator;
   
   IREE_TRACE_ZONE_BEGIN(z0);
@@ -93,7 +93,7 @@ static void iree_hal_tt_driver_destroy(iree_hal_driver_t* base_driver) {
   IREE_TRACE_ZONE_END(z0);
 }
 
-static iree_status_t iree_hal_tt_driver_query_available_devices(
+static iree_status_t iree_hal_tenstorrent_driver_query_available_devices(
     iree_hal_driver_t* base_driver,
     iree_allocator_t host_allocator,
     iree_host_size_t* out_device_info_count,
@@ -122,7 +122,7 @@ static iree_status_t iree_hal_tt_driver_query_available_devices(
 #endif
 }
 
-static iree_status_t iree_hal_tt_driver_dump_device_info(
+static iree_status_t iree_hal_tenstorrent_driver_dump_device_info(
     iree_hal_driver_t* base_driver,
     iree_hal_device_id_t device_id,
     iree_string_builder_t* builder) {
@@ -133,14 +133,14 @@ static iree_status_t iree_hal_tt_driver_dump_device_info(
   return iree_ok_status();
 }
 
-static iree_status_t iree_hal_tt_driver_create_device_by_id(
+static iree_status_t iree_hal_tenstorrent_driver_create_device_by_id(
     iree_hal_driver_t* base_driver,
     iree_hal_device_id_t device_id,
     iree_host_size_t param_count,
     const iree_string_pair_t* params,
     iree_allocator_t host_allocator,
     iree_hal_device_t** out_device) {
-  iree_hal_tt_driver_t* driver = iree_hal_tt_driver_cast(base_driver);
+  iree_hal_tenstorrent_driver_t* driver = iree_hal_tenstorrent_driver_cast(base_driver);
   
   IREE_TRACE_ZONE_BEGIN(z0);
   
@@ -154,7 +154,7 @@ static iree_status_t iree_hal_tt_driver_create_device_by_id(
   return status;
 }
 
-static iree_status_t iree_hal_tt_driver_create_device_by_path(
+static iree_status_t iree_hal_tenstorrent_driver_create_device_by_path(
     iree_hal_driver_t* base_driver,
     iree_string_view_t driver_name,
     iree_string_view_t device_path,
@@ -165,7 +165,7 @@ static iree_status_t iree_hal_tt_driver_create_device_by_path(
   // For now, just use device ID 0 if path is empty or "0"
   if (iree_string_view_is_empty(device_path) ||
       iree_string_view_equal(device_path, IREE_SV("0"))) {
-    return iree_hal_tt_driver_create_device_by_id(
+    return iree_hal_tenstorrent_driver_create_device_by_id(
         base_driver, 0, param_count, params, host_allocator, out_device);
   }
   
@@ -178,10 +178,10 @@ static iree_status_t iree_hal_tt_driver_create_device_by_path(
 // vtable
 //===----------------------------------------------------------------------===//
 
-static const iree_hal_driver_vtable_t iree_hal_tt_driver_vtable = {
-    .destroy = iree_hal_tt_driver_destroy,
-    .query_available_devices = iree_hal_tt_driver_query_available_devices,
-    .dump_device_info = iree_hal_tt_driver_dump_device_info,
-    .create_device_by_id = iree_hal_tt_driver_create_device_by_id,
-    .create_device_by_path = iree_hal_tt_driver_create_device_by_path,
+static const iree_hal_driver_vtable_t iree_hal_tenstorrent_driver_vtable = {
+    .destroy = iree_hal_tenstorrent_driver_destroy,
+    .query_available_devices = iree_hal_tenstorrent_driver_query_available_devices,
+    .dump_device_info = iree_hal_tenstorrent_driver_dump_device_info,
+    .create_device_by_id = iree_hal_tenstorrent_driver_create_device_by_id,
+    .create_device_by_path = iree_hal_tenstorrent_driver_create_device_by_path,
 };

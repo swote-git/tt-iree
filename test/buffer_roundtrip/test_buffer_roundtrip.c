@@ -22,6 +22,7 @@
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/tenstorrent/api.h"
 #include "iree/hal/drivers/tenstorrent/registration/driver_module.h"
+#include "iree/hal/drivers/tenstorrent/tt_buffer.h"
 
 // Test helper: Create sequential test data
 static void fill_sequential(float* data, int size) {
@@ -71,7 +72,7 @@ static iree_status_t test_tile_conversion(void) {
   bool success = arrays_equal(row_major, unpacked, size, 1e-6f);
   
   if (success) {
-    printf("✓ Tile conversion is bit-exact\n");
+    printf("Tile conversion is bit-exact\n");
     
     // Print sample to verify tile ordering
     printf("  Sample values:\n");
@@ -82,7 +83,7 @@ static iree_status_t test_tile_conversion(void) {
     printf("    Original[1024] = %.1f, Tiled[1024] = %.1f (start of 2nd tile)\n",
            row_major[1024], tiled[1024]);
   } else {
-    printf("✗ Tile conversion failed\n");
+    printf("Tile conversion failed\n");
   }
   
   free(row_major);
@@ -117,22 +118,22 @@ static iree_status_t test_buffer_allocation(iree_hal_device_t* device) {
       allocator, params, buffer_size, &buffer);
   
   if (iree_status_is_ok(status)) {
-    printf("✓ Buffer allocated: %zu bytes\n", (size_t)buffer_size);
+    printf("Buffer allocated: %zu bytes\n", (size_t)buffer_size);
     
     // Verify buffer properties
     iree_device_size_t allocated_size = iree_hal_buffer_allocation_size(buffer);
     printf("  Allocated size: %zu bytes\n", (size_t)allocated_size);
     
     if (allocated_size >= buffer_size) {
-      printf("✓ Buffer size correct\n");
+      printf("Buffer size correct\n");
     } else {
-      printf("✗ Buffer size mismatch\n");
+      printf("Buffer size mismatch\n");
       status = iree_make_status(IREE_STATUS_INTERNAL, "size mismatch");
     }
     
     iree_hal_buffer_release(buffer);
   } else {
-    printf("✗ Buffer allocation failed: %s\n", 
+    printf("Buffer allocation failed: %s\n", 
            iree_status_code_string(iree_status_code(status)));
   }
   
@@ -166,14 +167,14 @@ static iree_status_t test_buffer_roundtrip(iree_hal_device_t* device) {
   IREE_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(
       allocator, params, buffer_size, &buffer));
   
-  printf("✓ Buffer allocated\n");
+  printf("Buffer allocated\n");
   
   // Prepare test data
   float* input_data = (float*)malloc(buffer_size);
   float* output_data = (float*)malloc(buffer_size);
   fill_sequential(input_data, size);
   
-  printf("✓ Test data prepared (sequential 0..%d)\n", size - 1);
+  printf("Test data prepared (sequential 0..%d)\n", size - 1);
   
   // Step 1: Write to device
   iree_status_t status;
@@ -190,16 +191,17 @@ static iree_status_t test_buffer_roundtrip(iree_hal_device_t* device) {
     if (iree_status_is_ok(status)) {
       memcpy(mapping.contents.data, input_data, buffer_size);
       
-      status = iree_hal_buffer_unmap_range(buffer, 0, buffer_size, &mapping);
+      // FIXED: IREE v3.9.0 API - only takes mapping parameter
+      status = iree_hal_buffer_unmap_range(&mapping);
       
       if (iree_status_is_ok(status)) {
-        printf("✓ Data written to device (with tile conversion)\n");
+        printf("Data written to device (with tile conversion)\n");
       }
     }
   }
   
   if (!iree_status_is_ok(status)) {
-    printf("✗ Write failed: %s\n", 
+    printf("Write failed: %s\n", 
            iree_status_code_string(iree_status_code(status)));
     goto cleanup;
   }
@@ -218,16 +220,17 @@ static iree_status_t test_buffer_roundtrip(iree_hal_device_t* device) {
     if (iree_status_is_ok(status)) {
       memcpy(output_data, mapping.contents.data, buffer_size);
       
-      status = iree_hal_buffer_unmap_range(buffer, 0, buffer_size, &mapping);
+      // FIXED: IREE v3.9.0 API - only takes mapping parameter
+      status = iree_hal_buffer_unmap_range(&mapping);
       
       if (iree_status_is_ok(status)) {
-        printf("✓ Data read from device (with tile conversion)\n");
+        printf("Data read from device (with tile conversion)\n");
       }
     }
   }
   
   if (!iree_status_is_ok(status)) {
-    printf("✗ Read failed: %s\n", 
+    printf("Read failed: %s\n", 
            iree_status_code_string(iree_status_code(status)));
     goto cleanup;
   }
@@ -236,13 +239,13 @@ static iree_status_t test_buffer_roundtrip(iree_hal_device_t* device) {
   bool data_matches = arrays_equal(input_data, output_data, size, 1e-6f);
   
   if (data_matches) {
-    printf("✓ Round-trip successful! Data matches exactly.\n");
+    printf("Round-trip successful! Data matches exactly.\n");
     printf("  Sample: input[0]=%.1f, output[0]=%.1f\n", 
            input_data[0], output_data[0]);
     printf("  Sample: input[100]=%.1f, output[100]=%.1f\n",
            input_data[100], output_data[100]);
   } else {
-    printf("✗ Round-trip failed: data mismatch\n");
+    printf("Round-trip failed: data mismatch\n");
     status = iree_make_status(IREE_STATUS_DATA_LOSS, "data mismatch");
   }
 
@@ -300,7 +303,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   
-  printf("\n✓ Tenstorrent driver created\n");
+  printf("\nTenstorrent driver created\n");
   
   // Create device
   iree_hal_device_t* device = NULL;
@@ -316,7 +319,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   
-  printf("✓ Device created (Device ID: 0)\n");
+  printf("Device created (Device ID: 0)\n");
   
   // Run device-dependent tests
   status = test_buffer_allocation(device);
@@ -331,11 +334,11 @@ int main(int argc, char** argv) {
   
   printf("\n==============================================\n");
   if (iree_status_is_ok(status)) {
-    printf("✓ ALL TESTS PASSED - Week 2 Complete!\n");
+    printf("ALL TESTS PASSED\n");
     printf("==============================================\n");
     return 0;
   } else {
-    printf("✗ TESTS FAILED\n");
+    printf("TESTS FAILED\n");
     printf("==============================================\n");
     return 1;
   }
