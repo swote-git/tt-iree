@@ -109,7 +109,8 @@ static iree_status_t iree_hal_tt_driver_query_available_devices(
       host_allocator, sizeof(iree_hal_device_info_t), (void**)&device_infos));
   
   device_infos[0].device_id = 0;
-  device_infos[0].name = IREE_SVL("Tenstorrent P100A (Mock)");
+  // FIXED: Use iree_make_cstring_view instead of IREE_SVL
+  device_infos[0].name = iree_make_cstring_view("Tenstorrent P100A (Mock)");
   
   *out_device_infos = device_infos;
   return iree_ok_status();
@@ -127,8 +128,8 @@ static iree_status_t iree_hal_tt_driver_dump_device_info(
     iree_string_builder_t* builder) {
   // TODO: Add device info dumping
   iree_string_builder_append_cstring(builder, "Tenstorrent Device\n");
-  iree_string_builder_append_cstring(builder, "  Architecture: Wormhole\n");
-  iree_string_builder_append_cstring(builder, "  Cores: 8x8 Tensix grid\n");
+  iree_string_builder_append_cstring(builder, "  Architecture: Blackhole\n");
+  iree_string_builder_append_cstring(builder, "  Cores: 120 Tensix (10x12 grid)\n");
   return iree_ok_status();
 }
 

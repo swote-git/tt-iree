@@ -16,7 +16,7 @@ static iree_status_t iree_hal_tenstorrent_driver_factory_enumerate(
   static const iree_hal_driver_info_t driver_infos[] = {
       {
           .driver_name = IREE_SVL("tenstorrent"),
-          .full_name = IREE_SVL("Tenstorrent AI Accelerator (P100A/Wormhole)"),
+          .full_name = IREE_SVL("Tenstorrent AI Accelerator (P100A/Blackhole)"),
       },
   };
   *out_driver_info_count = IREE_ARRAYSIZE(driver_infos);

@@ -5,6 +5,8 @@
 
 #include <stddef.h>
 
+#include "iree/hal/drivers/tenstorrent/tt_allocator.h"
+
 //===----------------------------------------------------------------------===//
 // iree_hal_tt_device_t
 //===----------------------------------------------------------------------===//
@@ -35,6 +37,28 @@ static iree_hal_tt_device_t* iree_hal_tt_device_cast(
 }
 
 //===----------------------------------------------------------------------===//
+// Utility functions for other modules
+//===----------------------------------------------------------------------===//
+
+void* iree_hal_tt_device_get_tt_metal_handle(iree_hal_tt_device_t* device) {
+#ifndef TT_IREE_ENABLE_MOCK
+  // TODO: return device->ttnn_device;
+  return NULL;
+#else
+  return NULL;
+#endif
+}
+
+void* iree_hal_tt_device_get_compute_queue(iree_hal_tt_device_t* device) {
+#ifndef TT_IREE_ENABLE_MOCK
+  // TODO: return device->compute_queue;
+  return NULL;
+#else
+  return NULL;
+#endif
+}
+
+//===----------------------------------------------------------------------===//
 // Device creation
 //===----------------------------------------------------------------------===//
 
@@ -55,7 +79,7 @@ iree_status_t iree_hal_tt_device_create(
   if (iree_status_is_ok(status)) {
     iree_hal_resource_initialize(&iree_hal_tt_device_vtable, &device->resource);
     device->host_allocator = host_allocator;
-    device->identifier = IREE_SV("tenstorrent");
+    device->identifier = iree_make_cstring_view("tenstorrent");
     device->device_id = device_id;
     device->device_allocator = NULL;
     
@@ -65,15 +89,21 @@ iree_status_t iree_hal_tt_device_create(
 #endif
   }
   
-  // TODO: Create device allocator
-  // if (iree_status_is_ok(status)) {
-  //   status = iree_hal_tt_allocator_create(...);
-  // }
+  // Create device allocator
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_tt_allocator_create(
+        device,
+        host_allocator,
+        &device->device_allocator);
+  }
   
   if (iree_status_is_ok(status)) {
     *out_device = (iree_hal_device_t*)device;
   } else {
     if (device) {
+      if (device->device_allocator) {
+        iree_hal_allocator_release(device->device_allocator);
+      }
       iree_allocator_free(host_allocator, device);
     }
   }
@@ -216,8 +246,10 @@ static iree_status_t iree_hal_tt_device_import_file(
                          "file import not implemented");
 }
 
+// FIXED: Add queue_affinity parameter
 static iree_status_t iree_hal_tt_device_create_semaphore(
     iree_hal_device_t* base_device,
+    iree_hal_queue_affinity_t queue_affinity,
     uint64_t initial_value,
     iree_hal_semaphore_flags_t flags,
     iree_hal_semaphore_t** out_semaphore) {
@@ -233,6 +265,7 @@ iree_hal_tt_device_query_semaphore_compatibility(
   return IREE_HAL_SEMAPHORE_COMPATIBILITY_HOST_ONLY;
 }
 
+// FIXED: Add flags parameter
 static iree_status_t iree_hal_tt_device_queue_alloca(
     iree_hal_device_t* base_device,
     iree_hal_queue_affinity_t queue_affinity,
@@ -241,21 +274,25 @@ static iree_status_t iree_hal_tt_device_queue_alloca(
     iree_hal_allocator_pool_t pool,
     iree_hal_buffer_params_t params,
     iree_device_size_t allocation_size,
+    iree_hal_alloca_flags_t flags,
     iree_hal_buffer_t** out_buffer) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "queue alloca not implemented");
 }
 
+// FIXED: Add flags parameter
 static iree_status_t iree_hal_tt_device_queue_dealloca(
     iree_hal_device_t* base_device,
     iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
-    iree_hal_buffer_t* buffer) {
+    iree_hal_buffer_t* buffer,
+    iree_hal_dealloca_flags_t flags) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "queue dealloca not implemented");
 }
 
+// FIXED: Change flags type from uint32_t to iree_hal_read_flags_t
 static iree_status_t iree_hal_tt_device_queue_read(
     iree_hal_device_t* base_device,
     iree_hal_queue_affinity_t queue_affinity,
@@ -266,11 +303,12 @@ static iree_status_t iree_hal_tt_device_queue_read(
     iree_hal_buffer_t* target_buffer,
     iree_device_size_t target_offset,
     iree_device_size_t length,
-    uint32_t flags) {
+    iree_hal_read_flags_t flags) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "queue read not implemented");
 }
 
+// FIXED: Change flags type from uint32_t to iree_hal_write_flags_t
 static iree_status_t iree_hal_tt_device_queue_write(
     iree_hal_device_t* base_device,
     iree_hal_queue_affinity_t queue_affinity,
@@ -281,19 +319,20 @@ static iree_status_t iree_hal_tt_device_queue_write(
     iree_hal_file_t* target_file,
     uint64_t target_offset,
     iree_device_size_t length,
-    uint32_t flags) {
+    iree_hal_write_flags_t flags) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "queue write not implemented");
 }
 
+// FIXED: Change signature to match IREE v3.9.0
 static iree_status_t iree_hal_tt_device_queue_execute(
     iree_hal_device_t* base_device,
     iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
-    iree_host_size_t command_buffer_count,
-    iree_hal_command_buffer_t* const* command_buffers,
-    iree_hal_buffer_binding_table_t const* binding_tables) {
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    iree_hal_execute_flags_t flags) {
   // TODO: Implement queue execution
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "queue execute not implemented");
@@ -305,11 +344,13 @@ static iree_status_t iree_hal_tt_device_queue_flush(
   return iree_ok_status();
 }
 
+// FIXED: Add flags parameter
 static iree_status_t iree_hal_tt_device_wait_semaphores(
     iree_hal_device_t* base_device,
     iree_hal_wait_mode_t wait_mode,
     const iree_hal_semaphore_list_t semaphore_list,
-    iree_timeout_t timeout) {
+    iree_timeout_t timeout,
+    iree_hal_wait_flags_t flags) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                          "wait semaphores not implemented");
 }
