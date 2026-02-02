@@ -19,7 +19,6 @@ struct iree_hal_tt_allocator_t {
   iree_hal_allocator_statistics_t statistics;
 };
 
-// Forward declarations of vtable functions
 static void iree_hal_tt_allocator_destroy(iree_hal_allocator_t*);
 static iree_allocator_t iree_hal_tt_allocator_host_allocator(const iree_hal_allocator_t*);
 static iree_status_t iree_hal_tt_allocator_trim(iree_hal_allocator_t*);
@@ -31,7 +30,6 @@ static void iree_hal_tt_allocator_deallocate_buffer(iree_hal_allocator_t*, iree_
 static iree_status_t iree_hal_tt_allocator_import_buffer(iree_hal_allocator_t*, const iree_hal_buffer_params_t*, iree_hal_external_buffer_t*, iree_hal_buffer_release_callback_t, iree_hal_buffer_t**);
 static iree_status_t iree_hal_tt_allocator_export_buffer(iree_hal_allocator_t*, iree_hal_buffer_t*, iree_hal_external_buffer_type_t, iree_hal_external_buffer_flags_t, iree_hal_external_buffer_t*);
 
-// Define vtable early
 static const iree_hal_allocator_vtable_t iree_hal_tt_allocator_vtable = {
     .destroy = iree_hal_tt_allocator_destroy,
     .host_allocator = iree_hal_tt_allocator_host_allocator,

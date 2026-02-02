@@ -80,14 +80,12 @@ struct iree_hal_tt_buffer_t {
   bool uses_tile_layout;
 };
 
-// Forward declarations
 static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t*);
 static iree_status_t iree_hal_tt_buffer_map_range(iree_hal_buffer_t*, iree_hal_mapping_mode_t, iree_hal_memory_access_t, iree_device_size_t, iree_device_size_t, iree_hal_buffer_mapping_t*);
 static iree_status_t iree_hal_tt_buffer_unmap_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_buffer_mapping_t*);
 static iree_status_t iree_hal_tt_buffer_invalidate_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t);
 static iree_status_t iree_hal_tt_buffer_flush_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t);
 
-// Define vtable early
 static const iree_hal_buffer_vtable_t iree_hal_tt_buffer_vtable = {
     .recycle = nullptr,
     .destroy = iree_hal_tt_buffer_destroy,
