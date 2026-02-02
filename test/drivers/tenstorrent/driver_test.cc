@@ -128,7 +128,6 @@ int test_driver_info_dump() {
   status = iree_hal_driver_dump_device_info(driver, 0, &builder);
   TEST_STATUS_OK(status, "dump device info failed");
 
-  // Just verify we got some output
   iree_string_view_t info = iree_string_builder_view(&builder);
   TEST_ASSERT(info.size > 0, "no device info returned");
 

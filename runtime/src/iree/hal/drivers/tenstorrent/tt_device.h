@@ -46,19 +46,17 @@ iree_status_t iree_hal_tt_device_create(
 #ifdef __cplusplus
 }  // extern "C"
 
-// C++ only: internal accessors for TT-Metal handles
 #ifndef TT_IREE_ENABLE_MOCK
 namespace tt::tt_metal {
-class Device;
+class IDevice;
 class CommandQueue;
 }
 
-tt::tt_metal::Device* iree_hal_tt_device_handle(iree_hal_tt_device_t* device);
+tt::tt_metal::IDevice* iree_hal_tt_device_handle(iree_hal_tt_device_t* device);
 tt::tt_metal::CommandQueue* iree_hal_tt_device_queue(iree_hal_tt_device_t* device);
 #endif
 
 #else
-// C only: opaque accessors
 void* iree_hal_tt_device_get_tt_metal_handle(iree_hal_tt_device_t* device);
 void* iree_hal_tt_device_get_compute_queue(iree_hal_tt_device_t* device);
 #endif  // __cplusplus

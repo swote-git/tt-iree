@@ -114,7 +114,6 @@ int test_device_query_core_count() {
   int64_t core_x = 0, core_y = 0;
   status = iree_hal_device_query_i64(
       device, IREE_SV("hal.device"), IREE_SV("core_count_x"), &core_x);
-  // May fail in mock mode, that's OK
   
   status = iree_hal_device_query_i64(
       device, IREE_SV("hal.device"), IREE_SV("core_count_y"), &core_y);

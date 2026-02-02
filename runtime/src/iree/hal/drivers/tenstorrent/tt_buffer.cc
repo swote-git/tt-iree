@@ -10,7 +10,8 @@
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
-#include "tt_metal/host_api.hpp"
+#include "tt-metalium/host_api.hpp"
+#include "tt-metalium/tt_metal.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -79,7 +80,22 @@ struct iree_hal_tt_buffer_t {
   bool uses_tile_layout;
 };
 
-static const iree_hal_buffer_vtable_t iree_hal_tt_buffer_vtable;
+// Forward declarations
+static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t*);
+static iree_status_t iree_hal_tt_buffer_map_range(iree_hal_buffer_t*, iree_hal_mapping_mode_t, iree_hal_memory_access_t, iree_device_size_t, iree_device_size_t, iree_hal_buffer_mapping_t*);
+static iree_status_t iree_hal_tt_buffer_unmap_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_buffer_mapping_t*);
+static iree_status_t iree_hal_tt_buffer_invalidate_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t);
+static iree_status_t iree_hal_tt_buffer_flush_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t);
+
+// Define vtable early
+static const iree_hal_buffer_vtable_t iree_hal_tt_buffer_vtable = {
+    .recycle = nullptr,
+    .destroy = iree_hal_tt_buffer_destroy,
+    .map_range = iree_hal_tt_buffer_map_range,
+    .unmap_range = iree_hal_tt_buffer_unmap_range,
+    .invalidate_range = iree_hal_tt_buffer_invalidate_range,
+    .flush_range = iree_hal_tt_buffer_flush_range,
+};
 
 static iree_hal_tt_buffer_t* iree_hal_tt_buffer_cast(iree_hal_buffer_t* base) {
   IREE_HAL_ASSERT_TYPE(base, &iree_hal_tt_buffer_vtable);
@@ -105,11 +121,13 @@ iree_status_t iree_hal_tt_buffer_create(
   iree_hal_tt_buffer_t* buffer = nullptr;
   iree_status_t status = iree_allocator_malloc(
       host_allocator, sizeof(*buffer), (void**)&buffer);
-  
+
   if (iree_status_is_ok(status)) {
-    new (buffer) iree_hal_tt_buffer_t();  // Placement new for C++ members
-    
-    // Infer dimensions from size (assuming float32)
+    new (buffer) iree_hal_tt_buffer_t();
+
+    buffer->host_allocator = host_allocator;
+    buffer->device = device;
+
     iree_device_size_t num_elements = allocation_size / sizeof(float);
     if (num_elements == 1024) {
       buffer->rows = 32;
@@ -120,23 +138,27 @@ iree_status_t iree_hal_tt_buffer_create(
       buffer->rows = ((buffer->rows + 31) / 32) * 32;
       buffer->cols = ((buffer->cols + 31) / 32) * 32;
     }
-    
+
     buffer->uses_tile_layout = (buffer->rows % 32 == 0) && (buffer->cols % 32 == 0);
-    
+
+    iree_hal_buffer_placement_t placement = {
+        .device = (iree_hal_device_t*)device,
+        .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+        .flags = 0,
+        .reserved = 0,
+    };
+    // init buffer
     iree_hal_buffer_initialize(
-        (iree_hal_buffer_placement_t){.device = (iree_hal_device_t*)device},
+        placement,
         &buffer->base,
         allocation_size,
-        0,
-        allocation_size,
+        0,  // byte_offset
+        allocation_size,  // byte_length
         params.type,
         params.access,
         params.usage,
         &iree_hal_tt_buffer_vtable,
         &buffer->base);
-    
-    buffer->host_allocator = host_allocator;
-    buffer->device = device;
 
 #ifdef TT_IREE_ENABLE_MOCK
     buffer->host_ptr = std::malloc(allocation_size);
@@ -145,19 +167,23 @@ iree_status_t iree_hal_tt_buffer_create(
                                "failed to allocate mock buffer");
     }
 #else
-    tt::tt_metal::Device* tt_device = iree_hal_tt_device_handle(device);
+    tt::tt_metal::IDevice* tt_device = iree_hal_tt_device_handle(device);
     if (!tt_device) {
       status = iree_make_status(IREE_STATUS_UNAVAILABLE,
                                "TT-Metal device not initialized");
     } else {
       try {
-        auto config = tt::tt_metal::InterleavedBufferConfig{
+        tt::tt_metal::BufferConfig config{
             .device = tt_device,
-            .size = allocation_size,
+            .size = static_cast<uint64_t>(allocation_size),
             .page_size = TT_TILE_SIZE * sizeof(float),  // 4KB per tile
             .buffer_type = tt::tt_metal::BufferType::DRAM
         };
         buffer->tt_buffer = tt::tt_metal::CreateBuffer(config);
+        if (!buffer->tt_buffer) {
+          status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                                   "TT-Metal CreateBuffer returned null");
+        }
       } catch (const std::exception& e) {
         status = iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                                  "TT-Metal buffer creation failed: %s", e.what());
@@ -173,7 +199,7 @@ iree_status_t iree_hal_tt_buffer_create(
 #ifdef TT_IREE_ENABLE_MOCK
       if (buffer->host_ptr) std::free(buffer->host_ptr);
 #endif
-      buffer->~iree_hal_tt_buffer_t();  // Destroy C++ members
+      buffer->~iree_hal_tt_buffer_t();
       iree_allocator_free(host_allocator, buffer);
     }
   }
@@ -196,7 +222,7 @@ static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t* base_buffer) {
   if (buffer->host_ptr) std::free(buffer->host_ptr);
 #endif
   
-  buffer->~iree_hal_tt_buffer_t();  // Destroy C++ members (shared_ptr)
+  buffer->~iree_hal_tt_buffer_t();
   iree_allocator_free(host_allocator, buffer);
   IREE_TRACE_ZONE_END(z0);
 }
@@ -216,6 +242,7 @@ static iree_status_t iree_hal_tt_buffer_map_range(
   uint8_t* data_ptr = (uint8_t*)buffer->host_ptr + local_byte_offset;
   mapping->contents = iree_make_byte_span(data_ptr, local_byte_length);
 #else
+  // Allocate staging buffer
   void* staging = std::malloc(local_byte_length);
   if (!staging) {
     IREE_TRACE_ZONE_END(z0);
@@ -234,10 +261,8 @@ static iree_status_t iree_hal_tt_buffer_map_range(
     }
     
     try {
-      auto* queue = iree_hal_tt_device_queue(buffer->device);
-      tt::tt_metal::EnqueueReadBuffer(*queue, buffer->tt_buffer,
-                                      tiled_data, true);  // blocking
-      
+      tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, (uint8_t*)tiled_data);
+
       if (buffer->uses_tile_layout) {
         iree_hal_tt_unpack_from_tiles((const float*)tiled_data, (float*)staging,
                                       buffer->rows, buffer->cols);
@@ -275,27 +300,27 @@ static iree_status_t iree_hal_tt_buffer_unmap_range(
   iree_device_size_t buffer_size = iree_hal_buffer_allocation_size(base_buffer);
   
   try {
-    auto* queue = iree_hal_tt_device_queue(buffer->device);
-    
     if (buffer->uses_tile_layout) {
       void* tiled_data = std::malloc(buffer_size);
       if (tiled_data) {
         iree_hal_tt_pack_to_tiles((const float*)mapping->contents.data,
                                   (float*)tiled_data,
                                   buffer->rows, buffer->cols);
-        
-        tt::tt_metal::EnqueueWriteBuffer(*queue, buffer->tt_buffer,
-                                         tiled_data, true);  // blocking
+
+        tt::stl::Span<const uint8_t> span(
+            (const uint8_t*)tiled_data, buffer_size);
+        tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
         std::free(tiled_data);
       }
     } else {
-      tt::tt_metal::EnqueueWriteBuffer(*queue, buffer->tt_buffer,
-                                       mapping->contents.data, true);
+      tt::stl::Span<const uint8_t> span(
+          mapping->contents.data, local_byte_length);
+      tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
     }
   } catch (...) {
-    // Best effort - don't fail on unmap
+    // idk for now.
   }
-  
+
   std::free(mapping->contents.data);
 #endif
   
@@ -313,11 +338,3 @@ static iree_status_t iree_hal_tt_buffer_flush_range(
     iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t) {
   return iree_ok_status();
 }
-
-static const iree_hal_buffer_vtable_t iree_hal_tt_buffer_vtable = {
-    .destroy = iree_hal_tt_buffer_destroy,
-    .map_range = iree_hal_tt_buffer_map_range,
-    .unmap_range = iree_hal_tt_buffer_unmap_range,
-    .invalidate_range = iree_hal_tt_buffer_invalidate_range,
-    .flush_range = iree_hal_tt_buffer_flush_range,
-};

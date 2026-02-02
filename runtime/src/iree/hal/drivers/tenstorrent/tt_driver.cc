@@ -11,8 +11,8 @@
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
-#include "tt_metal/host_api.hpp"
-#include "tt_metal/impl/device/device.hpp"
+#include "tt-metalium/host_api.hpp"
+#include "tt-metalium/device.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -25,11 +25,35 @@ struct iree_hal_tenstorrent_driver_t {
   iree_string_view_t identifier;
   
 #ifndef TT_IREE_ENABLE_MOCK
-  std::vector<std::string> device_names;  // Persistent storage for device names
+  std::vector<std::string> device_names;
 #endif
 };
 
-static const iree_hal_driver_vtable_t iree_hal_tenstorrent_driver_vtable;
+// Forward declarations
+static void iree_hal_tenstorrent_driver_destroy(iree_hal_driver_t* base);
+static iree_status_t iree_hal_tenstorrent_driver_query_available_devices(
+    iree_hal_driver_t* base, iree_allocator_t host_allocator,
+    iree_host_size_t* out_count, iree_hal_device_info_t** out_infos);
+static iree_status_t iree_hal_tenstorrent_driver_dump_device_info(
+    iree_hal_driver_t* base, iree_hal_device_id_t device_id,
+    iree_string_builder_t* builder);
+static iree_status_t iree_hal_tenstorrent_driver_create_device_by_id(
+    iree_hal_driver_t* base, iree_hal_device_id_t device_id,
+    iree_host_size_t param_count, const iree_string_pair_t* params,
+    iree_allocator_t host_allocator, iree_hal_device_t** out_device);
+static iree_status_t iree_hal_tenstorrent_driver_create_device_by_path(
+    iree_hal_driver_t* base, iree_string_view_t driver_name,
+    iree_string_view_t device_path, iree_host_size_t param_count,
+    const iree_string_pair_t* params, iree_allocator_t host_allocator,
+    iree_hal_device_t** out_device);
+
+static const iree_hal_driver_vtable_t iree_hal_tenstorrent_driver_vtable = {
+    .destroy = iree_hal_tenstorrent_driver_destroy,
+    .query_available_devices = iree_hal_tenstorrent_driver_query_available_devices,
+    .dump_device_info = iree_hal_tenstorrent_driver_dump_device_info,
+    .create_device_by_id = iree_hal_tenstorrent_driver_create_device_by_id,
+    .create_device_by_path = iree_hal_tenstorrent_driver_create_device_by_path,
+};
 
 static iree_hal_tenstorrent_driver_t* iree_hal_tenstorrent_driver_cast(
     iree_hal_driver_t* base) {
@@ -40,6 +64,8 @@ static iree_hal_tenstorrent_driver_t* iree_hal_tenstorrent_driver_cast(
 //===----------------------------------------------------------------------===//
 // Driver creation
 //===----------------------------------------------------------------------===//
+
+extern "C" {
 
 iree_status_t iree_hal_tenstorrent_driver_create(
     iree_string_view_t identifier,
@@ -63,6 +89,8 @@ iree_status_t iree_hal_tenstorrent_driver_create(
   *out_driver = (iree_hal_driver_t*)driver;
   return iree_ok_status();
 }
+
+}  // extern "C"
 
 //===----------------------------------------------------------------------===//
 // Driver vtable
@@ -213,11 +241,3 @@ static iree_status_t iree_hal_tenstorrent_driver_create_device_by_path(
                          "device path '%.*s' not supported",
                          (int)device_path.size, device_path.data);
 }
-
-static const iree_hal_driver_vtable_t iree_hal_tenstorrent_driver_vtable = {
-    .destroy = iree_hal_tenstorrent_driver_destroy,
-    .query_available_devices = iree_hal_tenstorrent_driver_query_available_devices,
-    .dump_device_info = iree_hal_tenstorrent_driver_dump_device_info,
-    .create_device_by_id = iree_hal_tenstorrent_driver_create_device_by_id,
-    .create_device_by_path = iree_hal_tenstorrent_driver_create_device_by_path,
-};

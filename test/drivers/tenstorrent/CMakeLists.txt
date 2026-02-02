@@ -24,6 +24,13 @@ target_link_libraries(driver_test
     iree_base_base
     iree_hal_hal
 )
+if(TT_IREE_ENABLE_TTNN)
+  target_link_libraries(driver_test PRIVATE "${TT_METAL_LIB_DIR}/libfmt.so")
+  set_target_properties(driver_test PROPERTIES
+    BUILD_RPATH "${TT_METAL_LIB_DIR}"
+    INSTALL_RPATH "${TT_METAL_LIB_DIR}"
+  )
+endif()
 target_include_directories(driver_test
   PRIVATE
     ${CMAKE_SOURCE_DIR}/runtime/src
@@ -42,6 +49,13 @@ target_link_libraries(device_test
     iree_base_base
     iree_hal_hal
 )
+if(TT_IREE_ENABLE_TTNN)
+  target_link_libraries(device_test PRIVATE "${TT_METAL_LIB_DIR}/libfmt.so")
+  set_target_properties(device_test PROPERTIES
+    BUILD_RPATH "${TT_METAL_LIB_DIR}"
+    INSTALL_RPATH "${TT_METAL_LIB_DIR}"
+  )
+endif()
 target_include_directories(device_test
   PRIVATE
     ${CMAKE_SOURCE_DIR}/runtime/src
@@ -60,6 +74,13 @@ target_link_libraries(buffer_test
     iree_base_base
     iree_hal_hal
 )
+if(TT_IREE_ENABLE_TTNN)
+  target_link_libraries(buffer_test PRIVATE "${TT_METAL_LIB_DIR}/libfmt.so")
+  set_target_properties(buffer_test PROPERTIES
+    BUILD_RPATH "${TT_METAL_LIB_DIR}"
+    INSTALL_RPATH "${TT_METAL_LIB_DIR}"
+  )
+endif()
 target_include_directories(buffer_test
   PRIVATE
     ${CMAKE_SOURCE_DIR}/runtime/src

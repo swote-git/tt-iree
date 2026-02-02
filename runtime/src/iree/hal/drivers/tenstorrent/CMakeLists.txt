@@ -8,10 +8,10 @@ message(STATUS "tt-iree: Configuring Tenstorrent HAL driver")
 #-------------------------------------------------------------------------------
 
 set(TT_HAL_DRIVER_SRCS
-  tt_driver.c
-  tt_device.c
-  tt_allocator.c
-  tt_buffer.c
+  tt_driver.cc
+  tt_device.cc
+  tt_allocator.cc
+  tt_buffer.cc
   tt_executable.c
   tt_semaphore.c
   tt_command_buffer.c
@@ -40,8 +40,28 @@ add_library(iree_hal_tenstorrent STATIC
   ${TT_HAL_DRIVER_HDRS}
 )
 
+if(TT_IREE_ENABLE_TTNN)
+  target_include_directories(iree_hal_tenstorrent
+    PRIVATE
+      ${TT_METAL_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(iree_hal_tenstorrent
+    PRIVATE
+      ${TT_METAL_LIBRARIES}
+      "${TT_METAL_LIB_DIR}/libfmt.so"
+  )
+  target_compile_definitions(iree_hal_tenstorrent
+    PRIVATE
+      SPDLOG_FMT_EXTERNAL=1
+  )
+  set_target_properties(iree_hal_tenstorrent PROPERTIES
+    BUILD_RPATH "${TT_METAL_LIB_DIR}"
+    INSTALL_RPATH "${TT_METAL_LIB_DIR}"
+  )
+endif()
+
 # Set include directories
-# FIXED: Correct path to allow "iree/hal/drivers/tenstorrent/..." includes
 target_include_directories(iree_hal_tenstorrent
   PUBLIC
     # Path to runtime/src (4 levels up from current directory)

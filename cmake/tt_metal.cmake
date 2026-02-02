@@ -32,6 +32,7 @@ function(find_tt_metal)
   set(TT_METAL_INCLUDE_DIRS
     "${TT_METAL_HOME}"
     "${TT_METAL_HOME}/tt_metal"
+    "${TT_METAL_HOME}/tt_metal/api"
     "${TT_METAL_HOME}/tt_metal/include"
     "${TT_METAL_HOME}/tt_metal/common"
     "${TT_METAL_HOME}/tt_metal/hw/inc"
@@ -40,35 +41,51 @@ function(find_tt_metal)
     "${TT_METAL_HOME}/tt_metal/third_party/fmt"
     "${TT_METAL_HOME}/ttnn"
     "${TT_METAL_HOME}/ttnn/cpp"
+    "${TT_METAL_HOME}/build_Release/include"
+    "${TT_METAL_HOME}/build_Release/include/metalium-thirdparty"
     PARENT_SCOPE
   )
 
   #-----------------------------------------------------------------------------
   # Find TT-Metal libraries
   #-----------------------------------------------------------------------------
-  set(TT_METAL_LIB_DIR "${TT_METAL_HOME}/build/lib")
-  
-  if(NOT EXISTS "${TT_METAL_LIB_DIR}")
-    message(FATAL_ERROR 
-      "TT-Metal libraries not found at ${TT_METAL_LIB_DIR}\n"
-      "Please build TT-Metal first: cd ${TT_METAL_HOME} && ./build_metal.sh")
+  if(EXISTS "${TT_METAL_HOME}/build_Release/lib")
+    set(TT_METAL_LIB_DIR "${TT_METAL_HOME}/build_Release/lib")
+  elseif(EXISTS "${TT_METAL_HOME}/build_Debug/lib")
+    set(TT_METAL_LIB_DIR "${TT_METAL_HOME}/build_Debug/lib")
+  elseif(EXISTS "${TT_METAL_HOME}/build/lib")
+    set(TT_METAL_LIB_DIR "${TT_METAL_HOME}/build/lib")
+  else()
+    message(FATAL_ERROR "TT-Metal libraries not found")
   endif()
 
-  find_library(TT_METAL_LIB NAMES tt_metal
-    PATHS "${TT_METAL_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-  message(STATUS "Found tt_metal: ${TT_METAL_LIB}")
-
-  find_library(TT_DEVICE_LIB NAMES device
-    PATHS "${TT_METAL_LIB_DIR}" NO_DEFAULT_PATH)
-  if(TT_DEVICE_LIB)
-    message(STATUS "Found device: ${TT_DEVICE_LIB}")
-  endif()
-
-  set(TT_METAL_LIBRARIES ${TT_METAL_LIB} PARENT_SCOPE)
-  if(TT_DEVICE_LIB)
-    set(TT_DEVICE_LIBRARIES ${TT_DEVICE_LIB} PARENT_SCOPE)
-  endif()
   set(TT_METAL_LIB_DIR "${TT_METAL_LIB_DIR}" PARENT_SCOPE)
+  message(STATUS "TT-Metal library directory: ${TT_METAL_LIB_DIR}")
+
+  # Find libraries
+  find_library(TT_METAL_LIB
+    NAMES tt_metal
+    PATHS ${TT_METAL_LIB_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
+  )
+
+  find_library(TT_DEVICE_LIB
+    NAMES device
+    PATHS ${TT_METAL_LIB_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
+  )
+
+  message(STATUS "Found TT-Metal: ${TT_METAL_LIB}")
+  message(STATUS "Found TT-Device: ${TT_DEVICE_LIB}")
+
+  # Set variables for linking
+  set(TT_METAL_LIBRARIES
+    ${TT_METAL_LIB}
+    ${TT_DEVICE_LIB}
+    PARENT_SCOPE
+  )
 
   # Architecture
   if(DEFINED ENV{ARCH_NAME})

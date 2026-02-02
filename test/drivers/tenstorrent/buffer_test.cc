@@ -100,9 +100,11 @@ int test_buffer_allocation_single_tile() {
   const iree_device_size_t buffer_size = 32 * 32 * sizeof(float);  // 4KB
 
   iree_hal_buffer_params_t params = {
-      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE,
+      .access = IREE_HAL_MEMORY_ACCESS_NONE,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
@@ -127,9 +129,11 @@ int test_buffer_allocation_multiple_tiles() {
   const iree_device_size_t buffer_size = 64 * 64 * sizeof(float);  // 16KB
 
   iree_hal_buffer_params_t params = {
-      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE,
+      .access = IREE_HAL_MEMORY_ACCESS_NONE,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
@@ -154,8 +158,10 @@ int test_buffer_map_write() {
   const iree_device_size_t buffer_size = num_elements * sizeof(float);
 
   iree_hal_buffer_params_t params = {
-      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_NONE,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
@@ -195,8 +201,10 @@ int test_buffer_roundtrip_single_tile() {
   const iree_device_size_t buffer_size = num_elements * sizeof(float);
 
   iree_hal_buffer_params_t params = {
-      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_NONE,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
@@ -258,8 +266,10 @@ int test_buffer_roundtrip_multiple_tiles() {
   const iree_device_size_t buffer_size = num_elements * sizeof(float);
 
   iree_hal_buffer_params_t params = {
-      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_NONE,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
@@ -316,7 +326,6 @@ int test_allocator_statistics() {
   iree_hal_allocator_statistics_t stats;
   iree_hal_allocator_query_statistics(g_allocator, &stats);
 
-  // Just verify we can query stats without crashing
   printf("(alloc=%lu, freed=%lu) ",
          (unsigned long)stats.device_bytes_allocated,
          (unsigned long)stats.device_bytes_freed);

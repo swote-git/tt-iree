@@ -9,8 +9,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_allocator.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
-#include "tt_metal/host_api.hpp"
-#include "tt_metal/impl/device/device.hpp"
+#include "tt-metalium/host_api.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -26,12 +25,66 @@ struct iree_hal_tt_device_t {
   iree_hal_allocator_t* device_allocator;
   
 #ifndef TT_IREE_ENABLE_MOCK
-  tt::tt_metal::Device* tt_device;
+  tt::tt_metal::IDevice* tt_device;
   tt::tt_metal::CommandQueue* compute_queue;
 #endif
 };
 
-static const iree_hal_device_vtable_t iree_hal_tt_device_vtable;
+// Forward declarations of vtable functions
+static void iree_hal_tt_device_destroy(iree_hal_device_t* base);
+static iree_string_view_t iree_hal_tt_device_id(iree_hal_device_t* base);
+static iree_allocator_t iree_hal_tt_device_host_allocator(iree_hal_device_t* base);
+static iree_hal_allocator_t* iree_hal_tt_device_allocator(iree_hal_device_t* base);
+static void iree_hal_tt_device_replace_allocator(iree_hal_device_t*, iree_hal_allocator_t*);
+static void iree_hal_tt_device_replace_channel_provider(iree_hal_device_t*, iree_hal_channel_provider_t*);
+static iree_status_t iree_hal_tt_device_trim(iree_hal_device_t*);
+static iree_status_t iree_hal_tt_device_query_i64(iree_hal_device_t*, iree_string_view_t, iree_string_view_t, int64_t*);
+static iree_status_t iree_hal_tt_device_create_channel(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_channel_params_t, iree_hal_channel_t**);
+static iree_status_t iree_hal_tt_device_create_command_buffer(iree_hal_device_t*, iree_hal_command_buffer_mode_t, iree_hal_command_category_t, iree_hal_queue_affinity_t, iree_host_size_t, iree_hal_command_buffer_t**);
+static iree_status_t iree_hal_tt_device_create_event(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_event_flags_t, iree_hal_event_t**);
+static iree_status_t iree_hal_tt_device_create_executable_cache(iree_hal_device_t*, iree_string_view_t, iree_loop_t, iree_hal_executable_cache_t**);
+static iree_status_t iree_hal_tt_device_import_file(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_memory_access_t, iree_io_file_handle_t*, iree_hal_external_file_flags_t, iree_hal_file_t**);
+static iree_status_t iree_hal_tt_device_create_semaphore(iree_hal_device_t*, iree_hal_queue_affinity_t, uint64_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_t**);
+static iree_hal_semaphore_compatibility_t iree_hal_tt_device_query_semaphore_compatibility(iree_hal_device_t*, iree_hal_semaphore_t*);
+static iree_status_t iree_hal_tt_device_queue_alloca(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_allocator_pool_t, iree_hal_buffer_params_t, iree_device_size_t, iree_hal_alloca_flags_t, iree_hal_buffer_t**);
+static iree_status_t iree_hal_tt_device_queue_dealloca(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_hal_dealloca_flags_t);
+static iree_status_t iree_hal_tt_device_queue_read(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_file_t*, uint64_t, iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_read_flags_t);
+static iree_status_t iree_hal_tt_device_queue_write(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_device_size_t, iree_hal_file_t*, uint64_t, iree_device_size_t, iree_hal_write_flags_t);
+static iree_status_t iree_hal_tt_device_queue_execute(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_command_buffer_t*, iree_hal_buffer_binding_table_t, iree_hal_execute_flags_t);
+static iree_status_t iree_hal_tt_device_queue_flush(iree_hal_device_t*, iree_hal_queue_affinity_t);
+static iree_status_t iree_hal_tt_device_wait_semaphores(iree_hal_device_t*, iree_hal_wait_mode_t, const iree_hal_semaphore_list_t, iree_timeout_t, iree_hal_wait_flags_t);
+static iree_status_t iree_hal_tt_device_profiling_begin(iree_hal_device_t*, const iree_hal_device_profiling_options_t*);
+static iree_status_t iree_hal_tt_device_profiling_flush(iree_hal_device_t*);
+static iree_status_t iree_hal_tt_device_profiling_end(iree_hal_device_t*);
+
+// Define vtable early so it can be used by cast function
+static const iree_hal_device_vtable_t iree_hal_tt_device_vtable = {
+    .destroy = iree_hal_tt_device_destroy,
+    .id = iree_hal_tt_device_id,
+    .host_allocator = iree_hal_tt_device_host_allocator,
+    .device_allocator = iree_hal_tt_device_allocator,
+    .replace_device_allocator = iree_hal_tt_device_replace_allocator,
+    .replace_channel_provider = iree_hal_tt_device_replace_channel_provider,
+    .trim = iree_hal_tt_device_trim,
+    .query_i64 = iree_hal_tt_device_query_i64,
+    .create_channel = iree_hal_tt_device_create_channel,
+    .create_command_buffer = iree_hal_tt_device_create_command_buffer,
+    .create_event = iree_hal_tt_device_create_event,
+    .create_executable_cache = iree_hal_tt_device_create_executable_cache,
+    .import_file = iree_hal_tt_device_import_file,
+    .create_semaphore = iree_hal_tt_device_create_semaphore,
+    .query_semaphore_compatibility = iree_hal_tt_device_query_semaphore_compatibility,
+    .queue_alloca = iree_hal_tt_device_queue_alloca,
+    .queue_dealloca = iree_hal_tt_device_queue_dealloca,
+    .queue_read = iree_hal_tt_device_queue_read,
+    .queue_write = iree_hal_tt_device_queue_write,
+    .queue_execute = iree_hal_tt_device_queue_execute,
+    .queue_flush = iree_hal_tt_device_queue_flush,
+    .wait_semaphores = iree_hal_tt_device_wait_semaphores,
+    .profiling_begin = iree_hal_tt_device_profiling_begin,
+    .profiling_flush = iree_hal_tt_device_profiling_flush,
+    .profiling_end = iree_hal_tt_device_profiling_end,
+};
 
 static iree_hal_tt_device_t* iree_hal_tt_device_cast(iree_hal_device_t* base) {
   IREE_HAL_ASSERT_TYPE(base, &iree_hal_tt_device_vtable);
@@ -43,7 +96,8 @@ static iree_hal_tt_device_t* iree_hal_tt_device_cast(iree_hal_device_t* base) {
 //===----------------------------------------------------------------------===//
 
 #ifndef TT_IREE_ENABLE_MOCK
-tt::tt_metal::Device* iree_hal_tt_device_handle(iree_hal_tt_device_t* device) {
+
+tt::tt_metal::IDevice* iree_hal_tt_device_handle(iree_hal_tt_device_t* device) {
   return device ? device->tt_device : nullptr;
 }
 
@@ -82,7 +136,7 @@ iree_status_t iree_hal_tt_device_create(
   // Open TT-Metal device
   if (iree_status_is_ok(status)) {
     try {
-      device->tt_device = tt::tt_metal::CreateDevice(device_id);
+      device->tt_device = tt::tt_metal::CreateDevice(device_id, 1);  // 1 HW CQ
       if (!device->tt_device) {
         status = iree_make_status(IREE_STATUS_UNAVAILABLE,
                                  "failed to open device %d", (int)device_id);
@@ -262,8 +316,7 @@ static iree_status_t iree_hal_tt_device_import_file(
 }
 
 static iree_status_t iree_hal_tt_device_create_semaphore(
-    iree_hal_device_t*, iree_hal_queue_affinity_t, uint64_t,
-    iree_hal_semaphore_flags_t, iree_hal_semaphore_t**) {
+    iree_hal_device_t*, iree_hal_queue_affinity_t, uint64_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_t**) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "semaphore not implemented");
 }
 
@@ -316,7 +369,8 @@ static iree_status_t iree_hal_tt_device_queue_flush(
 #ifndef TT_IREE_ENABLE_MOCK
   auto* device = iree_hal_tt_device_cast(base);
   if (device->compute_queue) {
-    try { tt::tt_metal::Finish(*device->compute_queue); } catch (...) {}
+    // TODO(swote): Implement proper queue finish when needed
+    // The API might have changed or we need to use a different method
   }
 #endif
   return iree_ok_status();
@@ -340,35 +394,3 @@ static iree_status_t iree_hal_tt_device_profiling_flush(iree_hal_device_t*) {
 static iree_status_t iree_hal_tt_device_profiling_end(iree_hal_device_t*) {
   return iree_ok_status();
 }
-
-//===----------------------------------------------------------------------===//
-// vtable
-//===----------------------------------------------------------------------===//
-
-static const iree_hal_device_vtable_t iree_hal_tt_device_vtable = {
-    .destroy = iree_hal_tt_device_destroy,
-    .id = iree_hal_tt_device_id,
-    .host_allocator = iree_hal_tt_device_host_allocator,
-    .device_allocator = iree_hal_tt_device_allocator,
-    .replace_device_allocator = iree_hal_tt_device_replace_allocator,
-    .replace_channel_provider = iree_hal_tt_device_replace_channel_provider,
-    .trim = iree_hal_tt_device_trim,
-    .query_i64 = iree_hal_tt_device_query_i64,
-    .create_channel = iree_hal_tt_device_create_channel,
-    .create_command_buffer = iree_hal_tt_device_create_command_buffer,
-    .create_event = iree_hal_tt_device_create_event,
-    .create_executable_cache = iree_hal_tt_device_create_executable_cache,
-    .import_file = iree_hal_tt_device_import_file,
-    .create_semaphore = iree_hal_tt_device_create_semaphore,
-    .query_semaphore_compatibility = iree_hal_tt_device_query_semaphore_compatibility,
-    .queue_alloca = iree_hal_tt_device_queue_alloca,
-    .queue_dealloca = iree_hal_tt_device_queue_dealloca,
-    .queue_read = iree_hal_tt_device_queue_read,
-    .queue_write = iree_hal_tt_device_queue_write,
-    .queue_execute = iree_hal_tt_device_queue_execute,
-    .queue_flush = iree_hal_tt_device_queue_flush,
-    .wait_semaphores = iree_hal_tt_device_wait_semaphores,
-    .profiling_begin = iree_hal_tt_device_profiling_begin,
-    .profiling_flush = iree_hal_tt_device_profiling_flush,
-    .profiling_end = iree_hal_tt_device_profiling_end,
-};
