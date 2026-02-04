@@ -64,16 +64,16 @@ To ensure success within 8 weeks, strictly limit scope:
 
 ## Timeline
 
-### Week 1: Environment & SDK Verification
+### Step 1: Environment & SDK Verification
 
 **Objective:** Verify P100A works with TT-Metal SDK (independent of IREE)
 
 **Tasks:**
-- [ ] Install P100A drivers & firmware
-- [ ] Build TT-Metal from source (v0.65.0)
-- [ ] Run SDK examples: `hello_world`, `eltwise_binary`
-- [ ] Verify 120-core grid: `tt-smi` shows full 10x12 grid
-- [ ] Set up tt-iree repo with TT-Metal linking
+- [✔] Install P100A drivers & firmware
+- [✔] Build TT-Metal from source (v0.65.0)
+- [✔] Run SDK examples: `hello_world`, `eltwise_binary`
+- [✔] Verify 120-core grid: `tt-smi` shows full 10x12 grid
+- [✔] Set up tt-iree repo with TT-Metal linking
 
 **Verification:**
 ```bash
@@ -89,18 +89,18 @@ tt-smi
 - Working development environment
 - tt-iree CMake links against `libtt_metal.so`
 
-### Week 2-3: Runtime HAL Driver (Hardware)
+### Step 2: Runtime HAL Driver (Hardware)
 
 **Objective:** Implement IREE HAL driver that talks to real P100A
 
 **Tasks:**
-- [ ] `tt_driver.c`: Query available devices via TT-Metal
-- [ ] `tt_device.c`: Call `tt::tt_metal::CreateDevice(0)`
-- [ ] `tt_allocator.c`: Implement DRAM buffer allocation
+- [✔] `tt_driver.cc`: Query available devices via TT-Metal
+- [✔] `tt_device.cc`: Call `tt::tt_metal::CreateDevice(0)`
+- [✔] `tt_allocator.cc`: Implement DRAM buffer allocation
   - Use `tt::tt_metal::CreateBuffer()` with `BufferType::DRAM`
-- [ ] `tt_buffer.c`: Implement Host ↔ Device transfer
+- [✔] `tt_buffer.cc`: Implement Host ↔ Device transfer
   - **Critical:** Implement tile packing/unpacking on CPU side
-- [ ] `tt_command_buffer.c`: Wrap `CommandQueue`
+- [✔] `tt_command_buffer.c`: Wrap `CommandQueue`
 
 **Tile Layout Conversion:**
 ```cpp
@@ -146,7 +146,7 @@ TEST(TenstorrentRuntime, BufferRoundTrip) {
 }
 ```
 
-### Week 4-5: Compiler Backend (Real Kernels)
+### Step 3: Compiler Backend (Real Kernels)
 
 **Objective:** Generate valid TT-Metal C++ kernels for `arith.addf`
 
@@ -206,7 +206,7 @@ void kernel_main() {
 - `iree-compile --iree-hal-target-backends=tenstorrent` produces `.vmfb`
 - FlatBuffer contains valid TT-Metal C++ source
 
-### Week 6: JIT Compilation & Kernel Loading
+### Step 4: JIT Compilation & Kernel Loading
 
 **Objective:** Compile generated C++ kernels at runtime
 
@@ -251,7 +251,7 @@ Enable TT-Metal kernel caching for faster subsequent runs.
 - Runtime successfully JIT compiles kernels
 - Program executes without hang
 
-### Week 7-8: Integration & Debugging
+### Step 5: Integration & Debugging
 
 **Objective:** End-to-end execution and result verification
 
@@ -285,14 +285,14 @@ export TT_METAL_LOGGER_LEVEL=DEBUG
 
 ## Test Plan
 
-### 1. SDK Sanity Check (Week 1)
+### 1. SDK Sanity Check
 ```bash
 # Run before any IREE work
 cd tt-metal/build
 ./test/tt_metal/test_eltwise_binary
 ```
 
-### 2. Buffer Round-Trip Test (Week 2-3)
+### 2. Buffer Round-Trip Test
 ```cpp
 TEST(TenstorrentRuntime, BufferRoundTrip) {
   // Create 32x32 float buffer, write, read, compare
@@ -300,7 +300,7 @@ TEST(TenstorrentRuntime, BufferRoundTrip) {
 }
 ```
 
-### 3. Tile Layout Test (Week 2-3)
+### 3. Tile Layout Test
 ```cpp
 TEST(TenstorrentRuntime, TilePackUnpack) {
   // Row-major -> Tile -> Row-major
@@ -308,7 +308,7 @@ TEST(TenstorrentRuntime, TilePackUnpack) {
 }
 ```
 
-### 4. Compile Test (Week 4-5)
+### 4. Compile Test
 ```bash
 iree-compile \
   --iree-hal-target-backends=tenstorrent \
@@ -318,7 +318,7 @@ iree-compile \
 # Inspect FlatBuffer contains kernel source
 ```
 
-### 5. E2E Test (Week 7-8)
+### 5. E2E Test
 ```python
 # examples/simple_add.py
 import numpy as np
@@ -340,16 +340,6 @@ assert np.allclose(result, expected)
 print("PoC Success on P100A!")
 ```
 
-## Risks & Mitigations
-
-| Risk | Impact | Likelihood | Mitigation |
-|------|--------|------------|------------|
-| JIT compilation slow | Medium | High | Enable kernel caching |
-| Device hangs | High | Medium | Use `tt-smi -r` to reset; keep kernels simple |
-| Tile layout bugs | Medium | High | Test pack/unpack in isolation first |
-| IREE API complexity | High | Medium | Study HIP driver as reference |
-| Build system issues | Medium | High | Start minimal, expand incrementally |
-
 ## Success Criteria
 
 | Criterion | Target | Measurement |
@@ -364,8 +354,8 @@ print("PoC Success on P100A!")
 
 PoC is complete when:
 
-- [ ] P100A initializes successfully from IREE HAL
-- [ ] `iree-compile --iree-hal-target-backends=tenstorrent` produces valid output
+- [✔] P100A initializes successfully from IREE HAL
+- [✔] `iree-compile --iree-hal-target-backends=tenstorrent` produces valid output
 - [ ] `iree-run-module --device=tenstorrent` executes kernel on hardware
 - [ ] 32x32 elementwise add produces correct results
 - [ ] Documentation is complete
