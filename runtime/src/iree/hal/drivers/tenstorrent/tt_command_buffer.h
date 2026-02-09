@@ -17,24 +17,20 @@ typedef enum iree_hal_tt_command_type_t {
 } iree_hal_tt_command_type_t;
 
 // --- Constants ---
-#define IREE_HAL_TT_MAX_DESCRIPTOR_SETS 4
-#define IREE_HAL_TT_MAX_BINDINGS_PER_SET 8
+#define IREE_HAL_TT_MAX_BINDINGS 16
+#define IREE_HAL_TT_MAX_CONSTANTS 256
 
-// --- Descriptor Set Snapshot ---
-typedef struct iree_hal_tt_descriptor_set_t {
-  iree_hal_buffer_t* bindings[IREE_HAL_TT_MAX_BINDINGS_PER_SET];
-  iree_device_size_t offsets[IREE_HAL_TT_MAX_BINDINGS_PER_SET];
-} iree_hal_tt_descriptor_set_t;
-
-// --- Dispatch Command ---
+// --- Dispatch Command (v3.9.0 API) ---
 typedef struct iree_hal_tt_dispatch_command_t {
   iree_hal_executable_t* executable;
-  int32_t entry_point;
-  uint32_t workgroup_x;
-  uint32_t workgroup_y;
-  uint32_t workgroup_z;
-  // Snapshot of bindings needed for execution
-  iree_hal_tt_descriptor_set_t descriptor_sets[IREE_HAL_TT_MAX_DESCRIPTOR_SETS];
+  iree_hal_executable_export_ordinal_t export_ordinal;  // Changed from entry_point
+  iree_hal_dispatch_config_t config;  // Contains workgroup counts
+  // Snapshot of bindings and constants
+  iree_hal_buffer_ref_t bindings[IREE_HAL_TT_MAX_BINDINGS];
+  iree_host_size_t binding_count;
+  uint8_t constants[IREE_HAL_TT_MAX_CONSTANTS];
+  iree_host_size_t constants_length;
+  iree_hal_dispatch_flags_t flags;
 } iree_hal_tt_dispatch_command_t;
 
 // --- Generic Command Wrapper ---
@@ -44,6 +40,13 @@ typedef struct iree_hal_tt_command_t {
     iree_hal_tt_dispatch_command_t dispatch;
   };
 } iree_hal_tt_command_t;
+
+// --- Device Command Buffer Creation ---
+iree_status_t iree_hal_tt_device_create_command_buffer(
+    iree_hal_device_t* device, iree_hal_command_buffer_mode_t mode,
+    iree_hal_command_category_t command_categories,
+    iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_command_buffer_t** out_command_buffer);
 
 // --- Accessor ---
 iree_hal_tt_command_t* iree_hal_tt_command_buffer_get_commands(

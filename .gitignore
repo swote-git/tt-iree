@@ -45,5 +45,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Third party (managed by submodules)
-# Don't ignore the directory itself, just the contents that git submodule manages
+# Cache
+.cache

@@ -127,7 +127,9 @@ iree_hal_tt_allocator_query_buffer_compatibility(
   if (!(params->type & IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     return IREE_HAL_BUFFER_COMPATIBILITY_NONE;
   }
-  return IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE;
+  // Buffers are both allocatable and usable in dispatch operations
+  return IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE |
+         IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_DISPATCH;
 }
 
 static iree_status_t iree_hal_tt_allocator_allocate_buffer(

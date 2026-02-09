@@ -87,3 +87,36 @@ target_include_directories(buffer_test
 )
 add_test(NAME tt_buffer_test COMMAND buffer_test)
 set_tests_properties(tt_buffer_test PROPERTIES LABELS "tt-iree;hal")
+
+add_executable(dispatch_test
+  dispatch_test.cc
+)
+target_compile_features(dispatch_test PRIVATE cxx_std_17)
+target_link_libraries(dispatch_test
+  PRIVATE
+    iree_hal_tenstorrent
+    iree_base_base
+    iree_hal_hal
+)
+if(TT_IREE_ENABLE_TTNN)
+  target_link_libraries(dispatch_test PRIVATE
+    ${TT_METAL_LIBRARIES}
+    "${TT_METAL_LIB_DIR}/libfmt.so"
+  )
+  target_include_directories(dispatch_test PRIVATE
+    ${TT_METAL_INCLUDE_DIRS}
+  )
+  target_compile_definitions(dispatch_test PRIVATE
+    SPDLOG_FMT_EXTERNAL=1
+  )
+  set_target_properties(dispatch_test PROPERTIES
+    BUILD_RPATH "${TT_METAL_LIB_DIR}"
+    INSTALL_RPATH "${TT_METAL_LIB_DIR}"
+  )
+endif()
+target_include_directories(dispatch_test
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/runtime/src
+)
+add_test(NAME tt_dispatch_test COMMAND dispatch_test)
+set_tests_properties(tt_dispatch_test PROPERTIES LABELS "tt-iree;hal")

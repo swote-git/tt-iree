@@ -12,9 +12,9 @@ set(TT_HAL_DRIVER_SRCS
   tt_device.cc
   tt_allocator.cc
   tt_buffer.cc
-  tt_executable.c
-  tt_semaphore.c
-  tt_command_buffer.c
+  tt_executable.cc
+  tt_semaphore.cc
+  tt_command_buffer.cc
   registration/driver_module.c
 )
 

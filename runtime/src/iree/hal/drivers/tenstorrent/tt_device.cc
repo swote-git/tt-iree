@@ -7,9 +7,14 @@
 #include <cstring>
 
 #include "iree/hal/drivers/tenstorrent/tt_allocator.h"
+#include "iree/hal/drivers/tenstorrent/tt_buffer.h"
+#include "iree/hal/drivers/tenstorrent/tt_command_buffer.h"
+#include "iree/hal/drivers/tenstorrent/tt_executable.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
+#include "tt-metalium/device.hpp"
+#include "tt-metalium/distributed.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -23,10 +28,10 @@ struct iree_hal_tt_device_t {
   iree_string_view_t identifier;
   iree_hal_device_id_t device_id;
   iree_hal_allocator_t* device_allocator;
-  
+
 #ifndef TT_IREE_ENABLE_MOCK
-  tt::tt_metal::IDevice* tt_device;
-  tt::tt_metal::CommandQueue* compute_queue;
+  std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device;
+  tt::tt_metal::distributed::MeshCommandQueue* mesh_cq;
 #endif
 };
 
@@ -40,7 +45,8 @@ static void iree_hal_tt_device_replace_channel_provider(iree_hal_device_t*, iree
 static iree_status_t iree_hal_tt_device_trim(iree_hal_device_t*);
 static iree_status_t iree_hal_tt_device_query_i64(iree_hal_device_t*, iree_string_view_t, iree_string_view_t, int64_t*);
 static iree_status_t iree_hal_tt_device_create_channel(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_channel_params_t, iree_hal_channel_t**);
-static iree_status_t iree_hal_tt_device_create_command_buffer(iree_hal_device_t*, iree_hal_command_buffer_mode_t, iree_hal_command_category_t, iree_hal_queue_affinity_t, iree_host_size_t, iree_hal_command_buffer_t**);
+// Implemented in tt_command_buffer.cc
+extern iree_status_t iree_hal_tt_device_create_command_buffer(iree_hal_device_t*, iree_hal_command_buffer_mode_t, iree_hal_command_category_t, iree_hal_queue_affinity_t, iree_host_size_t, iree_hal_command_buffer_t**);
 static iree_status_t iree_hal_tt_device_create_event(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_event_flags_t, iree_hal_event_t**);
 static iree_status_t iree_hal_tt_device_create_executable_cache(iree_hal_device_t*, iree_string_view_t, iree_loop_t, iree_hal_executable_cache_t**);
 static iree_status_t iree_hal_tt_device_import_file(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_memory_access_t, iree_io_file_handle_t*, iree_hal_external_file_flags_t, iree_hal_file_t**);
@@ -97,12 +103,18 @@ static iree_hal_tt_device_t* iree_hal_tt_device_cast(iree_hal_device_t* base) {
 
 #ifndef TT_IREE_ENABLE_MOCK
 
-tt::tt_metal::IDevice* iree_hal_tt_device_handle(iree_hal_tt_device_t* device) {
-  return device ? device->tt_device : nullptr;
+tt::tt_metal::distributed::MeshDevice* iree_hal_tt_device_mesh_handle(iree_hal_tt_device_t* device) {
+  return device ? device->mesh_device.get() : nullptr;
 }
 
-tt::tt_metal::CommandQueue* iree_hal_tt_device_queue(iree_hal_tt_device_t* device) {
-  return device ? device->compute_queue : nullptr;
+tt::tt_metal::distributed::MeshCommandQueue* iree_hal_tt_device_mesh_queue(iree_hal_tt_device_t* device) {
+  return device ? device->mesh_cq : nullptr;
+}
+
+tt::tt_metal::IDevice* iree_hal_tt_device_idevice(iree_hal_tt_device_t* device) {
+  if (!device || !device->mesh_device) return nullptr;
+  // For unit mesh, get the single device at coordinate {0,0}
+  return device->mesh_device->get_device({0, 0});
 }
 #endif
 
@@ -133,37 +145,43 @@ iree_status_t iree_hal_tt_device_create(
   }
 
 #ifndef TT_IREE_ENABLE_MOCK
-  // Open TT-Metal device
+  // Create TT-Metal MeshDevice (v0.65 API - even for single device)
   if (iree_status_is_ok(status)) {
     try {
-      device->tt_device = tt::tt_metal::CreateDevice(device_id, 1);  // 1 HW CQ
-      if (!device->tt_device) {
+      // Create a 1x1 mesh (unit mesh) for single device
+      device->mesh_device = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(device_id);
+
+      if (!device->mesh_device) {
         status = iree_make_status(IREE_STATUS_UNAVAILABLE,
-                                 "failed to open device %d", (int)device_id);
+                                 "failed to create mesh device %d", (int)device_id);
       }
     } catch (const std::exception& e) {
       status = iree_make_status(IREE_STATUS_INTERNAL,
                                "TT-Metal error: %s", e.what());
     }
   }
-  
-  // Get command queue
+
+  // Get mesh command queue and print device info
   if (iree_status_is_ok(status)) {
     try {
-      device->compute_queue = &device->tt_device->command_queue();
-      
-      auto grid = device->tt_device->compute_with_storage_grid_size();
-      auto arch = device->tt_device->arch();
-      const char* arch_name = (arch == tt::ARCH::BLACKHOLE) ? "Blackhole" :
-                              (arch == tt::ARCH::WORMHOLE_B0) ? "Wormhole" : "Unknown";
-      
-      fprintf(stderr, "tt-iree: Device %d opened (%s, %ux%u cores, %lu MB DRAM)\n",
-              (int)device_id, arch_name, grid.x, grid.y,
-              (unsigned long)(device->tt_device->num_dram_channels() *
-                             device->tt_device->dram_size_per_channel() / (1024*1024)));
+      device->mesh_cq = &device->mesh_device->mesh_command_queue();
+
+      // Get underlying IDevice for queries
+      tt::tt_metal::IDevice* idevice = device->mesh_device->get_device({0, 0});
+      if (idevice) {
+        auto grid = idevice->compute_with_storage_grid_size();
+        auto arch = idevice->arch();
+        const char* arch_name = (arch == tt::ARCH::BLACKHOLE) ? "Blackhole" :
+                                (arch == tt::ARCH::WORMHOLE_B0) ? "Wormhole" : "Unknown";
+
+        fprintf(stderr, "tt-iree: MeshDevice %d opened (%s, %ux%u cores, %lu MB DRAM)\n",
+                (int)device_id, arch_name, grid.x, grid.y,
+                (unsigned long)(idevice->num_dram_channels() *
+                               idevice->dram_size_per_channel() / (1024*1024)));
+      }
     } catch (const std::exception& e) {
       status = iree_make_status(IREE_STATUS_INTERNAL,
-                               "failed to get queue: %s", e.what());
+                               "failed to get mesh queue: %s", e.what());
     }
   }
 #else
@@ -183,8 +201,9 @@ iree_status_t iree_hal_tt_device_create(
   } else {
     if (device) {
 #ifndef TT_IREE_ENABLE_MOCK
-      if (device->tt_device) {
-        try { tt::tt_metal::CloseDevice(device->tt_device); } catch (...) {}
+      if (device->mesh_device) {
+        try { device->mesh_device->close(); } catch (...) {}
+        // shared_ptr will handle deletion
       }
 #endif
       if (device->device_allocator) {
@@ -205,21 +224,24 @@ iree_status_t iree_hal_tt_device_create(
 static void iree_hal_tt_device_destroy(iree_hal_device_t* base) {
   auto* device = iree_hal_tt_device_cast(base);
   iree_allocator_t host_allocator = device->host_allocator;
-  
+
   IREE_TRACE_ZONE_BEGIN(z0);
-  
-  fprintf(stderr, "tt-iree: Closing device %d\n", (int)device->device_id);
-  
+
+  fprintf(stderr, "tt-iree: Closing mesh device %d\n", (int)device->device_id);
+
   if (device->device_allocator) {
     iree_hal_allocator_release(device->device_allocator);
   }
-  
+
 #ifndef TT_IREE_ENABLE_MOCK
-  if (device->tt_device) {
-    try { tt::tt_metal::CloseDevice(device->tt_device); } catch (...) {}
+  if (device->mesh_device) {
+    try {
+      device->mesh_device->close();
+      // shared_ptr will handle deletion
+    } catch (...) {}
   }
 #endif
-  
+
   iree_allocator_free(host_allocator, device);
   IREE_TRACE_ZONE_END(z0);
 }
@@ -261,22 +283,25 @@ static iree_status_t iree_hal_tt_device_query_i64(
     *out_value = device->device_id;
     return iree_ok_status();
   }
-  
+
 #ifndef TT_IREE_ENABLE_MOCK
-  if (iree_string_view_equal(category, IREE_SV("hal.device")) && device->tt_device) {
-    auto grid = device->tt_device->compute_with_storage_grid_size();
-    if (iree_string_view_equal(key, IREE_SV("core_count_x"))) {
-      *out_value = grid.x;
-      return iree_ok_status();
-    }
-    if (iree_string_view_equal(key, IREE_SV("core_count_y"))) {
-      *out_value = grid.y;
-      return iree_ok_status();
-    }
-    if (iree_string_view_equal(key, IREE_SV("dram_size"))) {
-      *out_value = device->tt_device->num_dram_channels() *
-                   device->tt_device->dram_size_per_channel();
-      return iree_ok_status();
+  if (iree_string_view_equal(category, IREE_SV("hal.device")) && device->mesh_device) {
+    tt::tt_metal::IDevice* idevice = device->mesh_device->get_device({0, 0});
+    if (idevice) {
+      auto grid = idevice->compute_with_storage_grid_size();
+      if (iree_string_view_equal(key, IREE_SV("core_count_x"))) {
+        *out_value = grid.x;
+        return iree_ok_status();
+      }
+      if (iree_string_view_equal(key, IREE_SV("core_count_y"))) {
+        *out_value = grid.y;
+        return iree_ok_status();
+      }
+      if (iree_string_view_equal(key, IREE_SV("dram_size"))) {
+        *out_value = idevice->num_dram_channels() *
+                     idevice->dram_size_per_channel();
+        return iree_ok_status();
+      }
     }
   }
 #endif
@@ -290,12 +315,6 @@ static iree_status_t iree_hal_tt_device_create_channel(
     iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_channel_params_t,
     iree_hal_channel_t**) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "channel not implemented");
-}
-
-static iree_status_t iree_hal_tt_device_create_command_buffer(
-    iree_hal_device_t*, iree_hal_command_buffer_mode_t, iree_hal_command_category_t,
-    iree_hal_queue_affinity_t, iree_host_size_t, iree_hal_command_buffer_t**) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "command buffer not implemented");
 }
 
 static iree_status_t iree_hal_tt_device_create_event(
@@ -357,20 +376,154 @@ static iree_status_t iree_hal_tt_device_queue_write(
 }
 
 static iree_status_t iree_hal_tt_device_queue_execute(
-    iree_hal_device_t*, iree_hal_queue_affinity_t,
-    const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t,
-    iree_hal_command_buffer_t*, iree_hal_buffer_binding_table_t,
-    iree_hal_execute_flags_t) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue execute not implemented");
+    iree_hal_device_t* base_device,
+    iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphores,
+    const iree_hal_semaphore_list_t signal_semaphores,
+    iree_hal_command_buffer_t* command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    iree_hal_execute_flags_t flags) {
+
+  auto* device = iree_hal_tt_device_cast(base_device);
+
+#ifndef TT_IREE_ENABLE_MOCK
+  // Get MeshDevice and MeshCommandQueue
+  tt::tt_metal::distributed::MeshDevice* mesh_device = device->mesh_device.get();
+  tt::tt_metal::distributed::MeshCommandQueue& mesh_cq = *device->mesh_cq;
+
+  // Get recorded commands from command buffer
+  iree_host_size_t command_count = 0;
+  iree_hal_tt_command_t* commands =
+      iree_hal_tt_command_buffer_get_commands(command_buffer, &command_count);
+
+  if (command_count == 0) {
+    // No commands to execute, just signal semaphores
+    for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
+      IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
+          signal_semaphores.semaphores[i],
+          signal_semaphores.payload_values[i]));
+    }
+    return iree_ok_status();
+  }
+
+  // Create MeshWorkload for this execution batch
+  tt::tt_metal::distributed::MeshWorkload workload;
+
+  // Device range for unit mesh (single device at coordinate {0,0})
+  tt::tt_metal::distributed::MeshCoordinateRange device_range =
+      tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
+
+  // Process each dispatch command
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH) {
+      auto& cmd = commands[i].dispatch;
+
+      // Lookup kernel params (contains the Program)
+      const iree_hal_tt_kernel_params_t* params = nullptr;
+      IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params(
+          cmd.executable, cmd.export_ordinal, &params));
+
+      if (!params || !params->program) {
+        return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                               "executable export ordinal %d has no program",
+                               cmd.export_ordinal);
+      }
+
+      tt::tt_metal::Program* program = static_cast<tt::tt_metal::Program*>(params->program);
+
+      // Set runtime arguments from bindings (v3.9.0 API)
+      tt::tt_metal::CoreCoord core = {0, 0};  // Using single core for PoC
+
+      // Extract buffer addresses from bindings
+      // Expected layout: bindings = [input0, input1, output]
+      uint32_t in0_addr = 0, in1_addr = 0, out_addr = 0;
+      uint32_t buffer_size = 0;
+
+      if (cmd.binding_count > 0 && cmd.bindings[0].buffer) {
+        in0_addr = iree_hal_tt_buffer_device_address(cmd.bindings[0].buffer);
+        buffer_size = iree_hal_buffer_byte_length(cmd.bindings[0].buffer);
+      }
+      if (cmd.binding_count > 1 && cmd.bindings[1].buffer) {
+        in1_addr = iree_hal_tt_buffer_device_address(cmd.bindings[1].buffer);
+      }
+      if (cmd.binding_count > 2 && cmd.bindings[2].buffer) {
+        out_addr = iree_hal_tt_buffer_device_address(cmd.bindings[2].buffer);
+      }
+
+      // Calculate number of tiles (assuming float32 data)
+      // Each tile is 32x32 floats = 4KB
+      uint32_t n_tiles = buffer_size / (32 * 32 * sizeof(float));
+      if (n_tiles == 0) n_tiles = 1;  // At least one tile for PoC
+
+      // Set runtime args for reader kernel (in0_addr, in1_addr, n_tiles)
+      try {
+        std::vector<uint32_t> reader_args = {in0_addr, in1_addr, n_tiles};
+        tt::tt_metal::SetRuntimeArgs(*program, params->reader_kernel_id, core, reader_args);
+
+        // Set runtime args for writer kernel (out_addr, n_tiles)
+        std::vector<uint32_t> writer_args = {out_addr, n_tiles};
+        tt::tt_metal::SetRuntimeArgs(*program, params->writer_kernel_id, core, writer_args);
+
+        // Set runtime args for compute kernel (n_tiles)
+        std::vector<uint32_t> compute_args = {n_tiles};
+        tt::tt_metal::SetRuntimeArgs(*program, params->compute_kernel_id, core, compute_args);
+      } catch (const std::exception& e) {
+        return iree_make_status(IREE_STATUS_INTERNAL,
+                               "Failed to set runtime args: %s", e.what());
+      }
+
+      // Add program to workload
+      // Note: MeshWorkload expects to move the program, but we need to preserve it
+      // for future dispatches. For now, we'll work around this limitation.
+      // In production, you'd need to clone the program or cache compiled programs.
+      try {
+        // FIXME: This moves the program! Need to address program lifetime management
+        workload.add_program(device_range, std::move(*program));
+      } catch (const std::exception& e) {
+        return iree_make_status(IREE_STATUS_INTERNAL,
+                               "Failed to add program to workload: %s", e.what());
+      }
+    }
+  }
+
+  // Execute the workload (blocking for PoC)
+  try {
+    tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_cq, workload, /*blocking=*/true);
+  } catch (const std::exception& e) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                           "Failed to execute workload: %s", e.what());
+  }
+
+  // Signal completion semaphores
+  for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
+        signal_semaphores.semaphores[i],
+        signal_semaphores.payload_values[i]));
+  }
+#else
+  // Mock mode - just signal completion
+  for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
+        signal_semaphores.semaphores[i],
+        signal_semaphores.payload_values[i]));
+  }
+#endif
+
+  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_tt_device_queue_flush(
     iree_hal_device_t* base, iree_hal_queue_affinity_t) {
 #ifndef TT_IREE_ENABLE_MOCK
   auto* device = iree_hal_tt_device_cast(base);
-  if (device->compute_queue) {
-    // TODO(swote): Implement proper queue finish when needed
-    // The API might have changed or we need to use a different method
+  if (device->mesh_cq) {
+    try {
+      // Flush the mesh command queue (wait for all pending operations)
+      tt::tt_metal::distributed::Finish(*device->mesh_cq);
+    } catch (const std::exception& e) {
+      return iree_make_status(IREE_STATUS_INTERNAL,
+                             "Failed to flush queue: %s", e.what());
+    }
   }
 #endif
   return iree_ok_status();

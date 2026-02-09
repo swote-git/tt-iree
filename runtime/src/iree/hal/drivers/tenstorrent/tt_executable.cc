@@ -11,6 +11,7 @@
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/tt_metal.hpp"
+#include "tt-metalium/tensor_accessor_args.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -28,7 +29,8 @@ typedef struct iree_hal_tt_executable_t {
   iree_hal_tt_kernel_params_t entry_points[];
 } iree_hal_tt_executable_t;
 
-static const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable;
+// Forward declare vtable (defined at end of file)
+extern const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable;
 
 static iree_hal_tt_executable_t* iree_hal_tt_executable_cast(iree_hal_executable_t* base) {
   IREE_HAL_ASSERT_TYPE(base, &iree_hal_tt_executable_vtable);
@@ -41,68 +43,85 @@ static iree_hal_tt_executable_t* iree_hal_tt_executable_cast(iree_hal_executable
 
 #ifndef TT_IREE_ENABLE_MOCK
 static iree_status_t iree_hal_tt_create_program_for_entry_point(
-    tt::tt_metal::IDevice* tt_device,
-    iree_string_view_t kernel_name,
-    // In real implementation, pass source code strings here
+    iree_hal_device_t* device,
     iree_hal_tt_kernel_params_t* params) {
-  
+
   try {
     // 1. Create Program
-    // Note: Program is a lightweight container, typically created on heap or stack.
-    // Since we need it to persist, we might need a wrapper or manage its lifetime carefully.
-    // TT-Metal Program is movable but not copyable.
     params->program = new tt::tt_metal::Program();
     tt::tt_metal::Program& program = *static_cast<tt::tt_metal::Program*>(params->program);
 
-    // 2. Define Core Range (e.g., single core (0,0) for PoC)
-    CoreCoord core_coord = {0, 0};
-    CoreRange core = {.start = core_coord, .end = core_coord};
+    // 2. Define Core Range (single core (0,0) for PoC)
+    tt::tt_metal::CoreCoord core_coord = {0, 0};
+    tt::tt_metal::CoreRange core(core_coord);
 
-    // 3. Create Circular Buffers (L1 Memory)
-    // This configuration should come from the compiler (FlatBuffer).
-    // Hardcoded example for "Add" op:
-    uint32_t cb_index = 0;
-    uint32_t num_tiles = 1;
-    uint32_t tile_size = 32 * 32 * 2; // bfloat16 assumption
-    
-    tt::tt_metal::CircularBufferConfig cb_config = tt::tt_metal::CircularBufferConfig(
-        num_tiles * tile_size, {{cb_index, tt::tt_metal::DataFormat::Float16_b}})
-        .set_page_size(cb_index, tile_size);
-    tt::tt_metal::CreateCircularBuffer(program, core, cb_config);
+    // 3. Create Circular Buffers (3 CBs as required by custom_sfpi_add kernels)
+    // Using Float16_b to match the reference example
+    constexpr uint32_t tiles_per_cb = 2;
+    constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16: 2048 bytes
 
-    // 4. Create Kernels
-    // These paths/sources should be extracted from the FlatBuffer.
-    // For PoC, we assume standard kernels or use placeholders.
-    
-    // Reader
+    // CB c_0: input0
+    tt::CBIndex src0_cb_index = tt::CBIndex::c_0;
+    tt::tt_metal::CreateCircularBuffer(program, core,
+        tt::tt_metal::CircularBufferConfig(
+            tiles_per_cb * tile_size_bytes,
+            {{src0_cb_index, tt::DataFormat::Float16_b}})
+            .set_page_size(src0_cb_index, tile_size_bytes));
+
+    // CB c_1: input1
+    tt::CBIndex src1_cb_index = tt::CBIndex::c_1;
+    tt::tt_metal::CreateCircularBuffer(program, core,
+        tt::tt_metal::CircularBufferConfig(
+            tiles_per_cb * tile_size_bytes,
+            {{src1_cb_index, tt::DataFormat::Float16_b}})
+            .set_page_size(src1_cb_index, tile_size_bytes));
+
+    // CB c_16: output
+    tt::CBIndex dst_cb_index = tt::CBIndex::c_16;
+    tt::tt_metal::CreateCircularBuffer(program, core,
+        tt::tt_metal::CircularBufferConfig(
+            tiles_per_cb * tile_size_bytes,
+            {{dst_cb_index, tt::DataFormat::Float16_b}})
+            .set_page_size(dst_cb_index, tile_size_bytes));
+
+    // 4. Create compile-time args for TensorAccessor (DRAM interleaved buffers)
+    std::vector<uint32_t> reader_compile_args;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_compile_args);
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_compile_args);
+
+    std::vector<uint32_t> writer_compile_args;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(writer_compile_args);
+
+    // 5. Create Kernels with compile-time args
+    // Reader (reads tiles from DRAM to circular buffers)
     params->reader_kernel_id = tt::tt_metal::CreateKernel(
         program,
-        "tt_metal/kernels/dataflow/reader_unary.cpp", // Placeholder path
-        core,
-        tt::tt_metal::DataMovementConfig{
-            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-            .noc = tt::tt_metal::NOC::RISCV_1_default});
-
-    // Writer
-    params->writer_kernel_id = tt::tt_metal::CreateKernel(
-        program,
-        "tt_metal/kernels/dataflow/writer_unary.cpp", // Placeholder path
+        "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/read_tiles.cpp",
         core,
         tt::tt_metal::DataMovementConfig{
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-            .noc = tt::tt_metal::NOC::RISCV_0_default});
+            .noc = tt::tt_metal::NOC::RISCV_0_default,
+            .compile_args = reader_compile_args});
 
-    // Compute
-    std::vector<uint32_t> compute_args = {};
+    // Writer (writes tiles from circular buffers to DRAM)
+    params->writer_kernel_id = tt::tt_metal::CreateKernel(
+        program,
+        "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/write_tile.cpp",
+        core,
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt::tt_metal::NOC::RISCV_1_default,
+            .compile_args = writer_compile_args});
+
+    // Compute (performs tile addition using SFPU)
     params->compute_kernel_id = tt::tt_metal::CreateKernel(
         program,
-        "tt_metal/kernels/compute/eltwise_binary.cpp", // Placeholder path
+        "tt_metal/programming_examples/custom_sfpi_add/kernels/compute/tiles_add.cpp",
         core,
-        tt::tt_metal::ComputeConfig{
-            .compile_args = compute_args});
+        tt::tt_metal::ComputeConfig{});
 
   } catch (const std::exception& e) {
-    return iree_make_status(IREE_STATUS_INTERNAL, 
+    return iree_make_status(IREE_STATUS_INTERNAL,
                            "Failed to create TT-Metal program: %s", e.what());
   }
 
@@ -124,7 +143,9 @@ iree_status_t iree_hal_tt_executable_create(
   IREE_ASSERT_ARGUMENT(out_executable);
   *out_executable = NULL;
 
-  iree_host_size_t entry_point_count = params->pipeline_layout_count;
+  // For PoC: hardcode 1 entry point. In production, parse executable_data FlatBuffer
+  // to determine the actual number of entry points.
+  iree_host_size_t entry_point_count = 1;
   
   // Calculate size for executable + array of kernel params
   iree_host_size_t total_size = sizeof(iree_hal_tt_executable_t) + 
@@ -145,15 +166,10 @@ iree_status_t iree_hal_tt_executable_create(
     // In a full implementation, you would:
     // 1. Read FlatBuffer to get kernel source/metadata for entry point [i].
     // 2. Call iree_hal_tt_create_program_for_entry_point(...)
-    
+
 #ifndef TT_IREE_ENABLE_MOCK
-    tt::tt_metal::IDevice* tt_device = iree_hal_tt_device_handle(
-        (iree_hal_tt_device_t*)device);
-        
-    iree_string_view_t name = iree_make_cstring_view("entry_point");
-    
     iree_status_t status = iree_hal_tt_create_program_for_entry_point(
-        tt_device, name, kernel_params);
+        device, kernel_params);
         
     if (!iree_status_is_ok(status)) {
       iree_hal_executable_destroy((iree_hal_executable_t*)executable);
@@ -198,6 +214,6 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params(
   return iree_ok_status();
 }
 
-static const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable = {
+const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable = {
     .destroy = iree_hal_tt_executable_destroy,
 };

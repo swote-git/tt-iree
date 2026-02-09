@@ -50,7 +50,20 @@ iree_status_t iree_hal_tt_buffer_create(
     iree_hal_buffer_t** out_buffer);
 
 #ifdef __cplusplus
+}  // extern "C"
+
+#ifndef TT_IREE_ENABLE_MOCK
+namespace tt::tt_metal {
+class Buffer;
 }
+
+// Get the TT-Metal buffer address for kernel runtime arguments
+uint32_t iree_hal_tt_buffer_device_address(iree_hal_buffer_t* buffer);
+
+// Get the underlying TT-Metal buffer (for advanced operations)
+tt::tt_metal::Buffer* iree_hal_tt_buffer_handle(iree_hal_buffer_t* buffer);
 #endif
+
+#endif  // __cplusplus
 
 #endif  // IREE_HAL_DRIVERS_TENSTORRENT_TT_BUFFER_H_

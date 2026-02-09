@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "iree/base/api.h"
-#include "iree/hal/utils/resource_set.h"
 
 //===----------------------------------------------------------------------===//
 // Data Structures
@@ -15,18 +14,16 @@
 typedef struct iree_hal_tt_command_buffer_t {
   iree_hal_command_buffer_t base;
   iree_allocator_t host_allocator;
-  
-  // Tracks resources to prevent premature deallocation
-  iree_hal_resource_set_t* resource_set;
 
   // Recorded commands
   std::vector<iree_hal_tt_command_t> commands;
 
-  // Current binding state
-  iree_hal_tt_descriptor_set_t current_descriptor_sets[IREE_HAL_TT_MAX_DESCRIPTOR_SETS];
+  // Resources to retain (simplified - just keep a list for PoC)
+  std::vector<iree_hal_resource_t*> resources;
 } iree_hal_tt_command_buffer_t;
 
-static const iree_hal_command_buffer_vtable_t iree_hal_tt_command_buffer_vtable;
+// Forward declare vtable (defined at end of file)
+extern const iree_hal_command_buffer_vtable_t iree_hal_tt_command_buffer_vtable;
 
 static iree_hal_tt_command_buffer_t* iree_hal_tt_command_buffer_cast(
     iree_hal_command_buffer_t* base) {
@@ -43,41 +40,46 @@ iree_status_t iree_hal_tt_device_create_command_buffer(
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
     iree_hal_command_buffer_t** out_command_buffer) {
-  
+
   iree_allocator_t host_allocator = iree_hal_device_host_allocator(device);
+  iree_hal_allocator_t* device_allocator = iree_hal_device_allocator(device);
   iree_hal_tt_command_buffer_t* command_buffer = nullptr;
-  
+
+  // Allocate space for command buffer + validation state
+  iree_host_size_t total_size = sizeof(*command_buffer) +
+      iree_hal_command_buffer_validation_state_size(mode, binding_capacity);
+
   IREE_RETURN_IF_ERROR(iree_allocator_malloc(
-      host_allocator, sizeof(*command_buffer), (void**)&command_buffer));
+      host_allocator, total_size, (void**)&command_buffer));
 
+  // Initialize base command buffer with validation_state pointing to memory after struct
   iree_hal_command_buffer_initialize(
-      device, mode, command_categories, queue_affinity, binding_capacity,
+      device_allocator, mode, command_categories, queue_affinity, binding_capacity,
+      (uint8_t*)command_buffer + sizeof(*command_buffer),
       &iree_hal_tt_command_buffer_vtable, &command_buffer->base);
-  
-  command_buffer->host_allocator = host_allocator;
-  
-  new (&command_buffer->commands) std::vector<iree_hal_tt_command_t>();
-  
-  std::memset(command_buffer->current_descriptor_sets, 0, 
-              sizeof(command_buffer->current_descriptor_sets));
-  
-  iree_status_t status = iree_hal_resource_set_create(host_allocator, &command_buffer->resource_set);
 
-  if (iree_status_is_ok(status)) {
-    *out_command_buffer = &command_buffer->base;
-  } else {
-    iree_hal_command_buffer_release(&command_buffer->base);
-  }
-  return status;
+  command_buffer->host_allocator = host_allocator;
+
+  // Initialize C++ members
+  new (&command_buffer->commands) std::vector<iree_hal_tt_command_t>();
+  new (&command_buffer->resources) std::vector<iree_hal_resource_t*>();
+
+  *out_command_buffer = &command_buffer->base;
+  return iree_ok_status();
 }
 
 static void iree_hal_tt_command_buffer_destroy(iree_hal_command_buffer_t* base) {
   iree_hal_tt_command_buffer_t* command_buffer = iree_hal_tt_command_buffer_cast(base);
-  
-  iree_hal_resource_set_free(command_buffer->resource_set);
-  
+
+  // Release all retained resources
+  for (auto* resource : command_buffer->resources) {
+    iree_hal_resource_release(resource);
+  }
+
+  // Destroy C++ members
   command_buffer->commands.~vector();
-  
+  command_buffer->resources.~vector();
+
   iree_allocator_free(command_buffer->host_allocator, command_buffer);
 }
 
@@ -89,6 +91,13 @@ static iree_status_t iree_hal_tt_command_buffer_begin(
     iree_hal_command_buffer_t* base) {
   iree_hal_tt_command_buffer_t* command_buffer = iree_hal_tt_command_buffer_cast(base);
   command_buffer->commands.clear();
+
+  // Release previous resources
+  for (auto* resource : command_buffer->resources) {
+    iree_hal_resource_release(resource);
+  }
+  command_buffer->resources.clear();
+
   return iree_ok_status();
 }
 
@@ -97,7 +106,18 @@ static iree_status_t iree_hal_tt_command_buffer_end(
   return iree_ok_status();
 }
 
-// NOTE: Execution barriers are no-ops for this PoC but can be recorded if needed
+static iree_status_t iree_hal_tt_command_buffer_begin_debug_group(
+    iree_hal_command_buffer_t* base, iree_string_view_t label,
+    iree_hal_label_color_t label_color,
+    const iree_hal_label_location_t* location) {
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_command_buffer_end_debug_group(
+    iree_hal_command_buffer_t* base) {
+  return iree_ok_status();
+}
+
 static iree_status_t iree_hal_tt_command_buffer_execution_barrier(
     iree_hal_command_buffer_t* base, iree_hal_execution_stage_t source_stage_mask,
     iree_hal_execution_stage_t target_stage_mask,
@@ -109,55 +129,118 @@ static iree_status_t iree_hal_tt_command_buffer_execution_barrier(
   return iree_ok_status();
 }
 
-// Updates current binding state. Does NOT emit a command
-static iree_status_t iree_hal_tt_command_buffer_push_descriptor_set(
-    iree_hal_command_buffer_t* base, iree_hal_pipeline_layout_t* pipeline_layout,
-    uint32_t set, iree_host_size_t binding_count,
-    const iree_hal_descriptor_set_binding_t* bindings) {
-  
-  iree_hal_tt_command_buffer_t* command_buffer = iree_hal_tt_command_buffer_cast(base);
-  
-  if (set >= IREE_HAL_TT_MAX_DESCRIPTOR_SETS) return iree_ok_status();
+static iree_status_t iree_hal_tt_command_buffer_signal_event(
+    iree_hal_command_buffer_t* base, iree_hal_event_t* event,
+    iree_hal_execution_stage_t source_stage_mask) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "signal_event not implemented");
+}
 
-  for (iree_host_size_t i = 0; i < binding_count; i++) {
-    if (bindings[i].binding >= IREE_HAL_TT_MAX_BINDINGS_PER_SET) continue;
-    
-    // Update state
-    command_buffer->current_descriptor_sets[set].bindings[bindings[i].binding] = bindings[i].buffer;
-    command_buffer->current_descriptor_sets[set].offsets[bindings[i].binding] = bindings[i].offset;
+static iree_status_t iree_hal_tt_command_buffer_reset_event(
+    iree_hal_command_buffer_t* base, iree_hal_event_t* event,
+    iree_hal_execution_stage_t source_stage_mask) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "reset_event not implemented");
+}
 
-    // check buffer
-    if (bindings[i].buffer) {
-      iree_hal_resource_set_insert(command_buffer->resource_set, 1, &bindings[i].buffer);
-    }
-  }
+static iree_status_t iree_hal_tt_command_buffer_wait_events(
+    iree_hal_command_buffer_t* base, iree_host_size_t event_count,
+    const iree_hal_event_t** events,
+    iree_hal_execution_stage_t source_stage_mask,
+    iree_hal_execution_stage_t target_stage_mask,
+    iree_host_size_t memory_barrier_count,
+    const iree_hal_memory_barrier_t* memory_barriers,
+    iree_host_size_t buffer_barrier_count,
+    const iree_hal_buffer_barrier_t* buffer_barriers) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "wait_events not implemented");
+}
+
+static iree_status_t iree_hal_tt_command_buffer_advise_buffer(
+    iree_hal_command_buffer_t* base,
+    iree_hal_buffer_ref_t buffer_ref, iree_hal_memory_advise_flags_t flags,
+    uint64_t arg0, uint64_t arg1) {
   return iree_ok_status();
 }
 
-// Records a dispatch command with the current binding state
+static iree_status_t iree_hal_tt_command_buffer_fill_buffer(
+    iree_hal_command_buffer_t* base,
+    iree_hal_buffer_ref_t target_ref, const void* pattern,
+    iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "fill_buffer not implemented");
+}
+
+static iree_status_t iree_hal_tt_command_buffer_update_buffer(
+    iree_hal_command_buffer_t* base, const void* source_buffer,
+    iree_host_size_t source_offset, iree_hal_buffer_ref_t target_ref,
+    iree_hal_update_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "update_buffer not implemented");
+}
+
+static iree_status_t iree_hal_tt_command_buffer_copy_buffer(
+    iree_hal_command_buffer_t* base,
+    iree_hal_buffer_ref_t source_ref, iree_hal_buffer_ref_t target_ref,
+    iree_hal_copy_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "copy_buffer not implemented");
+}
+
+static iree_status_t iree_hal_tt_command_buffer_collective(
+    iree_hal_command_buffer_t* base, iree_hal_channel_t* channel,
+    iree_hal_collective_op_t op, uint32_t param,
+    iree_hal_buffer_ref_t send_ref, iree_hal_buffer_ref_t recv_ref,
+    iree_device_size_t element_count) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "collective not implemented");
+}
+
+// Records a dispatch command (v3.9.0 API)
 static iree_status_t iree_hal_tt_command_buffer_dispatch(
-    iree_hal_command_buffer_t* base, iree_hal_executable_t* executable,
-    int32_t entry_point, uint32_t workgroup_x, uint32_t workgroup_y,
-    uint32_t workgroup_z, iree_hal_dispatch_flags_t flags) {
-  
+    iree_hal_command_buffer_t* base,
+    iree_hal_executable_t* executable,
+    iree_hal_executable_export_ordinal_t export_ordinal,
+    const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
+    iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
+
   iree_hal_tt_command_buffer_t* command_buffer = iree_hal_tt_command_buffer_cast(base);
-  
+
   iree_hal_tt_command_t cmd;
   cmd.type = IREE_HAL_TT_COMMAND_TYPE_DISPATCH;
   cmd.dispatch.executable = executable;
-  cmd.dispatch.entry_point = entry_point;
-  cmd.dispatch.workgroup_x = workgroup_x;
-  cmd.dispatch.workgroup_y = workgroup_y;
-  cmd.dispatch.workgroup_z = workgroup_z;
-  
-  // Snapshot
-  std::memcpy(cmd.dispatch.descriptor_sets, command_buffer->current_descriptor_sets, 
-              sizeof(command_buffer->current_descriptor_sets));
-  
+  cmd.dispatch.export_ordinal = export_ordinal;
+  cmd.dispatch.config = config;
+  cmd.dispatch.flags = flags;
+
+  // Copy bindings
+  cmd.dispatch.binding_count = bindings.count;
+  if (bindings.count > IREE_HAL_TT_MAX_BINDINGS) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "too many bindings: %zu > %d",
+                            bindings.count, IREE_HAL_TT_MAX_BINDINGS);
+  }
+  std::memcpy(cmd.dispatch.bindings, bindings.values,
+              bindings.count * sizeof(iree_hal_buffer_ref_t));
+
+  // Copy constants
+  cmd.dispatch.constants_length = constants.data_length;
+  if (constants.data_length > IREE_HAL_TT_MAX_CONSTANTS) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "too many constants: %zu > %d",
+                            constants.data_length, IREE_HAL_TT_MAX_CONSTANTS);
+  }
+  if (constants.data_length > 0) {
+    std::memcpy(cmd.dispatch.constants, constants.data, constants.data_length);
+  }
+
   command_buffer->commands.push_back(cmd);
-  
-  iree_hal_resource_set_insert(command_buffer->resource_set, 1, &executable);
-  
+
+  // Retain executable
+  iree_hal_executable_retain(executable);
+  command_buffer->resources.push_back((iree_hal_resource_t*)executable);
+
+  // Retain buffers from bindings
+  for (iree_host_size_t i = 0; i < bindings.count; i++) {
+    if (bindings.values[i].buffer) {
+      iree_hal_buffer_retain(bindings.values[i].buffer);
+      command_buffer->resources.push_back((iree_hal_resource_t*)bindings.values[i].buffer);
+    }
+  }
+
   return iree_ok_status();
 }
 
@@ -173,23 +256,23 @@ iree_hal_tt_command_t* iree_hal_tt_command_buffer_get_commands(
 }
 
 //===----------------------------------------------------------------------===//
-// VTable
+// VTable (v3.9.0 API)
 //===----------------------------------------------------------------------===//
 
-static const iree_hal_command_buffer_vtable_t iree_hal_tt_command_buffer_vtable = {
+const iree_hal_command_buffer_vtable_t iree_hal_tt_command_buffer_vtable = {
     .destroy = iree_hal_tt_command_buffer_destroy,
     .begin = iree_hal_tt_command_buffer_begin,
     .end = iree_hal_tt_command_buffer_end,
+    .begin_debug_group = iree_hal_tt_command_buffer_begin_debug_group,
+    .end_debug_group = iree_hal_tt_command_buffer_end_debug_group,
     .execution_barrier = iree_hal_tt_command_buffer_execution_barrier,
-    .signal_event = NULL,
-    .reset_event = NULL,
-    .wait_events = NULL,
-    .discard_buffer = NULL,
-    .update_buffer = NULL,
-    .copy_buffer = NULL,
-    .collective = NULL,
-    .push_constants = iree_hal_command_buffer_push_constants,
-    .push_descriptor_set = iree_hal_tt_command_buffer_push_descriptor_set,
+    .signal_event = iree_hal_tt_command_buffer_signal_event,
+    .reset_event = iree_hal_tt_command_buffer_reset_event,
+    .wait_events = iree_hal_tt_command_buffer_wait_events,
+    .advise_buffer = iree_hal_tt_command_buffer_advise_buffer,
+    .fill_buffer = iree_hal_tt_command_buffer_fill_buffer,
+    .update_buffer = iree_hal_tt_command_buffer_update_buffer,
+    .copy_buffer = iree_hal_tt_command_buffer_copy_buffer,
+    .collective = iree_hal_tt_command_buffer_collective,
     .dispatch = iree_hal_tt_command_buffer_dispatch,
-    .dispatch_indirect = NULL,
 };

@@ -49,11 +49,16 @@ iree_status_t iree_hal_tt_device_create(
 #ifndef TT_IREE_ENABLE_MOCK
 namespace tt::tt_metal {
 class IDevice;
-class CommandQueue;
+namespace distributed {
+class MeshDevice;
+class MeshCommandQueue;
+}
 }
 
-tt::tt_metal::IDevice* iree_hal_tt_device_handle(iree_hal_tt_device_t* device);
-tt::tt_metal::CommandQueue* iree_hal_tt_device_queue(iree_hal_tt_device_t* device);
+tt::tt_metal::distributed::MeshDevice* iree_hal_tt_device_mesh_handle(iree_hal_tt_device_t* device);
+tt::tt_metal::distributed::MeshCommandQueue* iree_hal_tt_device_mesh_queue(iree_hal_tt_device_t* device);
+
+tt::tt_metal::IDevice* iree_hal_tt_device_idevice(iree_hal_tt_device_t* device);
 #endif
 
 #else

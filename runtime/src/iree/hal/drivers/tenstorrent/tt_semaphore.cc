@@ -18,7 +18,8 @@ typedef struct iree_hal_tt_semaphore_t {
   iree_atomic_int64_t value;
 } iree_hal_tt_semaphore_t;
 
-static const iree_hal_semaphore_vtable_t iree_hal_tt_semaphore_vtable;
+// Forward declare vtable (defined at end of file)
+extern const iree_hal_semaphore_vtable_t iree_hal_tt_semaphore_vtable;
 
 static iree_hal_tt_semaphore_t* iree_hal_tt_semaphore_cast(
     iree_hal_semaphore_t* base_value) {
@@ -117,13 +118,13 @@ static iree_status_t iree_hal_tt_semaphore_wait(
       return iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED);
     }
 
-    iree_thread_yield();
-    
+    // Yield to other threads (optional for busy-wait)
+    // iree_thread_yield() doesn't exist in v3.9.0, so we'll just poll
     iree_hal_semaphore_poll(&semaphore->base);
   }
 }
 
-static const iree_hal_semaphore_vtable_t iree_hal_tt_semaphore_vtable = {
+const iree_hal_semaphore_vtable_t iree_hal_tt_semaphore_vtable = {
     .destroy = iree_hal_tt_semaphore_destroy,
     .query = iree_hal_tt_semaphore_query,
     .signal = iree_hal_tt_semaphore_signal,

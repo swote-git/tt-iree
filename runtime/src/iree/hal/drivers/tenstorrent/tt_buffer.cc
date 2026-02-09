@@ -101,6 +101,23 @@ static iree_hal_tt_buffer_t* iree_hal_tt_buffer_cast(iree_hal_buffer_t* base) {
 }
 
 //===----------------------------------------------------------------------===//
+// Buffer accessors for kernel runtime arguments
+//===----------------------------------------------------------------------===//
+
+#ifndef TT_IREE_ENABLE_MOCK
+uint32_t iree_hal_tt_buffer_device_address(iree_hal_buffer_t* base_buffer) {
+  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  if (!buffer || !buffer->tt_buffer) return 0;
+  return buffer->tt_buffer->address();
+}
+
+tt::tt_metal::Buffer* iree_hal_tt_buffer_handle(iree_hal_buffer_t* base_buffer) {
+  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  return buffer ? buffer->tt_buffer.get() : nullptr;
+}
+#endif
+
+//===----------------------------------------------------------------------===//
 // Buffer creation
 //===----------------------------------------------------------------------===//
 
@@ -165,16 +182,22 @@ iree_status_t iree_hal_tt_buffer_create(
                                "failed to allocate mock buffer");
     }
 #else
-    tt::tt_metal::IDevice* tt_device = iree_hal_tt_device_handle(device);
+    tt::tt_metal::IDevice* tt_device = iree_hal_tt_device_idevice(device);
     if (!tt_device) {
       status = iree_make_status(IREE_STATUS_UNAVAILABLE,
                                "TT-Metal device not initialized");
     } else {
       try {
+        // Page size must match the tile size used by kernels.
+        // Using bfloat16 tiles: 32x32 * 2 bytes = 2048 bytes per tile.
+        constexpr uint32_t bf16_tile_size = TT_TILE_SIZE * sizeof(uint16_t);
+        // Ensure allocation is aligned to tile size
+        uint64_t aligned_size = ((static_cast<uint64_t>(allocation_size) + bf16_tile_size - 1)
+                                / bf16_tile_size) * bf16_tile_size;
         tt::tt_metal::BufferConfig config{
             .device = tt_device,
-            .size = static_cast<uint64_t>(allocation_size),
-            .page_size = TT_TILE_SIZE * sizeof(float),  // 4KB per tile
+            .size = aligned_size,
+            .page_size = bf16_tile_size,
             .buffer_type = tt::tt_metal::BufferType::DRAM
         };
         buffer->tt_buffer = tt::tt_metal::CreateBuffer(config);
