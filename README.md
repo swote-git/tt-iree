@@ -1,6 +1,6 @@
 # tt-iree
 
-IREE Backend for Tenstorrent AI Accelerators
+IREE plugin for Tenstorrent AI Accelerators
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -25,12 +25,13 @@ result = runtime.invoke(compiled, inputs)
 
 **Early Development (PoC Phase)**
 
-- [ ] Compiler backend registration
-- [ ] HAL driver implementation
-- [ ] Mock mode execution
-- [ ] Basic operation support (elementwise add)
-- [ ] TTNN integration
-- [ ] Hardware execution
+WIP & Planned:
+- Compiler backend registration
+- HAL driver implementation
+- Mock mode execution
+- Basic operation support (elementwise add)
+- TTNN integration
+- Hardware execution
 
 ## Version Compatibility
 
@@ -39,7 +40,6 @@ result = runtime.invoke(compiled, inputs)
 | IREE | v3.9.0 | Compiler & runtime infrastructure |
 | tt-metal | v0.65.0 | Tenstorrent SDK (TTNN, TT-Metalium) |
 
-These versions have been tested together. See [VERSIONS.md](VERSIONS.md) for details.
 
 ## Project Structure
 
@@ -57,7 +57,7 @@ tt-iree/
 └── examples/              # Example programs
 ```
 
-## Building
+## Building(WIP: Not working now)
 
 ### Prerequisites
 
@@ -112,7 +112,7 @@ cmake --build build
 
 ## Architecture
 
-This project implements an out-of-tree IREE backend for Tenstorrent hardware, consisting of two main components:
+Out-of-tree IREE plugin for Tenstorrent hardware, consisting of two main components:
 
 ### Compiler Backend
 
@@ -125,7 +125,7 @@ Extends IREE's compiler to generate code for Tenstorrent's tile-based architectu
 
 ### Runtime Driver
 
-Implements IREE's Hardware Abstraction Layer (HAL) interface:
+Implements IREE's HAL(Hardware Abstraction Layer) interface:
 
 | Component | Description |
 |-----------|-------------|

@@ -80,7 +80,7 @@ The compiler backend extends IREE to generate code for Tenstorrent hardware.
 - Map workloads to Tensix core grid
 - Serialize executables to FlatBuffer format
 
-**Key Design Decision:** Generate TT-Metal kernel code directly rather than
+**Direct to tt-metal:** Generate TT-Metal kernel code directly rather than
 going through tt-mlir dialects. This keeps the PoC simple while maintaining
 the option to integrate tt-mlir optimizations later.
 
