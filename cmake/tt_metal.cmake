@@ -112,8 +112,11 @@ function(tt_metal_target_link_libraries target)
     INSTALL_RPATH "${TT_METAL_LIB_DIR}"
   )
 
+  target_link_libraries(${target} PRIVATE "${TT_METAL_LIB_DIR}/libfmt.so")
+
   target_compile_definitions(${target} PRIVATE
     ARCH_BLACKHOLE=1
     TT_METAL_VERSIM_DISABLED=1
+    SPDLOG_FMT_EXTERNAL=1
   )
 endfunction()
