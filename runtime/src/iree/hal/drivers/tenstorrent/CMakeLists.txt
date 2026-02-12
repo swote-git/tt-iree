@@ -75,6 +75,7 @@ target_link_libraries(iree_hal_tenstorrent
   PUBLIC
     iree_base_base
     iree_hal_hal
+    iree_hal_utils_semaphore_base
 )
 
 # Add math library (for sqrt in tile conversion)

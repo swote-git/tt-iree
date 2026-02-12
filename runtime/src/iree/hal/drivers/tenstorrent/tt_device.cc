@@ -10,6 +10,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_command_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
+#include "iree/hal/drivers/tenstorrent/tt_semaphore.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
@@ -335,8 +336,12 @@ static iree_status_t iree_hal_tt_device_import_file(
 }
 
 static iree_status_t iree_hal_tt_device_create_semaphore(
-    iree_hal_device_t*, iree_hal_queue_affinity_t, uint64_t, iree_hal_semaphore_flags_t, iree_hal_semaphore_t**) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "semaphore not implemented");
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    uint64_t initial_value, iree_hal_semaphore_flags_t flags,
+    iree_hal_semaphore_t** out_semaphore) {
+  return iree_hal_tt_semaphore_create(
+      iree_hal_tt_device_cast(base_device)->host_allocator, initial_value,
+      out_semaphore);
 }
 
 static iree_hal_semaphore_compatibility_t
