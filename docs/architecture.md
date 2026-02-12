@@ -60,8 +60,8 @@ Technical architecture of the tt-iree project.
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              Tenstorrent Hardware (P100A)                   │
-│                  8x8 Tensix Core Grid                       │
-│                     24GB GDDR6                              │
+│                  12x10 Tensix Core Grid                     │
+│                     28GB GDDR6                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,7 +111,7 @@ The runtime driver implements IREE's Hardware Abstraction Layer (HAL) interface.
                      │ PCIe
                      ▼
 ┌─────────────────────────────────────────┐
-│         Device DRAM (24GB GDDR6)         │
+│         Device DRAM (28GB GDDR6)         │
 │         - Large capacity                 │
 │         - Higher latency                 │
 └────────────────────┬────────────────────┘
