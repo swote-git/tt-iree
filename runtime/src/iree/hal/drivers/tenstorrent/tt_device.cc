@@ -413,14 +413,17 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   tt::tt_metal::distributed::MeshCoordinateRange device_range =
       tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
 
+  // Track dispatched params so we can restore programs after execution.
+  iree_hal_tt_kernel_params_t* dispatched_params = nullptr;
+
   // Process each dispatch command
   for (iree_host_size_t i = 0; i < command_count; ++i) {
     if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH) {
       auto& cmd = commands[i].dispatch;
 
-      // Lookup kernel params (contains the Program)
-      const iree_hal_tt_kernel_params_t* params = nullptr;
-      IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params(
+      // Lookup kernel params (mutable: we need write access to restore program)
+      iree_hal_tt_kernel_params_t* params = nullptr;
+      IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params_mutable(
           cmd.executable, cmd.export_ordinal, &params));
 
       if (!params || !params->program) {
@@ -472,13 +475,11 @@ static iree_status_t iree_hal_tt_device_queue_execute(
                                "Failed to set runtime args: %s", e.what());
       }
 
-      // Add program to workload
-      // Note: MeshWorkload expects to move the program, but we need to preserve it
-      // for future dispatches. For now, we'll work around this limitation.
-      // In production, you'd need to clone the program or cache compiled programs.
+      // Move program into workload (required by MeshWorkload API).
+      // We restore it after execution completes.
       try {
-        // FIXME: This moves the program! Need to address program lifetime management
         workload.add_program(device_range, std::move(*program));
+        dispatched_params = params;
       } catch (const std::exception& e) {
         return iree_make_status(IREE_STATUS_INTERNAL,
                                "Failed to add program to workload: %s", e.what());
@@ -490,8 +491,25 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   try {
     tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_cq, workload, /*blocking=*/true);
   } catch (const std::exception& e) {
+    // Attempt to restore program even on execution failure.
+    if (dispatched_params) {
+      auto& programs = workload.get_programs();
+      if (!programs.empty()) {
+        *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
+            std::move(programs.begin()->second);
+      }
+    }
     return iree_make_status(IREE_STATUS_INTERNAL,
                            "Failed to execute workload: %s", e.what());
+  }
+
+  // Restore program back from workload so the executable can be re-dispatched.
+  if (dispatched_params) {
+    auto& programs = workload.get_programs();
+    if (!programs.empty()) {
+      *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
+          std::move(programs.begin()->second);
+    }
   }
 
   // Signal completion semaphores

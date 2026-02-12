@@ -214,6 +214,20 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params(
   return iree_ok_status();
 }
 
+iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
+    iree_hal_executable_t* base_executable,
+    int32_t entry_point,
+    iree_hal_tt_kernel_params_t** out_params) {
+  iree_hal_tt_executable_t* executable = iree_hal_tt_executable_cast(base_executable);
+
+  if (entry_point < 0 || entry_point >= executable->entry_point_count) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "invalid entry point ordinal %d", entry_point);
+  }
+
+  *out_params = &executable->entry_points[entry_point];
+  return iree_ok_status();
+}
+
 const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable = {
     .destroy = iree_hal_tt_executable_destroy,
 };

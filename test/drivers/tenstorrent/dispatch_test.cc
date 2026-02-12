@@ -141,6 +141,140 @@ TEST_F(DispatchTest, ElementwiseAddBfloat16) {
   // All resources (executable, buffers, cmd_buffer) auto-released by vm::ref.
 }
 
+TEST_F(DispatchTest, ReDispatchSameExecutable) {
+  // Verifies that a program survives dispatch and can be re-used.
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format = iree_make_cstring_view("TT-METAL");
+  exec_params.executable_data = iree_make_const_byte_span(NULL, 0);
+
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_status_t exec_status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "kernel compilation not available";
+  }
+
+#ifndef TT_IREE_ENABLE_MOCK
+  constexpr uint32_t kNTiles = 1;
+  constexpr uint32_t kElementsPerTile = 32 * 32;
+  constexpr uint32_t kTileSizeBytes = kElementsPerTile * sizeof(bfloat16);
+  constexpr uint32_t kDramBufferSize = kTileSizeBytes * kNTiles;
+
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree::vm::ref<iree_hal_buffer_t> in0_buffer;
+  iree::vm::ref<iree_hal_buffer_t> in1_buffer;
+  iree::vm::ref<iree_hal_buffer_t> out_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kDramBufferSize, &in0_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kDramBufferSize, &in1_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kDramBufferSize, &out_buffer));
+
+  constexpr float kEps = 1e-1f;
+
+  // --- First dispatch: 1.0 + 2.0 = 3.0 ---
+  {
+    std::vector<bfloat16> h_in0(kElementsPerTile, bfloat16(1.0f));
+    std::vector<bfloat16> h_in1(kElementsPerTile, bfloat16(2.0f));
+
+    tt::tt_metal::detail::WriteToBuffer(
+        *iree_hal_tt_buffer_handle(in0_buffer.get()), h_in0);
+    tt::tt_metal::detail::WriteToBuffer(
+        *iree_hal_tt_buffer_handle(in1_buffer.get()), h_in1);
+
+    iree::vm::ref<iree_hal_command_buffer_t> cmd;
+    IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+        device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+        IREE_HAL_COMMAND_CATEGORY_DISPATCH, 0, 16, &cmd));
+    IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd.get()));
+
+    iree_hal_buffer_ref_t bindings[3] = {
+        iree_hal_make_buffer_ref(in0_buffer.get(), 0, kDramBufferSize),
+        iree_hal_make_buffer_ref(in1_buffer.get(), 0, kDramBufferSize),
+        iree_hal_make_buffer_ref(out_buffer.get(), 0, kDramBufferSize),
+    };
+    iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+    iree_const_byte_span_t constants = {0};
+    iree_hal_buffer_ref_list_t binding_list = {3, bindings};
+
+    IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+        cmd.get(), executable.get(), 0, config, constants, binding_list, 0));
+    IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd.get()));
+
+    iree_hal_semaphore_list_t no_sema = {0};
+    iree_hal_buffer_binding_table_t no_bt = {0};
+    IREE_ASSERT_OK(iree_hal_device_queue_execute(
+        device_, 0, no_sema, no_sema, cmd.get(), no_bt, 0));
+
+    std::vector<bfloat16> h_out(kElementsPerTile);
+    tt::tt_metal::detail::ReadFromBuffer(
+        *iree_hal_tt_buffer_handle(out_buffer.get()), h_out);
+
+    for (uint32_t i = 0; i < kElementsPerTile; i++) {
+      ASSERT_NEAR(static_cast<float>(h_out[i]), 3.0f, kEps)
+          << "dispatch 1 mismatch at " << i;
+    }
+    fprintf(stderr, "  Dispatch 1: 1.0 + 2.0 = %.1f (OK)\n",
+            static_cast<float>(h_out[0]));
+  }
+
+  // --- Second dispatch (same executable): 10.0 + 5.0 = 15.0 ---
+  {
+    std::vector<bfloat16> h_in0(kElementsPerTile, bfloat16(10.0f));
+    std::vector<bfloat16> h_in1(kElementsPerTile, bfloat16(5.0f));
+
+    tt::tt_metal::detail::WriteToBuffer(
+        *iree_hal_tt_buffer_handle(in0_buffer.get()), h_in0);
+    tt::tt_metal::detail::WriteToBuffer(
+        *iree_hal_tt_buffer_handle(in1_buffer.get()), h_in1);
+
+    iree::vm::ref<iree_hal_command_buffer_t> cmd;
+    IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+        device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+        IREE_HAL_COMMAND_CATEGORY_DISPATCH, 0, 16, &cmd));
+    IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd.get()));
+
+    iree_hal_buffer_ref_t bindings[3] = {
+        iree_hal_make_buffer_ref(in0_buffer.get(), 0, kDramBufferSize),
+        iree_hal_make_buffer_ref(in1_buffer.get(), 0, kDramBufferSize),
+        iree_hal_make_buffer_ref(out_buffer.get(), 0, kDramBufferSize),
+    };
+    iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+    iree_const_byte_span_t constants = {0};
+    iree_hal_buffer_ref_list_t binding_list = {3, bindings};
+
+    IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+        cmd.get(), executable.get(), 0, config, constants, binding_list, 0));
+    IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd.get()));
+
+    iree_hal_semaphore_list_t no_sema = {0};
+    iree_hal_buffer_binding_table_t no_bt = {0};
+    IREE_ASSERT_OK(iree_hal_device_queue_execute(
+        device_, 0, no_sema, no_sema, cmd.get(), no_bt, 0));
+
+    std::vector<bfloat16> h_out(kElementsPerTile);
+    tt::tt_metal::detail::ReadFromBuffer(
+        *iree_hal_tt_buffer_handle(out_buffer.get()), h_out);
+
+    for (uint32_t i = 0; i < kElementsPerTile; i++) {
+      ASSERT_NEAR(static_cast<float>(h_out[i]), 15.0f, kEps)
+          << "dispatch 2 mismatch at " << i;
+    }
+    fprintf(stderr, "  Dispatch 2: 10.0 + 5.0 = %.1f (OK)\n",
+            static_cast<float>(h_out[0]));
+  }
+#endif  // !TT_IREE_ENABLE_MOCK
+}
+
 }  // namespace
 }  // namespace tenstorrent
 }  // namespace hal
