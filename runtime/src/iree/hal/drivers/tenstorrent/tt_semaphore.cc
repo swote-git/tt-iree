@@ -119,7 +119,6 @@ static iree_status_t iree_hal_tt_semaphore_wait(
     }
 
     // Yield to other threads (optional for busy-wait)
-    // iree_thread_yield() doesn't exist in v3.9.0, so we'll just poll
     iree_hal_semaphore_poll(&semaphore->base);
   }
 }

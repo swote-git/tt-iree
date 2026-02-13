@@ -553,9 +553,34 @@ static iree_status_t iree_hal_tt_device_queue_flush(
 }
 
 static iree_status_t iree_hal_tt_device_wait_semaphores(
-    iree_hal_device_t*, iree_hal_wait_mode_t, const iree_hal_semaphore_list_t,
-    iree_timeout_t, iree_hal_wait_flags_t) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "wait semaphores not implemented");
+    iree_hal_device_t* base_device, iree_hal_wait_mode_t wait_mode,
+    const iree_hal_semaphore_list_t semaphore_list, iree_timeout_t timeout,
+    iree_hal_wait_flags_t flags) {
+  if (semaphore_list.count == 0) return iree_ok_status();
+
+  iree_time_t deadline_ns = iree_timeout_as_deadline_ns(timeout);
+
+  // Busy-poll loop over the semaphore list.
+  while (true) {
+    iree_host_size_t satisfied = 0;
+    for (iree_host_size_t i = 0; i < semaphore_list.count; ++i) {
+      uint64_t current_value = 0;
+      IREE_RETURN_IF_ERROR(iree_hal_semaphore_query(
+          semaphore_list.semaphores[i], &current_value));
+      if (current_value >= semaphore_list.payload_values[i]) {
+        ++satisfied;
+        if (wait_mode == IREE_HAL_WAIT_MODE_ANY) {
+          return iree_ok_status();
+        }
+      }
+    }
+    if (satisfied == semaphore_list.count) {
+      return iree_ok_status();  // WAIT_ALL satisfied
+    }
+    if (iree_time_now() >= deadline_ns) {
+      return iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED);
+    }
+  }
 }
 
 static iree_status_t iree_hal_tt_device_profiling_begin(
