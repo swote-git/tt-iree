@@ -16,6 +16,7 @@ typedef struct iree_hal_tt_semaphore_t {
   iree_hal_semaphore_t base;
   iree_allocator_t host_allocator;
   iree_atomic_int64_t value;
+  iree_status_t failure_status;
 } iree_hal_tt_semaphore_t;
 
 // Forward declare vtable (defined at end of file)
@@ -43,6 +44,7 @@ iree_status_t iree_hal_tt_semaphore_create(
     iree_hal_semaphore_initialize(&iree_hal_tt_semaphore_vtable,
                                   &semaphore->base);
     semaphore->host_allocator = host_allocator;
+    semaphore->failure_status = iree_ok_status();
     iree_atomic_store(&semaphore->value, initial_value,
                       iree_memory_order_release);
     *out_semaphore = &semaphore->base;
@@ -60,6 +62,7 @@ static void iree_hal_tt_semaphore_destroy(
   
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  iree_status_ignore(semaphore->failure_status);
   iree_hal_semaphore_deinitialize(&semaphore->base);
   iree_allocator_free(host_allocator, semaphore);
 
@@ -70,8 +73,11 @@ static iree_status_t iree_hal_tt_semaphore_query(
     iree_hal_semaphore_t* base_semaphore, uint64_t* out_value) {
   iree_hal_tt_semaphore_t* semaphore =
       iree_hal_tt_semaphore_cast(base_semaphore);
-  
+
   *out_value = iree_atomic_load(&semaphore->value, iree_memory_order_acquire);
+  if (!iree_status_is_ok(semaphore->failure_status)) {
+    return iree_status_clone(semaphore->failure_status);
+  }
   return iree_ok_status();
 }
 
@@ -91,10 +97,13 @@ static void iree_hal_tt_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
                                        iree_status_t status) {
   iree_hal_tt_semaphore_t* semaphore =
       iree_hal_tt_semaphore_cast(base_semaphore);
-  
-  // TODO(swote): store the status to return it
-  iree_status_ignore(status);
-  
+
+  if (iree_status_is_ok(semaphore->failure_status)) {
+    semaphore->failure_status = status;
+  } else {
+    iree_status_ignore(status);
+  }
+
   iree_hal_semaphore_poll(&semaphore->base);
 }
 
@@ -109,6 +118,10 @@ static iree_status_t iree_hal_tt_semaphore_wait(
   iree_time_t deadline_ns = iree_timeout_as_deadline_ns(timeout);
   
   while (true) {
+    if (!iree_status_is_ok(semaphore->failure_status)) {
+      return iree_status_clone(semaphore->failure_status);
+    }
+
     uint64_t current_value = iree_atomic_load(&semaphore->value, iree_memory_order_acquire);
     if (current_value >= value) {
       return iree_ok_status();
