@@ -96,3 +96,19 @@ tt_iree_hal_test(
 if(NOT TT_IREE_ENABLE_MOCK)
   tt_metal_target_link_libraries(dispatch_test)
 endif()
+
+#-------------------------------------------------------------------------------
+# Schema tests (no hardware, no MPI — run directly)
+#-------------------------------------------------------------------------------
+
+add_executable(ttex_test ttex_test.cc)
+target_compile_features(ttex_test PRIVATE cxx_std_17)
+target_link_libraries(ttex_test
+  PRIVATE
+    tt_executable_builder_util
+    iree_base_base
+    iree_testing_gtest
+    iree_testing_gtest_main
+)
+add_test(NAME tt_ttex_test COMMAND ttex_test)
+set_tests_properties(tt_ttex_test PROPERTIES LABELS "tt-iree;unit")

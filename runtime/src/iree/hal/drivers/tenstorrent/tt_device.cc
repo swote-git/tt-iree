@@ -11,6 +11,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_command_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
 #include "iree/hal/drivers/tenstorrent/tt_semaphore.h"
+#include "iree/hal/drivers/tenstorrent/tt_executable_cache.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
@@ -325,8 +326,18 @@ static iree_status_t iree_hal_tt_device_create_event(
 }
 
 static iree_status_t iree_hal_tt_device_create_executable_cache(
-    iree_hal_device_t*, iree_string_view_t, iree_loop_t, iree_hal_executable_cache_t**) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "executable cache not implemented");
+    iree_hal_device_t* base_device,
+    iree_string_view_t identifier,
+    iree_loop_t loop,
+    iree_hal_executable_cache_t** out_executable_cache) {
+  // Passthrough cache: no caching, every prepare_executable creates fresh.
+  // The cache recognizes "tenstorrent-ttex-fb" format and delegates to
+  // iree_hal_tt_executable_create().
+  return iree_hal_tt_executable_cache_create(
+      base_device,
+      identifier,
+      iree_hal_device_host_allocator(base_device),
+      out_executable_cache);
 }
 
 static iree_status_t iree_hal_tt_device_import_file(

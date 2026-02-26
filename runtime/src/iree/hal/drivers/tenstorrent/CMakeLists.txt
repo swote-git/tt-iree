@@ -15,6 +15,7 @@ set(TT_HAL_DRIVER_SRCS
   tt_executable.cc
   tt_semaphore.cc
   tt_command_buffer.cc
+  tt_executable_cache.cc
   registration/driver_module.c
 )
 
@@ -27,6 +28,7 @@ set(TT_HAL_DRIVER_HDRS
   tt_executable.h
   tt_semaphore.h
   tt_command_buffer.h
+  tt_executable_cache.h
   registration/driver_module.h
 )
 
@@ -51,6 +53,16 @@ if(TT_IREE_ENABLE_TTNN)
       ${TT_METAL_LIBRARIES}
       "${TT_METAL_LIB_DIR}/libfmt.so"
   )
+
+  # TTEX FlatBuffer schema support
+  if(TARGET tt_executable_def_c_fbs)
+    target_link_libraries(iree_hal_tenstorrent PUBLIC tt_executable_def_c_fbs)
+    target_compile_definitions(iree_hal_tenstorrent PRIVATE TT_IREE_ENABLE_TTEX=1)
+    message(STATUS "  TTEX FlatBuffer support: enabled")
+  else()
+    message(STATUS "  TTEX FlatBuffer support: disabled (schema not built)")
+  endif()
+  
   target_compile_definitions(iree_hal_tenstorrent
     PRIVATE
       SPDLOG_FMT_EXTERNAL=1

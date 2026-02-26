@@ -63,11 +63,15 @@ target_link_libraries(tt_executable_builder_util
   PUBLIC
     tt_executable_def_c_fbs
     iree_base_base
+  PRIVATE
+    flatcc::runtime
 )
 
+# Expose runtime/src so callers can use:
+#   #include "iree/schema/tt_executable_builder_util.h"
 target_include_directories(tt_executable_builder_util
   PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 
 message(STATUS "  TTEX schema: ${TT_IREE_TTEX_SCHEMA}")
