@@ -1,0 +1,89 @@
+// Copyright 2025 The tt-iree Authors
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// Tenstorrent Executable Definition (TTEX)
+//
+// This FlatBuffer schema defines the binary format for Tenstorrent HAL
+// executables. The compiler backend serializes dispatch metadata into this
+// format, and the runtime HAL driver parses it to create executable objects.
+//
+// The executable_format string for this schema is: "tenstorrent-ttex-fb"
+// The file_identifier is "TTEX" (checked by flatcc verify_as_root).
+//
+// Extension roadmap:
+//   Phase A (current): BuiltinProgram enum selects hardcoded PoC programs
+//   Phase B: Add ttmetal_kernel_bundle table (kernel source / CB config / core range)
+//   Phase C: Add ttnn_op_desc table (op name + attrs + tensor layout)
+//   Phase D: Add binary cache hash, profile/trace metadata
+
+namespace iree.tenstorrent.hal;
+
+file_identifier "TTEX";
+file_extension "ttex";
+
+// ---------------------------------------------------------------------------
+// BuiltinProgram: PoC dispatch routing
+// ---------------------------------------------------------------------------
+// The runtime driver contains hardcoded TT-Metal program builders for each
+// variant. The compiler (or test builder) selects one by enum value.
+// This will be superseded by ttnn_op / ttmetal_kernel in later phases.
+
+enum BuiltinProgram : uint32 {
+  // custom_sfpi_add kernels (current dispatch_test path)
+  CUSTOM_SFPI_ADD = 0,
+
+  // Reserved for single-tile bf16 elementwise add via TTNN API
+  TTNN_ELTWISE_ADD = 1,
+}
+
+// ---------------------------------------------------------------------------
+// EntryPointDef: one per HAL export (dispatch function)
+// ---------------------------------------------------------------------------
+// Fields map directly to iree_hal_executable_export_info_t so the runtime
+// can populate that struct without additional computation.
+
+table EntryPointDef {
+  // HAL export name (used for ordinal mapping / debug).
+  name:string;
+
+  // --- HAL reflection metadata (iree_hal_executable_export_info_t) ---
+
+  // Number of 32-bit push constants expected by this dispatch.
+  constant_count:uint16 = 0;
+
+  // Number of buffer bindings expected by this dispatch.
+  binding_count:uint16 = 0;
+
+  // iree_hal_executable_export_flags_t (reserved, 0 for now).
+  flags:uint64 = 0;
+
+  // Workgroup size [x, y, z]. Scalars with defaults because flatcc
+  // does not support default values on struct fields.
+  workgroup_size_x:uint32 = 1;
+  workgroup_size_y:uint32 = 1;
+  workgroup_size_z:uint32 = 1;
+
+  // --- Tenstorrent dispatch routing (Phase A) ---
+
+  builtin:BuiltinProgram = CUSTOM_SFPI_ADD;
+
+  // --- Phase B extension point (TT-Metal JIT) ---
+  // ttmetal_kernel:TTMetalKernelBundle;  // kernel source + CB config + core range
+
+  // --- Phase C extension point (TTNN high-level op) ---
+  // ttnn_op:TTNNOpDesc;  // op_type + input/output tensor descs + attrs
+}
+
+// ---------------------------------------------------------------------------
+// ExecutableDef: root table
+// ---------------------------------------------------------------------------
+
+table ExecutableDef {
+  // Schema version. Bump on breaking changes.
+  version:uint32 = 0;
+
+  // One entry per HAL export ordinal.
+  entry_points:[EntryPointDef];
+}
+
+root_type ExecutableDef;

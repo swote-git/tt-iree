@@ -1,0 +1,49 @@
+// Copyright 2025 The tt-iree Authors
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// Utility to build TTEX FlatBuffer blobs without a compiler.
+// Primary use case: unit tests that need to exercise the runtime's
+// TTEX parsing/verification path before the compiler backend exists.
+
+#ifndef IREE_SCHEMA_TT_EXECUTABLE_BUILDER_UTIL_H_
+#define IREE_SCHEMA_TT_EXECUTABLE_BUILDER_UTIL_H_
+
+#include <stdint.h>
+
+#include "iree/base/api.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Describes a single entry point to be serialized into a TTEX blob.
+// Field semantics match EntryPointDef in tt_executable_def.fbs.
+typedef struct tt_iree_ttex_entry_point_desc_t {
+  const char* name;  // null-terminated, may be NULL (defaults to "")
+  uint16_t constant_count;
+  uint16_t binding_count;
+  uint64_t flags;
+  uint32_t workgroup_size[3];  // [x, y, z]
+  uint32_t builtin_program;    // BuiltinProgram enum value
+} tt_iree_ttex_entry_point_desc_t;
+
+// Builds a complete TTEX FlatBuffer from the given entry point descriptors.
+//
+// The resulting bytes are allocated via |allocator| and returned in |out_data|.
+// Caller must free with iree_allocator_free(allocator, out_data->data).
+//
+// The blob will:
+//   - Have file_identifier "TTEX"
+//   - Pass flatcc verify_as_root()
+//   - Contain |entry_point_count| EntryPointDef entries
+iree_status_t tt_iree_build_ttex_executable_def(
+    iree_allocator_t allocator,
+    iree_host_size_t entry_point_count,
+    const tt_iree_ttex_entry_point_desc_t* entry_points,
+    iree_byte_span_t* out_data);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // IREE_SCHEMA_TT_EXECUTABLE_BUILDER_UTIL_H_
