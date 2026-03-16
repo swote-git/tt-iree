@@ -23,6 +23,7 @@ option(TT_IREE_BUILD_TESTS "Build tests" ON)
 option(TT_IREE_ENABLE_MOCK "Enable mock mode (no hardware required)" ON)
 option(TT_IREE_ENABLE_TTNN "Enable TTNN integration" OFF)
 
+
 message(STATUS "tt-iree configuration:")
 message(STATUS "  TT_IREE_BUILD_COMPILER: ${TT_IREE_BUILD_COMPILER}")
 message(STATUS "  TT_IREE_BUILD_RUNTIME: ${TT_IREE_BUILD_RUNTIME}")
@@ -43,6 +44,21 @@ set(IREE_HAL_DRIVER_DEFAULTS OFF CACHE BOOL "" FORCE)
 # Enable only necessary HAL drivers for testing
 set(IREE_HAL_DRIVER_LOCAL_SYNC ON CACHE BOOL "" FORCE)
 set(IREE_HAL_DRIVER_LOCAL_TASK ON CACHE BOOL "" FORCE)
+
+# Disable unused input plugins (avoid large submodules like torch-mlir)
+set(IREE_INPUT_TORCH OFF CACHE BOOL "" FORCE)
+set(IREE_INPUT_STABLEHLO OFF CACHE BOOL "" FORCE)
+set(IREE_INPUT_TOSA OFF CACHE BOOL "" FORCE)
+
+# Register the Tenstorrent compiler plugin with IREE's static plugin mechanism.
+# TenstorrentTarget must be created (add_subdirectory compiler) before IREE is
+# added so that iree_compiler_plugin.cmake can call iree_compiler_register_plugin.
+# target_link_libraries forward-references to IREE targets are resolved later.
+if(TT_IREE_BUILD_COMPILER)
+  add_subdirectory(compiler)
+  list(APPEND IREE_CMAKE_BUILTIN_PLUGIN_PATHS
+    "${CMAKE_CURRENT_SOURCE_DIR}/compiler/plugins")
+endif()
 
 # Add IREE
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/iree/CMakeLists.txt")
@@ -76,10 +92,6 @@ endif()
 #-------------------------------------------------------------------------------
 # Subdirectories
 #-------------------------------------------------------------------------------
-
-if(TT_IREE_BUILD_COMPILER)
-  add_subdirectory(compiler)
-endif()
 
 if(TT_IREE_BUILD_RUNTIME)
   add_subdirectory(runtime)
