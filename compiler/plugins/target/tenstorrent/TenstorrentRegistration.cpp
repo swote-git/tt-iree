@@ -10,6 +10,7 @@
 #include "TenstorrentTarget.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
+#include "iree/compiler/Utils/OptionUtils.h"
 
 namespace mlir::iree_compiler {
 
@@ -75,6 +76,9 @@ struct TenstorrentSession
 };
 
 }  // namespace
+
+IREE_DEFINE_COMPILER_OPTION_FLAGS(TenstorrentOptions);
+
 }  // namespace mlir::iree_compiler
 
 extern "C" bool iree_register_compiler_plugin_hal_target_tenstorrent(

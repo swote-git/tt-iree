@@ -22,6 +22,7 @@ target_include_directories(TenstorrentTarget
 
 target_link_libraries(TenstorrentTarget
   PUBLIC
+    iree_compiler_Codegen_Common_Common
     iree_compiler_Dialect_HAL_Target_Target
     iree_compiler_PluginAPI_PluginAPI
     MLIRIR
@@ -30,3 +31,14 @@ target_link_libraries(TenstorrentTarget
 )
 
 target_compile_features(TenstorrentTarget PUBLIC cxx_std_17)
+
+set_target_properties(TenstorrentTarget PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
+
+# Match IREE compiler build flags: no RTTI, no exceptions, hidden visibility.
+target_compile_options(TenstorrentTarget PRIVATE
+  -fno-rtti
+  -fno-exceptions
+  -fvisibility=hidden
+)

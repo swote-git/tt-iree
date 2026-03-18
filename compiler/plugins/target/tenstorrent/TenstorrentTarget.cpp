@@ -3,10 +3,10 @@
 
 #include "TenstorrentTarget.h"
 
+#include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
 
 // TTEX builder — shared between compiler and runtime tests.
 // This header is from runtime/src/iree/schema/ and is available
@@ -68,18 +68,12 @@ void TenstorrentTargetBackend::getDefaultExecutableTargets(
 void TenstorrentTargetBackend::buildTranslationPassPipeline(
     IREE::HAL::ExecutableTargetAttr targetAttr,
     OpPassManager &passManager) {
-  // PoC: No Tenstorrent-specific lowering passes.
-  //
-  // IREE's standard pipeline already:
-  //   1. Partitioned program into dispatches
-  //   2. Lowered to linalg-on-tensors
-  //   3. Bufferized dispatch contents
-  //
-  // serializeExecutable inspects ops and maps to builtin programs.
-  //
-  // Future passes (Phase B/C):
-  //   passManager.addPass(createTTTileForTensixPass());
-  //   passManager.addPass(createTTGenerateKernelPass());
+  // Lower dispatch.workgroup_count_from_slice → concrete workgroup counts.
+  // Without this, index-typed results reach VM conversion and cause a
+  // vm.trunc.i64.i32 type error (op expects i64, gets index).
+  // When there are no scf.forall distribution loops, ReconcileTranslationInfo
+  // replaces the op with {1,1,1} workgroup counts (one tile per dispatch).
+  passManager.addPass(createReconcileTranslationInfoPass());
 }
 
 //===----------------------------------------------------------------------===//

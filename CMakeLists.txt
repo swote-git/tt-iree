@@ -40,6 +40,10 @@ set(IREE_BUILD_COMPILER ${TT_IREE_BUILD_COMPILER} CACHE BOOL "" FORCE)
 set(IREE_BUILD_TESTS ${TT_IREE_BUILD_TESTS} CACHE BOOL "" FORCE)
 set(IREE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(IREE_HAL_DRIVER_DEFAULTS OFF CACHE BOOL "" FORCE)
+# Disable IREE install targets — we're embedding IREE, not installing it.
+# This avoids export-set errors when external HAL driver targets (iree_hal_tenstorrent)
+# are linked into iree_hal_drivers_drivers but not in IREE's IREEExported-Runtime set.
+set(IREE_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 
 # Enable only necessary HAL drivers for testing
 set(IREE_HAL_DRIVER_LOCAL_SYNC ON CACHE BOOL "" FORCE)
