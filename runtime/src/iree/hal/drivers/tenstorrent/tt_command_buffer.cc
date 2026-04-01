@@ -178,7 +178,24 @@ static iree_status_t iree_hal_tt_command_buffer_copy_buffer(
     iree_hal_command_buffer_t* base,
     iree_hal_buffer_ref_t source_ref, iree_hal_buffer_ref_t target_ref,
     iree_hal_copy_flags_t flags) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "copy_buffer not implemented");
+  iree_hal_tt_command_buffer_t* command_buffer = iree_hal_tt_command_buffer_cast(base);
+
+  iree_hal_tt_command_t cmd;
+  cmd.type = IREE_HAL_TT_COMMAND_TYPE_COPY;
+  cmd.copy.source_ref = source_ref;
+  cmd.copy.target_ref = target_ref;
+  command_buffer->commands.push_back(cmd);
+
+  // Retain buffers
+  if (source_ref.buffer) {
+    iree_hal_buffer_retain(source_ref.buffer);
+    command_buffer->resources.push_back((iree_hal_resource_t*)source_ref.buffer);
+  }
+  if (target_ref.buffer) {
+    iree_hal_buffer_retain(target_ref.buffer);
+    command_buffer->resources.push_back((iree_hal_resource_t*)target_ref.buffer);
+  }
+  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_tt_command_buffer_collective(

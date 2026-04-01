@@ -14,10 +14,15 @@ set(TT_IREE_TTEX_GENERATED_HDRS
   "${CMAKE_CURRENT_BINARY_DIR}/tt_executable_def_verifier.h"
 )
 
-# IREE_ROOT_DIR: the root of the IREE source tree (third_party/iree).
+# IREE_ROOT_DIR: the root of the IREE source tree.
+# IREE_SOURCE_DIR is set by IREE when it is the top-level project.
+# Fall back to the submodule path for legacy tt-iree top-level builds.
 if(NOT DEFINED IREE_ROOT_DIR)
-  # Fallback: assume standard tt-iree layout
-  set(IREE_ROOT_DIR "${CMAKE_SOURCE_DIR}/third_party/iree")
+  if(DEFINED IREE_SOURCE_DIR)
+    set(IREE_ROOT_DIR "${IREE_SOURCE_DIR}")
+  else()
+    set(IREE_ROOT_DIR "${CMAKE_SOURCE_DIR}/third_party/iree")
+  endif()
 endif()
 
 add_custom_command(

@@ -42,6 +42,9 @@ add_library(iree_hal_tenstorrent STATIC
   ${TT_HAL_DRIVER_HDRS}
 )
 
+# TT-Metal requires C++20 (CMAKE_CXX_STANDARD 20 in tt-metal/CMakeLists.txt).
+target_compile_features(iree_hal_tenstorrent PRIVATE cxx_std_20)
+
 if(TT_IREE_ENABLE_TTNN)
   target_include_directories(iree_hal_tenstorrent
     PRIVATE
@@ -54,9 +57,15 @@ if(TT_IREE_ENABLE_TTNN)
       "${TT_METAL_LIB_DIR}/libfmt.so"
   )
 
-  # TTEX FlatBuffer schema support
+  # TTEX FlatBuffer schema support.
+  # Expand tt_executable_def_c_fbs's include dirs via generator expression instead of
+  # target_link_libraries to avoid creating a CMake target dep that would require
+  # tt_executable_def_c_fbs to appear in IREE's install export set.
   if(TARGET tt_executable_def_c_fbs)
-    target_link_libraries(iree_hal_tenstorrent PUBLIC tt_executable_def_c_fbs)
+    target_include_directories(iree_hal_tenstorrent PRIVATE
+      $<TARGET_PROPERTY:tt_executable_def_c_fbs,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    add_dependencies(iree_hal_tenstorrent tt_executable_def_gen)
     target_compile_definitions(iree_hal_tenstorrent PRIVATE TT_IREE_ENABLE_TTEX=1)
     message(STATUS "  TTEX FlatBuffer support: enabled")
   else()
@@ -74,11 +83,13 @@ if(TT_IREE_ENABLE_TTNN)
 endif()
 
 # Set include directories
+# Resolve to absolute path so CMake doesn't warn about relative INTERFACE paths.
+get_filename_component(_TT_IREE_RUNTIME_SRC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 target_include_directories(iree_hal_tenstorrent
   PUBLIC
-    # Path to runtime/src (4 levels up from current directory)
-    # This allows: #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../..
+    # runtime/src — allows: #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
+    ${_TT_IREE_RUNTIME_SRC}
 )
 
 # Link against IREE HAL
@@ -117,19 +128,28 @@ if(TT_IREE_ENABLE_TTNN)
 endif()
 
 #-------------------------------------------------------------------------------
-# Installation (optional)
+# Installation
 #-------------------------------------------------------------------------------
 
-# Install headers (if needed for external use)
-install(FILES ${TT_HAL_DRIVER_HDRS}
-  DESTINATION include/iree/hal/drivers/tenstorrent
-)
-
-# Install library
-install(TARGETS iree_hal_tenstorrent
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-)
+# When included by IREE via iree_register_external_hal_driver(SOURCE_DIR ...),
+# the directory inherits IREE_INSTALL_LIBRARY_TARGETS_DEFAULT_COMPONENT and
+# IREE_INSTALL_LIBRARY_TARGETS_DEFAULT_EXPORT_SET from the drivers/ scope.
+# iree_install_targets() adds iree_hal_tenstorrent to IREE's export set so that
+# the CMake generate step doesn't error on missing export set membership.
+if(COMMAND iree_install_targets)
+  iree_install_targets(
+    TARGETS iree_hal_tenstorrent
+    HDRS    ${TT_HAL_DRIVER_HDRS}
+  )
+else()
+  install(FILES ${TT_HAL_DRIVER_HDRS}
+    DESTINATION include/iree/hal/drivers/tenstorrent
+  )
+  install(TARGETS iree_hal_tenstorrent
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+  )
+endif()
 
 #-------------------------------------------------------------------------------
 # Status

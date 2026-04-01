@@ -56,8 +56,13 @@ static iree_status_t iree_hal_tt_device_create_semaphore(iree_hal_device_t*, ire
 static iree_hal_semaphore_compatibility_t iree_hal_tt_device_query_semaphore_compatibility(iree_hal_device_t*, iree_hal_semaphore_t*);
 static iree_status_t iree_hal_tt_device_queue_alloca(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_allocator_pool_t, iree_hal_buffer_params_t, iree_device_size_t, iree_hal_alloca_flags_t, iree_hal_buffer_t**);
 static iree_status_t iree_hal_tt_device_queue_dealloca(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_hal_dealloca_flags_t);
+static iree_status_t iree_hal_tt_device_queue_fill(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, const void*, iree_host_size_t, iree_hal_fill_flags_t);
+static iree_status_t iree_hal_tt_device_queue_update(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, const void*, iree_host_size_t, iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_update_flags_t);
+static iree_status_t iree_hal_tt_device_queue_copy(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_device_size_t, iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_copy_flags_t);
 static iree_status_t iree_hal_tt_device_queue_read(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_file_t*, uint64_t, iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t, iree_hal_read_flags_t);
 static iree_status_t iree_hal_tt_device_queue_write(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_buffer_t*, iree_device_size_t, iree_hal_file_t*, uint64_t, iree_device_size_t, iree_hal_write_flags_t);
+static iree_status_t iree_hal_tt_device_queue_host_call(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_host_call_t, const uint64_t[4], iree_hal_host_call_flags_t);
+static iree_status_t iree_hal_tt_device_queue_dispatch(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_executable_t*, iree_hal_executable_export_ordinal_t, const iree_hal_dispatch_config_t, iree_const_byte_span_t, const iree_hal_buffer_ref_list_t, iree_hal_dispatch_flags_t);
 static iree_status_t iree_hal_tt_device_queue_execute(iree_hal_device_t*, iree_hal_queue_affinity_t, const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t, iree_hal_command_buffer_t*, iree_hal_buffer_binding_table_t, iree_hal_execute_flags_t);
 static iree_status_t iree_hal_tt_device_queue_flush(iree_hal_device_t*, iree_hal_queue_affinity_t);
 static iree_status_t iree_hal_tt_device_wait_semaphores(iree_hal_device_t*, iree_hal_wait_mode_t, const iree_hal_semaphore_list_t, iree_timeout_t, iree_hal_wait_flags_t);
@@ -84,8 +89,13 @@ static const iree_hal_device_vtable_t iree_hal_tt_device_vtable = {
     .query_semaphore_compatibility = iree_hal_tt_device_query_semaphore_compatibility,
     .queue_alloca = iree_hal_tt_device_queue_alloca,
     .queue_dealloca = iree_hal_tt_device_queue_dealloca,
+    .queue_fill = iree_hal_tt_device_queue_fill,
+    .queue_update = iree_hal_tt_device_queue_update,
+    .queue_copy = iree_hal_tt_device_queue_copy,
     .queue_read = iree_hal_tt_device_queue_read,
     .queue_write = iree_hal_tt_device_queue_write,
+    .queue_host_call = iree_hal_tt_device_queue_host_call,
+    .queue_dispatch = iree_hal_tt_device_queue_dispatch,
     .queue_execute = iree_hal_tt_device_queue_execute,
     .queue_flush = iree_hal_tt_device_queue_flush,
     .wait_semaphores = iree_hal_tt_device_wait_semaphores,
@@ -282,7 +292,14 @@ static iree_status_t iree_hal_tt_device_query_i64(
   *out_value = 0;
   
   if (iree_string_view_equal(category, IREE_SV("hal.device.id"))) {
-    *out_value = device->device_id;
+    // key is a glob pattern; return 1 if our identifier matches it.
+    *out_value = iree_string_view_match_pattern(device->identifier, key) ? 1 : 0;
+    return iree_ok_status();
+  }
+
+  if (iree_string_view_equal(category, IREE_SV("hal.executable.format"))) {
+    // Report support for the TTEX FlatBuffer format.
+    *out_value = iree_string_view_equal(key, IREE_SV("tenstorrent-ttex-fb")) ? 1 : 0;
     return iree_ok_status();
   }
 
@@ -361,18 +378,107 @@ iree_hal_tt_device_query_semaphore_compatibility(iree_hal_device_t*, iree_hal_se
 }
 
 static iree_status_t iree_hal_tt_device_queue_alloca(
-    iree_hal_device_t*, iree_hal_queue_affinity_t,
-    const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t,
-    iree_hal_allocator_pool_t, iree_hal_buffer_params_t, iree_device_size_t,
-    iree_hal_alloca_flags_t, iree_hal_buffer_t**) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue alloca not implemented");
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_allocator_pool_t pool, iree_hal_buffer_params_t params,
+    iree_device_size_t allocation_size, iree_hal_alloca_flags_t flags,
+    iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(
+      wait_semaphore_list, iree_infinite_timeout(),
+      IREE_HAL_WAIT_FLAG_DEFAULT));
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(
+      iree_hal_device_allocator(base_device), params, allocation_size,
+      out_buffer));
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_signal(signal_semaphore_list));
+  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_tt_device_queue_dealloca(
-    iree_hal_device_t*, iree_hal_queue_affinity_t,
-    const iree_hal_semaphore_list_t, const iree_hal_semaphore_list_t,
-    iree_hal_buffer_t*, iree_hal_dealloca_flags_t) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue dealloca not implemented");
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags) {
+  return iree_hal_device_queue_barrier(base_device, queue_affinity,
+                                       wait_semaphore_list,
+                                       signal_semaphore_list,
+                                       IREE_HAL_EXECUTE_FLAG_NONE);
+}
+
+static iree_status_t iree_hal_tt_device_queue_fill(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
+    iree_device_size_t length, const void* pattern,
+    iree_host_size_t pattern_length, iree_hal_fill_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue_fill not implemented");
+}
+
+static iree_status_t iree_hal_tt_device_queue_update(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    const void* source_buffer, iree_host_size_t source_offset,
+    iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
+    iree_device_size_t length, iree_hal_update_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue_update not implemented");
+}
+
+// Inline synchronous device-to-device (host-mediated) copy.
+static iree_status_t iree_hal_tt_device_queue_copy(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_buffer_t* source_buffer, iree_device_size_t source_offset,
+    iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
+    iree_device_size_t length, iree_hal_copy_flags_t flags) {
+  iree_hal_buffer_mapping_t src_mapping = {};
+  iree_status_t status = iree_hal_buffer_map_range(
+      source_buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
+      source_offset, length, &src_mapping);
+  if (!iree_status_is_ok(status)) return status;
+
+  iree_hal_buffer_mapping_t dst_mapping = {};
+  status = iree_hal_buffer_map_range(
+      target_buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
+      target_offset, length, &dst_mapping);
+  if (iree_status_is_ok(status)) {
+    iree_device_size_t copy_len =
+        std::min(length, (iree_device_size_t)dst_mapping.contents.data_length);
+    std::memcpy(dst_mapping.contents.data, src_mapping.contents.data, copy_len);
+    iree_hal_buffer_unmap_range(&dst_mapping);
+  }
+  iree_hal_buffer_unmap_range(&src_mapping);
+  IREE_RETURN_IF_ERROR(status);
+
+  for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
+        signal_semaphore_list.semaphores[i],
+        signal_semaphore_list.payload_values[i]));
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_device_queue_host_call(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_host_call_t call, const uint64_t args[4],
+    iree_hal_host_call_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue_host_call not implemented");
+}
+
+static iree_status_t iree_hal_tt_device_queue_dispatch(
+    iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+    const iree_hal_semaphore_list_t wait_semaphore_list,
+    const iree_hal_semaphore_list_t signal_semaphore_list,
+    iree_hal_executable_t* executable,
+    iree_hal_executable_export_ordinal_t export_ordinal,
+    const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
+    const iree_hal_buffer_ref_list_t bindings,
+    iree_hal_dispatch_flags_t flags) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "queue_dispatch not implemented");
 }
 
 static iree_status_t iree_hal_tt_device_queue_read(
@@ -432,9 +538,11 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   // Track dispatched params so we can restore programs after execution.
   iree_hal_tt_kernel_params_t* dispatched_params = nullptr;
 
-  // Process each dispatch command
+  // Phase 1: process dispatch commands and build workload
+  bool has_dispatch = false;
   for (iree_host_size_t i = 0; i < command_count; ++i) {
     if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH) {
+      has_dispatch = true;
       auto& cmd = commands[i].dispatch;
 
       // Lookup kernel params (mutable: we need write access to restore program)
@@ -453,26 +561,41 @@ static iree_status_t iree_hal_tt_device_queue_execute(
       // Set runtime arguments from bindings (v3.9.0 API)
       tt::tt_metal::CoreCoord core = {0, 0};  // Using single core for PoC
 
-      // Extract buffer addresses from bindings
+      // Resolve a binding ref to its actual iree_hal_buffer_t*.
+      // If ref.buffer is non-NULL it's a direct binding; otherwise look up
+      // the buffer from the binding_table using ref.buffer_slot.
+      auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref) -> iree_hal_buffer_t* {
+        if (ref.buffer) return ref.buffer;
+        if (ref.buffer_slot < binding_table.count)
+          return binding_table.bindings[ref.buffer_slot].buffer;
+        return nullptr;
+      };
+
+      // Extract buffer addresses from bindings.
       // Expected layout: bindings = [input0, input1, output]
       uint32_t in0_addr = 0, in1_addr = 0, out_addr = 0;
       uint32_t buffer_size = 0;
 
-      if (cmd.binding_count > 0 && cmd.bindings[0].buffer) {
-        in0_addr = iree_hal_tt_buffer_device_address(cmd.bindings[0].buffer);
-        buffer_size = iree_hal_buffer_byte_length(cmd.bindings[0].buffer);
+      if (cmd.binding_count > 0) {
+        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[0]);
+        if (buf) {
+          in0_addr = iree_hal_tt_buffer_device_address(buf);
+          buffer_size = (uint32_t)iree_hal_buffer_byte_length(buf);
+        }
       }
-      if (cmd.binding_count > 1 && cmd.bindings[1].buffer) {
-        in1_addr = iree_hal_tt_buffer_device_address(cmd.bindings[1].buffer);
+      if (cmd.binding_count > 1) {
+        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[1]);
+        if (buf) in1_addr = iree_hal_tt_buffer_device_address(buf);
       }
-      if (cmd.binding_count > 2 && cmd.bindings[2].buffer) {
-        out_addr = iree_hal_tt_buffer_device_address(cmd.bindings[2].buffer);
+      if (cmd.binding_count > 2) {
+        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[2]);
+        if (buf) out_addr = iree_hal_tt_buffer_device_address(buf);
       }
 
-      // Calculate number of tiles (assuming float32 data)
-      // Each tile is 32x32 floats = 4KB
-      uint32_t n_tiles = buffer_size / (32 * 32 * sizeof(float));
-      if (n_tiles == 0) n_tiles = 1;  // At least one tile for PoC
+      // Calculate number of bfloat16 tiles (32x32x2 bytes each).
+      constexpr uint32_t bf16_tile_bytes = 32 * 32 * 2;
+      uint32_t n_tiles = buffer_size / bf16_tile_bytes;
+      if (n_tiles == 0) n_tiles = 1;
 
       // Set runtime args for reader kernel (in0_addr, in1_addr, n_tiles)
       try {
@@ -503,11 +626,23 @@ static iree_status_t iree_hal_tt_device_queue_execute(
     }
   }
 
-  // Execute the workload (blocking for PoC)
-  try {
-    tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_cq, workload, /*blocking=*/true);
-  } catch (const std::exception& e) {
-    // Attempt to restore program even on execution failure.
+  // Execute the workload (blocking) only if we have dispatch commands
+  if (has_dispatch) {
+    try {
+      tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_cq, workload, /*blocking=*/true);
+    } catch (const std::exception& e) {
+      if (dispatched_params) {
+        auto& programs = workload.get_programs();
+        if (!programs.empty()) {
+          *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
+              std::move(programs.begin()->second);
+        }
+      }
+      return iree_make_status(IREE_STATUS_INTERNAL,
+                             "Failed to execute workload: %s", e.what());
+    }
+
+    // Restore program back from workload so the executable can be re-dispatched.
     if (dispatched_params) {
       auto& programs = workload.get_programs();
       if (!programs.empty()) {
@@ -515,16 +650,42 @@ static iree_status_t iree_hal_tt_device_queue_execute(
             std::move(programs.begin()->second);
       }
     }
-    return iree_make_status(IREE_STATUS_INTERNAL,
-                           "Failed to execute workload: %s", e.what());
   }
 
-  // Restore program back from workload so the executable can be re-dispatched.
-  if (dispatched_params) {
-    auto& programs = workload.get_programs();
-    if (!programs.empty()) {
-      *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
-          std::move(programs.begin()->second);
+  // Phase 2: execute copy commands (host-mediated device-to-device copy)
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_COPY) {
+      auto& cmd = commands[i].copy;
+      iree_hal_buffer_t* src_buf = cmd.source_ref.buffer;
+      iree_hal_buffer_t* dst_buf = cmd.target_ref.buffer;
+      if (!src_buf || !dst_buf) { continue; }
+
+      iree_device_size_t length = cmd.source_ref.length;
+      if (length == IREE_HAL_WHOLE_BUFFER) {
+        iree_device_size_t src_len = iree_hal_buffer_byte_length(src_buf);
+        iree_device_size_t src_off = cmd.source_ref.offset;
+        length = src_len > src_off ? src_len - src_off : 0;
+      }
+      if (length == 0) continue;
+
+      iree_hal_buffer_mapping_t src_mapping = {};
+      iree_status_t copy_status = iree_hal_buffer_map_range(
+          src_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
+          cmd.source_ref.offset, length, &src_mapping);
+      if (!iree_status_is_ok(copy_status)) return copy_status;
+
+      iree_hal_buffer_mapping_t dst_mapping = {};
+      copy_status = iree_hal_buffer_map_range(
+          dst_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
+          cmd.target_ref.offset, length, &dst_mapping);
+      if (iree_status_is_ok(copy_status)) {
+        iree_device_size_t copy_len =
+            std::min(length, (iree_device_size_t)dst_mapping.contents.data_length);
+        std::memcpy(dst_mapping.contents.data, src_mapping.contents.data, copy_len);
+        iree_hal_buffer_unmap_range(&dst_mapping);
+      }
+      iree_hal_buffer_unmap_range(&src_mapping);
+      IREE_RETURN_IF_ERROR(copy_status);
     }
   }
 

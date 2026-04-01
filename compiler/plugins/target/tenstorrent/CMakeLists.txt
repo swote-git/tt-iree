@@ -17,7 +17,8 @@ target_include_directories(TenstorrentTarget
     # Own directory: makes #include "TenstorrentTarget.h" work in sibling files
     ${CMAKE_CURRENT_SOURCE_DIR}
     # IREE compiler headers: iree/compiler/Dialect/HAL/...
-    ${CMAKE_SOURCE_DIR}/third_party/iree/compiler/src
+    # IREE_SOURCE_DIR is set by IREE's own CMakeLists when IREE is the top-level project.
+    ${IREE_SOURCE_DIR}/compiler/src
 )
 
 target_link_libraries(TenstorrentTarget

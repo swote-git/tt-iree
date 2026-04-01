@@ -87,7 +87,7 @@ static iree_status_t iree_hal_tt_buffer_invalidate_range(iree_hal_buffer_t*, ire
 static iree_status_t iree_hal_tt_buffer_flush_range(iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t);
 
 static const iree_hal_buffer_vtable_t iree_hal_tt_buffer_vtable = {
-    .recycle = nullptr,
+    .recycle = iree_hal_buffer_recycle,
     .destroy = iree_hal_tt_buffer_destroy,
     .map_range = iree_hal_tt_buffer_map_range,
     .unmap_range = iree_hal_tt_buffer_unmap_range,
@@ -272,29 +272,19 @@ static iree_status_t iree_hal_tt_buffer_map_range(
   }
   
   if (memory_access & IREE_HAL_MEMORY_ACCESS_READ) {
-    iree_device_size_t buffer_size = iree_hal_buffer_allocation_size(base_buffer);
-    void* tiled_data = std::malloc(buffer_size);
-    if (!tiled_data) {
-      std::free(staging);
-      IREE_TRACE_ZONE_END(z0);
-      return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                             "failed to allocate tiled buffer");
-    }
-    
     try {
-      tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, (uint8_t*)tiled_data);
-
-      if (buffer->uses_tile_layout) {
-        iree_hal_tt_unpack_from_tiles((const float*)tiled_data, (float*)staging,
-                                      buffer->rows, buffer->cols);
-      } else {
-        std::memcpy(staging, tiled_data, local_byte_length);
-      }
-    } catch (const std::exception& e) {
+      // ReadFromBuffer fills a host-side vector; copy only what was requested.
+      std::vector<uint8_t> tmp;
+      tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, tmp);
+      iree_device_size_t copy_len =
+          std::min(local_byte_length, (iree_device_size_t)tmp.size());
+      std::memcpy(staging, tmp.data(), copy_len);
+      if (copy_len < local_byte_length)
+        std::memset((uint8_t*)staging + copy_len, 0,
+                    local_byte_length - copy_len);
+    } catch (...) {
       std::memset(staging, 0, local_byte_length);
     }
-    
-    std::free(tiled_data);
   } else {
     std::memset(staging, 0, local_byte_length);
   }
@@ -318,33 +308,22 @@ static iree_status_t iree_hal_tt_buffer_unmap_range(
 #ifdef TT_IREE_ENABLE_MOCK
   // No-op for mock mode
 #else
-  iree_device_size_t buffer_size = iree_hal_buffer_allocation_size(base_buffer);
-  
-  try {
-    if (buffer->uses_tile_layout) {
-      void* tiled_data = std::malloc(buffer_size);
-      if (tiled_data) {
-        iree_hal_tt_pack_to_tiles((const float*)mapping->contents.data,
-                                  (float*)tiled_data,
-                                  buffer->rows, buffer->cols);
-
-        tt::stl::Span<const uint8_t> span(
-            (const uint8_t*)tiled_data, buffer_size);
-        tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
-        std::free(tiled_data);
-      }
-    } else {
+  // Only write back to device if the mapping allowed writes.
+  if (mapping->impl.allowed_access & IREE_HAL_MEMORY_ACCESS_WRITE) {
+    try {
       tt::stl::Span<const uint8_t> span(
           mapping->contents.data, local_byte_length);
       tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
+    } catch (const std::exception& e) {
+      fprintf(stderr, "tt-iree: unmap_range: WriteToBuffer threw: %s\n", e.what());
+    } catch (...) {
+      fprintf(stderr, "tt-iree: unmap_range: WriteToBuffer threw unknown\n");
     }
-  } catch (...) {
-    // idk for now.
   }
 
   std::free(mapping->contents.data);
 #endif
-  
+
   mapping->contents = iree_byte_span_empty();
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();

@@ -136,10 +136,30 @@ static iree_status_t iree_hal_tt_semaphore_wait(
   }
 }
 
+static iree_status_t iree_hal_tt_semaphore_import_timepoint(
+    iree_hal_semaphore_t* semaphore, uint64_t value,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_external_timepoint_t external_timepoint) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "import_timepoint not supported");
+}
+
+static iree_status_t iree_hal_tt_semaphore_export_timepoint(
+    iree_hal_semaphore_t* semaphore, uint64_t value,
+    iree_hal_queue_affinity_t queue_affinity,
+    iree_hal_external_timepoint_type_t requested_type,
+    iree_hal_external_timepoint_flags_t requested_flags,
+    iree_hal_external_timepoint_t* out_external_timepoint) {
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "export_timepoint not supported");
+}
+
 const iree_hal_semaphore_vtable_t iree_hal_tt_semaphore_vtable = {
     .destroy = iree_hal_tt_semaphore_destroy,
     .query = iree_hal_tt_semaphore_query,
     .signal = iree_hal_tt_semaphore_signal,
     .fail = iree_hal_tt_semaphore_fail,
     .wait = iree_hal_tt_semaphore_wait,
+    .import_timepoint = iree_hal_tt_semaphore_import_timepoint,
+    .export_timepoint = iree_hal_tt_semaphore_export_timepoint,
 };

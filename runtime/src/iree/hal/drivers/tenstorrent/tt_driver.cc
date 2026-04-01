@@ -124,42 +124,27 @@ static iree_status_t iree_hal_tenstorrent_driver_query_available_devices(
 #else
   try {
     size_t device_count = tt::tt_metal::GetNumAvailableDevices();
-    
+
     if (device_count == 0) {
       *out_count = 0;
       *out_infos = nullptr;
       return iree_ok_status();
     }
-    
+
     *out_count = device_count;
     IREE_RETURN_IF_ERROR(iree_allocator_malloc(
         host_allocator, sizeof(iree_hal_device_info_t) * device_count,
         (void**)out_infos));
-    
+
     driver->device_names.resize(device_count);
-    
+
     for (size_t i = 0; i < device_count; i++) {
       (*out_infos)[i].device_id = i;
-      
-      // Create a temporary device to get info
-      // this is expensive but only done once
-      try {
-        auto* device = tt::tt_metal::CreateDevice(i);
-        auto grid = device->compute_with_storage_grid_size();
-        auto arch = device->arch();
-        const char* arch_name = (arch == tt::ARCH::BLACKHOLE) ? "Blackhole" :
-                                (arch == tt::ARCH::WORMHOLE_B0) ? "Wormhole" : "Unknown";
-        
-        char name_buf[128];
-        std::snprintf(name_buf, sizeof(name_buf), "Tenstorrent %s (%ux%u cores)",
-                     arch_name, grid.x, grid.y);
-        driver->device_names[i] = name_buf;
-        
-        tt::tt_metal::CloseDevice(device);
-      } catch (...) {
-        driver->device_names[i] = "Tenstorrent Device";
-      }
-      
+      // Do NOT open/close a device here — repeated CreateDevice/CloseDevice
+      // before MeshDevice::create_unit_mesh corrupts TT-Metal's internal state.
+      char name_buf[64];
+      std::snprintf(name_buf, sizeof(name_buf), "tenstorrent:%zu", i);
+      driver->device_names[i] = name_buf;
       (*out_infos)[i].name = iree_make_cstring_view(driver->device_names[i].c_str());
     }
   } catch (const std::exception& e) {
@@ -177,37 +162,10 @@ static iree_status_t iree_hal_tenstorrent_driver_dump_device_info(
     iree_hal_driver_t* base,
     iree_hal_device_id_t device_id,
     iree_string_builder_t* builder) {
+  // Do NOT open a device here — use info printed during device creation instead.
   iree_string_builder_append_cstring(builder, "Tenstorrent Device\n");
-  
-#ifndef TT_IREE_ENABLE_MOCK
-  try {
-    auto* device = tt::tt_metal::CreateDevice(device_id);
-    auto grid = device->compute_with_storage_grid_size();
-    auto arch = device->arch();
-    const char* arch_name = (arch == tt::ARCH::BLACKHOLE) ? "Blackhole" :
-                            (arch == tt::ARCH::WORMHOLE_B0) ? "Wormhole" : "Unknown";
-    
-    uint64_t dram_size = device->num_dram_channels() * device->dram_size_per_channel();
-    
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "  Architecture: %s\n", arch_name);
-    iree_string_builder_append_cstring(builder, buf);
-    std::snprintf(buf, sizeof(buf), "  Cores: %ux%u (%u total)\n",
-                 grid.x, grid.y, grid.x * grid.y);
-    iree_string_builder_append_cstring(builder, buf);
-    std::snprintf(buf, sizeof(buf), "  DRAM: %lu MB\n",
-                 (unsigned long)(dram_size / (1024*1024)));
-    iree_string_builder_append_cstring(builder, buf);
-    
-    tt::tt_metal::CloseDevice(device);
-  } catch (const std::exception& e) {
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "  Error: %s\n", e.what());
-    iree_string_builder_append_cstring(builder, buf);
-  }
-#else
+#ifdef TT_IREE_ENABLE_MOCK
   iree_string_builder_append_cstring(builder, "  Architecture: Blackhole (Mock)\n");
-  iree_string_builder_append_cstring(builder, "  Cores: 11x10 (110 total)\n");
 #endif
   
   return iree_ok_status();

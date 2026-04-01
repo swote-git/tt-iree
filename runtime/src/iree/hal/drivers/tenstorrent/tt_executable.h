@@ -93,6 +93,12 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params(
     int32_t entry_point,
     const iree_hal_tt_kernel_params_t** out_params);
 
+// Mutable variant — used by dispatch to restore moved programs after execute.
+iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
+    iree_hal_executable_t* executable,
+    int32_t entry_point,
+    iree_hal_tt_kernel_params_t** out_params);
+
 #ifdef __cplusplus
 }
 #endif

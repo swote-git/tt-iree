@@ -202,7 +202,7 @@ static iree_status_t iree_hal_tt_executable_export_parameters(
     iree_hal_executable_t* base_executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     iree_host_size_t capacity,
-    iree_hal_executable_parameter_t* out_parameters) {
+    iree_hal_executable_export_parameter_t* out_parameters) {
   iree_hal_tt_executable_t* executable =
       iree_hal_tt_executable_cast(base_executable);
   if (export_ordinal >= executable->entry_point_count) {
@@ -495,6 +495,24 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params(
     iree_hal_executable_t* base_executable,
     int32_t entry_point,
     const iree_hal_tt_kernel_params_t** out_params) {
+  iree_hal_tt_executable_t* executable =
+      iree_hal_tt_executable_cast(base_executable);
+
+  if (entry_point < 0 ||
+      (iree_host_size_t)entry_point >= executable->entry_point_count) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "invalid entry point ordinal %d (count=%zu)",
+                            entry_point, executable->entry_point_count);
+  }
+
+  *out_params = &executable->entry_points[entry_point].kernel_params;
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
+    iree_hal_executable_t* base_executable,
+    int32_t entry_point,
+    iree_hal_tt_kernel_params_t** out_params) {
   iree_hal_tt_executable_t* executable =
       iree_hal_tt_executable_cast(base_executable);
 

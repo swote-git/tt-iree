@@ -13,7 +13,8 @@ extern "C" {
 // --- Command Types ---
 typedef enum iree_hal_tt_command_type_t {
   IREE_HAL_TT_COMMAND_TYPE_DISPATCH,
-  IREE_HAL_TT_COMMAND_TYPE_BARRIER, // Placeholder for barriers
+  IREE_HAL_TT_COMMAND_TYPE_COPY,
+  IREE_HAL_TT_COMMAND_TYPE_BARRIER,
 } iree_hal_tt_command_type_t;
 
 // --- Constants ---
@@ -33,11 +34,18 @@ typedef struct iree_hal_tt_dispatch_command_t {
   iree_hal_dispatch_flags_t flags;
 } iree_hal_tt_dispatch_command_t;
 
+// --- Copy Command ---
+typedef struct iree_hal_tt_copy_command_t {
+  iree_hal_buffer_ref_t source_ref;
+  iree_hal_buffer_ref_t target_ref;
+} iree_hal_tt_copy_command_t;
+
 // --- Generic Command Wrapper ---
 typedef struct iree_hal_tt_command_t {
   iree_hal_tt_command_type_t type;
   union {
     iree_hal_tt_dispatch_command_t dispatch;
+    iree_hal_tt_copy_command_t copy;
   };
 } iree_hal_tt_command_t;
 
