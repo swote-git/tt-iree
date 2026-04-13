@@ -34,6 +34,9 @@ enum BuiltinProgram : uint32 {
 
   // Reserved for single-tile bf16 elementwise add via TTNN API
   TTNN_ELTWISE_ADD = 1,
+
+  // Narrow M1 path: one static 32x32x32 bf16 matmul on a single core.
+  BF16_MATMUL_32X32X32 = 2,
 }
 
 // ---------------------------------------------------------------------------

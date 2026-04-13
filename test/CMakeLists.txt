@@ -6,3 +6,4 @@
 #-------------------------------------------------------------------------------
 
 add_subdirectory(drivers/tenstorrent)
+add_subdirectory(e2e)

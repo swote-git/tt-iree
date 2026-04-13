@@ -90,6 +90,7 @@ tt_iree_hal_test(
 tt_iree_hal_test(
   NAME dispatch_test
   SRCS dispatch_test.cc
+  DEPS tt_executable_builder_util
 )
 
 # dispatch_test needs direct TT-Metal access for bfloat16 data transfer.

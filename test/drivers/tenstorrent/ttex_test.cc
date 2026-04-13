@@ -33,7 +33,7 @@ TEST(TtexSchemaTest, BuildVerifySingleEntry) {
   ep.workgroup_size[0] = 1;
   ep.workgroup_size[1] = 1;
   ep.workgroup_size[2] = 1;
-  ep.builtin_program = 0;  // CUSTOM_SFPI_ADD
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
 
   iree_byte_span_t data = {0};
   IREE_ASSERT_OK(tt_iree_build_ttex_executable_def(alloc, 1, &ep, &data));
@@ -67,14 +67,14 @@ TEST(TtexSchemaTest, BuildVerifyMultiEntry) {
   tt_iree_ttex_entry_point_desc_t eps[2] = {};
   eps[0].name = "dispatch_0_add";
   eps[0].binding_count = 3;
-  eps[0].builtin_program = 0;
+  eps[0].builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
   eps[0].workgroup_size[0] = 1;
   eps[0].workgroup_size[1] = 1;
   eps[0].workgroup_size[2] = 1;
 
-  eps[1].name = "dispatch_1_ttnn_add";
+  eps[1].name = "dispatch_1_matmul";
   eps[1].binding_count = 3;
-  eps[1].builtin_program = 1;  // TTNN_ELTWISE_ADD
+  eps[1].builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32;
   eps[1].workgroup_size[0] = 4;
   eps[1].workgroup_size[1] = 2;
   eps[1].workgroup_size[2] = 1;
@@ -90,8 +90,9 @@ TEST(TtexSchemaTest, BuildVerifyMultiEntry) {
   ASSERT_EQ(ttex_ns(EntryPointDef_vec_len(parsed_eps)), 2u);
 
   ttex_ns(EntryPointDef_table_t) ep1 = ttex_ns(EntryPointDef_vec_at(parsed_eps, 1));
-  ASSERT_STREQ(ttex_ns(EntryPointDef_name(ep1)), "dispatch_1_ttnn_add");
-  ASSERT_EQ(ttex_ns(EntryPointDef_builtin(ep1)), 1u);
+  ASSERT_STREQ(ttex_ns(EntryPointDef_name(ep1)), "dispatch_1_matmul");
+  ASSERT_EQ(ttex_ns(EntryPointDef_builtin(ep1)),
+            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32);
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_x(ep1)), 4u);
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_y(ep1)), 2u);
 

@@ -11,6 +11,7 @@
 #include "iree/base/api.h"
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable_cache.h"
+#include "iree/schema/tt_executable_builder_util.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
@@ -63,91 +64,167 @@ static iree_hal_tt_executable_t* iree_hal_tt_executable_cast(
 //===----------------------------------------------------------------------===//
 
 #ifndef TT_IREE_ENABLE_MOCK
+static iree_status_t iree_hal_tt_create_program_for_custom_sfpi_add(
+    iree_hal_tt_kernel_params_t* params) {
+  params->program = new tt::tt_metal::Program();
+  tt::tt_metal::Program& program =
+      *static_cast<tt::tt_metal::Program*>(params->program);
+
+  tt::tt_metal::CoreCoord core_coord = {0, 0};
+  tt::tt_metal::CoreRange core(core_coord);
+  params->core_range_x = 1;
+  params->core_range_y = 1;
+
+  // Circular Buffers (3 CBs for elementwise binary ops)
+  constexpr uint32_t tiles_per_cb = 2;
+  constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16
+
+  tt::CBIndex src0_cb_index = tt::CBIndex::c_0;
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tiles_per_cb * tile_size_bytes,
+          {{src0_cb_index, tt::DataFormat::Float16_b}})
+          .set_page_size(src0_cb_index, tile_size_bytes));
+
+  tt::CBIndex src1_cb_index = tt::CBIndex::c_1;
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tiles_per_cb * tile_size_bytes,
+          {{src1_cb_index, tt::DataFormat::Float16_b}})
+          .set_page_size(src1_cb_index, tile_size_bytes));
+
+  tt::CBIndex dst_cb_index = tt::CBIndex::c_16;
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tiles_per_cb * tile_size_bytes,
+          {{dst_cb_index, tt::DataFormat::Float16_b}})
+          .set_page_size(dst_cb_index, tile_size_bytes));
+
+  std::vector<uint32_t> reader_compile_args;
+  tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
+      reader_compile_args);
+  tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
+      reader_compile_args);
+
+  std::vector<uint32_t> writer_compile_args;
+  tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
+      writer_compile_args);
+
+  params->reader_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
+      "read_tiles.cpp",
+      core,
+      tt::tt_metal::DataMovementConfig{
+          .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+          .noc = tt::tt_metal::NOC::RISCV_0_default,
+          .compile_args = reader_compile_args});
+
+  params->writer_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
+      "write_tile.cpp",
+      core,
+      tt::tt_metal::DataMovementConfig{
+          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+          .noc = tt::tt_metal::NOC::RISCV_1_default,
+          .compile_args = writer_compile_args});
+
+  params->compute_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tt_metal/programming_examples/custom_sfpi_add/kernels/compute/"
+      "tiles_add.cpp",
+      core, tt::tt_metal::ComputeConfig{});
+
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_create_program_for_bf16_matmul_32x32x32(
+    iree_hal_tt_kernel_params_t* params) {
+  params->program = new tt::tt_metal::Program();
+  tt::tt_metal::Program& program =
+      *static_cast<tt::tt_metal::Program*>(params->program);
+
+  tt::tt_metal::CoreCoord core_coord = {0, 0};
+  tt::tt_metal::CoreRange core(core_coord);
+  params->core_range_x = 1;
+  params->core_range_y = 1;
+
+  constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16
+
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tile_size_bytes, {{tt::CBIndex::c_0, tt::DataFormat::Float16_b}})
+          .set_page_size(tt::CBIndex::c_0, tile_size_bytes));
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tile_size_bytes, {{tt::CBIndex::c_1, tt::DataFormat::Float16_b}})
+          .set_page_size(tt::CBIndex::c_1, tile_size_bytes));
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tile_size_bytes, {{tt::CBIndex::c_16, tt::DataFormat::Float16_b}})
+          .set_page_size(tt::CBIndex::c_16, tile_size_bytes));
+
+  params->reader_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_blocked.cpp",
+      core,
+      tt::tt_metal::DataMovementConfig{
+          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+          .noc = tt::tt_metal::NOC::RISCV_1_default});
+
+  params->writer_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tt_metal/kernels/dataflow/writer_unary.cpp",
+      core,
+      tt::tt_metal::DataMovementConfig{
+          .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+          .noc = tt::tt_metal::NOC::RISCV_0_default});
+
+  std::vector<uint32_t> compute_kernel_args = {
+      1,  // block_tile_dim
+      1,  // dst_tile_rows
+      1,  // dst_tile_cols
+      1,  // block_cnt
+      1,  // in0_block_tile_cnt
+      1,  // in1_block_tile_cnt
+      1,  // out_block_tile_cnt
+  };
+  params->compute_kernel_id = tt::tt_metal::CreateKernel(
+      program,
+      "tests/tt_metal/tt_metal/test_kernels/compute/matmul.cpp",
+      core, tt::tt_metal::ComputeConfig{.compile_args = compute_kernel_args});
+
+  return iree_ok_status();
+}
+
 static iree_status_t iree_hal_tt_create_program_for_builtin(
     iree_hal_device_t* device,
     uint32_t builtin_program,
     iree_hal_tt_kernel_params_t* params) {
   try {
-    params->program = new tt::tt_metal::Program();
-    tt::tt_metal::Program& program =
-        *static_cast<tt::tt_metal::Program*>(params->program);
-
-    tt::tt_metal::CoreCoord core_coord = {0, 0};
-    tt::tt_metal::CoreRange core(core_coord);
-    params->core_range_x = 1;
-    params->core_range_y = 1;
-
-    // Circular Buffers (3 CBs for elementwise binary ops)
-    constexpr uint32_t tiles_per_cb = 2;
-    constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16
-
-    tt::CBIndex src0_cb_index = tt::CBIndex::c_0;
-    tt::tt_metal::CreateCircularBuffer(
-        program, core,
-        tt::tt_metal::CircularBufferConfig(
-            tiles_per_cb * tile_size_bytes,
-            {{src0_cb_index, tt::DataFormat::Float16_b}})
-            .set_page_size(src0_cb_index, tile_size_bytes));
-
-    tt::CBIndex src1_cb_index = tt::CBIndex::c_1;
-    tt::tt_metal::CreateCircularBuffer(
-        program, core,
-        tt::tt_metal::CircularBufferConfig(
-            tiles_per_cb * tile_size_bytes,
-            {{src1_cb_index, tt::DataFormat::Float16_b}})
-            .set_page_size(src1_cb_index, tile_size_bytes));
-
-    tt::CBIndex dst_cb_index = tt::CBIndex::c_16;
-    tt::tt_metal::CreateCircularBuffer(
-        program, core,
-        tt::tt_metal::CircularBufferConfig(
-            tiles_per_cb * tile_size_bytes,
-            {{dst_cb_index, tt::DataFormat::Float16_b}})
-            .set_page_size(dst_cb_index, tile_size_bytes));
-
-    // Compile-time args
-    std::vector<uint32_t> reader_compile_args;
-    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
-        reader_compile_args);
-    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
-        reader_compile_args);
-
-    std::vector<uint32_t> writer_compile_args;
-    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
-        writer_compile_args);
-
-    // Kernels
-    params->reader_kernel_id = tt::tt_metal::CreateKernel(
-        program,
-        "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
-        "read_tiles.cpp",
-        core,
-        tt::tt_metal::DataMovementConfig{
-            .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-            .noc = tt::tt_metal::NOC::RISCV_0_default,
-            .compile_args = reader_compile_args});
-
-    params->writer_kernel_id = tt::tt_metal::CreateKernel(
-        program,
-        "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
-        "write_tile.cpp",
-        core,
-        tt::tt_metal::DataMovementConfig{
-            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-            .noc = tt::tt_metal::NOC::RISCV_1_default,
-            .compile_args = writer_compile_args});
-
-    params->compute_kernel_id = tt::tt_metal::CreateKernel(
-        program,
-        "tt_metal/programming_examples/custom_sfpi_add/kernels/compute/"
-        "tiles_add.cpp",
-        core, tt::tt_metal::ComputeConfig{});
-
+    (void)device;
+    params->builtin_program = builtin_program;
+    switch (builtin_program) {
+      case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
+        return iree_hal_tt_create_program_for_custom_sfpi_add(params);
+      case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
+        return iree_hal_tt_create_program_for_bf16_matmul_32x32x32(params);
+      default:
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "unsupported TTEX builtin program %u",
+                                builtin_program);
+    }
   } catch (const std::exception& e) {
     return iree_make_status(IREE_STATUS_INTERNAL,
                             "Failed to create TT-Metal program: %s", e.what());
   }
-  return iree_ok_status();
 }
 #endif
 
@@ -326,7 +403,7 @@ static iree_status_t iree_hal_tt_executable_create_legacy(
   ep->workgroup_size[0] = 1;
   ep->workgroup_size[1] = 1;
   ep->workgroup_size[2] = 1;
-  ep->builtin_program = 0;  // CUSTOM_SFPI_ADD
+  ep->builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
 
 #ifndef TT_IREE_ENABLE_MOCK
   iree_status_t status = iree_hal_tt_create_program_for_builtin(

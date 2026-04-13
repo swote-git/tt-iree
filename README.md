@@ -29,7 +29,7 @@ WIP & Planned:
 - Compiler backend registration
 - HAL driver implementation
 - Mock mode execution
-- Basic operation support (elementwise add)
+- Basic operation support (elementwise add, single-tile matmul smoke)
 - TTNN integration
 - Hardware execution
 

@@ -4,8 +4,12 @@
 #include "TenstorrentTarget.h"
 
 #include "iree/compiler/Codegen/Common/Passes.h"
+#include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Builders.h"
 
 // TTEX builder — shared between compiler and runtime tests.
@@ -17,6 +21,83 @@ namespace mlir::iree_compiler::IREE::HAL {
 
 // Must match IREE_HAL_TT_EXECUTABLE_FORMAT in tt_executable_cache.h.
 static constexpr const char *kExecutableFormat = "tenstorrent-ttex-fb";
+
+namespace {
+
+static bool isStaticBf16TensorOfShape(Type type, ArrayRef<int64_t> shape) {
+  auto rankedType = dyn_cast<RankedTensorType>(type);
+  if (!rankedType || !rankedType.hasStaticShape() ||
+      rankedType.getElementType().isBF16() == false) {
+    return false;
+  }
+  return rankedType.getShape() == shape;
+}
+
+static FailureOr<uint32_t> inferBuiltinProgram(func::FuncOp funcOp) {
+  linalg::MatmulOp matchedMatmulOp;
+  int matmulCount = 0;
+  funcOp.walk([&](linalg::MatmulOp matmulOp) {
+    matchedMatmulOp = matmulOp;
+    ++matmulCount;
+  });
+
+  if (matmulCount > 0) {
+    if (matmulCount != 1) {
+      return failure();
+    }
+
+    auto inputs = matchedMatmulOp.getInputs();
+    auto outputs = matchedMatmulOp.getOutputs();
+    if (inputs.size() != 2 || outputs.size() != 1) {
+      return failure();
+    }
+
+    if (!isStaticBf16TensorOfShape(inputs[0].getType(), {32, 32}) ||
+        !isStaticBf16TensorOfShape(inputs[1].getType(), {32, 32}) ||
+        !isStaticBf16TensorOfShape(outputs[0].getType(), {32, 32})) {
+      return failure();
+    }
+
+    return static_cast<uint32_t>(
+        TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32);
+  }
+
+  int addCount = 0;
+  funcOp.walk([&](arith::AddFOp) { ++addCount; });
+  if (addCount == 1) {
+    return static_cast<uint32_t>(
+        TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD);
+  }
+
+  return failure();
+}
+
+static uint16_t inferBindingCount(IREE::HAL::ExecutableExportOp exportOp) {
+  return static_cast<uint16_t>(exportOp.getLayout().getBindings().size());
+}
+
+static uint16_t inferConstantCount(IREE::HAL::ExecutableExportOp exportOp) {
+  return static_cast<uint16_t>(exportOp.getLayout().getConstants());
+}
+
+static void inferWorkgroupSize(IREE::HAL::ExecutableExportOp exportOp,
+                               tt_iree_ttex_entry_point_desc_t &desc) {
+  desc.workgroup_size[0] = 1;
+  desc.workgroup_size[1] = 1;
+  desc.workgroup_size[2] = 1;
+
+  if (auto workgroupSizeAttr = exportOp.getWorkgroupSize()) {
+    auto workgroupSizeValues = workgroupSizeAttr->getValue();
+    desc.workgroup_size[0] =
+        static_cast<uint32_t>(cast<IntegerAttr>(workgroupSizeValues[0]).getInt());
+    desc.workgroup_size[1] =
+        static_cast<uint32_t>(cast<IntegerAttr>(workgroupSizeValues[1]).getInt());
+    desc.workgroup_size[2] =
+        static_cast<uint32_t>(cast<IntegerAttr>(workgroupSizeValues[2]).getInt());
+  }
+}
+
+}  // namespace
 
 //===----------------------------------------------------------------------===//
 // TenstorrentTargetDevice
@@ -98,6 +179,7 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
     IREE::HAL::ExecutableVariantOp variantOp,
     OpBuilder &executableBuilder) {
   auto loc = variantOp.getLoc();
+  ModuleOp innerModuleOp = variantOp.getInnerModule();
 
   // ----------------------------------------------------------------
   // 1. Collect export ops (entry points).
@@ -121,21 +203,24 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
     tt_iree_ttex_entry_point_desc_t desc = {};
     desc.name = nameStorage.back().c_str();
 
-    // PoC: hardcoded for elementwise binary add.
-    //   3 bindings: input0, input1, output
-    //   builtin_program 0 = CUSTOM_SFPI_ADD
-    //
-    // Future: analyze inner func's linalg ops to determine:
-    //   - binding_count from function signature
-    //   - builtin_program from op pattern matching
-    //   - workgroup_size from tiling decisions
-    desc.constant_count = 0;
-    desc.binding_count = 3;
+    auto funcOp = innerModuleOp.lookupSymbol<func::FuncOp>(exportOp.getName());
+    if (!funcOp) {
+      return exportOp.emitError("missing inner function for executable export");
+    }
+
+    FailureOr<uint32_t> builtinProgram = inferBuiltinProgram(funcOp);
+    if (failed(builtinProgram)) {
+      return exportOp.emitError(
+          "unsupported Tenstorrent dispatch; supported builtins are a single "
+          "arith.addf path and a single static linalg.matmul on "
+          "tensor<32x32xbf16>");
+    }
+
+    desc.constant_count = inferConstantCount(exportOp);
+    desc.binding_count = inferBindingCount(exportOp);
     desc.flags = 0;
-    desc.workgroup_size[0] = 1;
-    desc.workgroup_size[1] = 1;
-    desc.workgroup_size[2] = 1;
-    desc.builtin_program = 0;  // CUSTOM_SFPI_ADD
+    inferWorkgroupSize(exportOp, desc);
+    desc.builtin_program = *builtinProgram;
 
     entryDescs.push_back(desc);
   }

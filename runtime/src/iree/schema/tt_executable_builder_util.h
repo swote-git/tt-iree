@@ -16,6 +16,14 @@
 extern "C" {
 #endif
 
+// BuiltinProgram enum values shared by the compiler, runtime, and tests.
+// Must stay in sync with BuiltinProgram in tt_executable_def.fbs.
+typedef enum tt_iree_ttex_builtin_program_e {
+  TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD = 0,
+  TT_IREE_TTEX_BUILTIN_PROGRAM_TTNN_ELTWISE_ADD = 1,
+  TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32 = 2,
+} tt_iree_ttex_builtin_program_e;
+
 // Describes a single entry point to be serialized into a TTEX blob.
 // Field semantics match EntryPointDef in tt_executable_def.fbs.
 typedef struct tt_iree_ttex_entry_point_desc_t {

@@ -12,6 +12,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
 #include "iree/hal/drivers/tenstorrent/tt_semaphore.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable_cache.h"
+#include "iree/schema/tt_executable_builder_util.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
@@ -36,6 +37,71 @@ struct iree_hal_tt_device_t {
   tt::tt_metal::distributed::MeshCommandQueue* mesh_cq;
 #endif
 };
+
+#ifndef TT_IREE_ENABLE_MOCK
+static iree_status_t iree_hal_tt_set_add_runtime_args(
+    tt::tt_metal::Program& program, const iree_hal_tt_kernel_params_t* params,
+    const tt::tt_metal::CoreCoord& core, uint32_t in0_addr, uint32_t in1_addr,
+    uint32_t out_addr, uint32_t input_byte_length) {
+  constexpr uint32_t bf16_tile_bytes = 32 * 32 * 2;
+  uint32_t n_tiles = input_byte_length / bf16_tile_bytes;
+  if (n_tiles == 0) n_tiles = 1;
+
+  std::vector<uint32_t> reader_args = {in0_addr, in1_addr, n_tiles};
+  tt::tt_metal::SetRuntimeArgs(program, params->reader_kernel_id, core,
+                               reader_args);
+
+  std::vector<uint32_t> writer_args = {out_addr, n_tiles};
+  tt::tt_metal::SetRuntimeArgs(program, params->writer_kernel_id, core,
+                               writer_args);
+
+  std::vector<uint32_t> compute_args = {n_tiles};
+  tt::tt_metal::SetRuntimeArgs(program, params->compute_kernel_id, core,
+                               compute_args);
+
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_set_matmul_runtime_args(
+    tt::tt_metal::Program& program, const iree_hal_tt_kernel_params_t* params,
+    const tt::tt_metal::CoreCoord& core, uint32_t lhs_addr, uint32_t rhs_addr,
+    uint32_t out_addr, uint32_t lhs_byte_length, uint32_t rhs_byte_length,
+    uint32_t out_byte_length) {
+  constexpr uint32_t kTileBytes = 32 * 32 * 2;
+  if (lhs_byte_length != kTileBytes || rhs_byte_length != kTileBytes ||
+      out_byte_length != kTileBytes) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "builtin matmul expects exactly one 32x32 bf16 tile per binding "
+        "(lhs=%u rhs=%u out=%u bytes)",
+        lhs_byte_length, rhs_byte_length, out_byte_length);
+  }
+
+  std::vector<uint32_t> reader_args = {
+      lhs_addr,
+      0,  // src0_bank_id
+      rhs_addr,
+      0,  // src1_bank_id
+      1,  // num_blocks
+      1,  // in0_block_tile_cnt
+      1,  // in1_block_tile_cnt
+      kTileBytes,
+      kTileBytes,
+  };
+  tt::tt_metal::SetRuntimeArgs(program, params->reader_kernel_id, core,
+                               reader_args);
+
+  std::vector<uint32_t> writer_args = {
+      out_addr,
+      0,  // dst_bank_id
+      1,  // num_tiles
+  };
+  tt::tt_metal::SetRuntimeArgs(program, params->writer_kernel_id, core,
+                               writer_args);
+
+  return iree_ok_status();
+}
+#endif
 
 // Forward declarations of vtable functions
 static void iree_hal_tt_device_destroy(iree_hal_device_t* base);
@@ -574,41 +640,51 @@ static iree_status_t iree_hal_tt_device_queue_execute(
       // Extract buffer addresses from bindings.
       // Expected layout: bindings = [input0, input1, output]
       uint32_t in0_addr = 0, in1_addr = 0, out_addr = 0;
-      uint32_t buffer_size = 0;
+      uint32_t in0_byte_length = 0, in1_byte_length = 0, out_byte_length = 0;
 
       if (cmd.binding_count > 0) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[0]);
         if (buf) {
           in0_addr = iree_hal_tt_buffer_device_address(buf);
-          buffer_size = (uint32_t)iree_hal_buffer_byte_length(buf);
+          in0_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
         }
       }
       if (cmd.binding_count > 1) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[1]);
-        if (buf) in1_addr = iree_hal_tt_buffer_device_address(buf);
+        if (buf) {
+          in1_addr = iree_hal_tt_buffer_device_address(buf);
+          in1_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
+        }
       }
       if (cmd.binding_count > 2) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[2]);
-        if (buf) out_addr = iree_hal_tt_buffer_device_address(buf);
+        if (buf) {
+          out_addr = iree_hal_tt_buffer_device_address(buf);
+          out_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
+        }
       }
 
-      // Calculate number of bfloat16 tiles (32x32x2 bytes each).
-      constexpr uint32_t bf16_tile_bytes = 32 * 32 * 2;
-      uint32_t n_tiles = buffer_size / bf16_tile_bytes;
-      if (n_tiles == 0) n_tiles = 1;
-
-      // Set runtime args for reader kernel (in0_addr, in1_addr, n_tiles)
       try {
-        std::vector<uint32_t> reader_args = {in0_addr, in1_addr, n_tiles};
-        tt::tt_metal::SetRuntimeArgs(*program, params->reader_kernel_id, core, reader_args);
-
-        // Set runtime args for writer kernel (out_addr, n_tiles)
-        std::vector<uint32_t> writer_args = {out_addr, n_tiles};
-        tt::tt_metal::SetRuntimeArgs(*program, params->writer_kernel_id, core, writer_args);
-
-        // Set runtime args for compute kernel (n_tiles)
-        std::vector<uint32_t> compute_args = {n_tiles};
-        tt::tt_metal::SetRuntimeArgs(*program, params->compute_kernel_id, core, compute_args);
+        iree_status_t status = iree_ok_status();
+        switch (params->builtin_program) {
+          case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
+            status = iree_hal_tt_set_add_runtime_args(
+                *program, params, core, in0_addr, in1_addr, out_addr,
+                in0_byte_length);
+            break;
+          case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
+            status = iree_hal_tt_set_matmul_runtime_args(
+                *program, params, core, in0_addr, in1_addr, out_addr,
+                in0_byte_length, in1_byte_length, out_byte_length);
+            break;
+          default:
+            status = iree_make_status(
+                IREE_STATUS_INVALID_ARGUMENT,
+                "unsupported builtin program %u for dispatch",
+                params->builtin_program);
+            break;
+        }
+        IREE_RETURN_IF_ERROR(status);
       } catch (const std::exception& e) {
         return iree_make_status(IREE_STATUS_INTERNAL,
                                "Failed to set runtime args: %s", e.what());

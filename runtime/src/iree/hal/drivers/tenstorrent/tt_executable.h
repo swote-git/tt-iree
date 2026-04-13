@@ -36,6 +36,7 @@ extern "C" {
 
 typedef struct iree_hal_tt_kernel_params_t {
   tt_metal_program_ptr_t program;
+  uint32_t builtin_program;
 
   // Kernel handles (set during program creation)
   tt_metal_kernel_id_t reader_kernel_id;
