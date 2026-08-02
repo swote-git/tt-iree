@@ -3,6 +3,7 @@
 //
 // End-to-end dispatch test: bfloat16 tile addition on P100A hardware.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_command_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
+#include "iree/hal/drivers/tenstorrent/tt_executable_cache.h"
 #include "iree/schema/tt_executable_builder_util.h"
 #include "utils.h"
 
@@ -51,7 +53,7 @@ static iree_status_t CreateBuiltinTtexExecutable(
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);
   exec_params.executable_format =
-      iree_make_cstring_view("tenstorrent-ttex-fb");
+      iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
   exec_params.executable_data =
       iree_make_const_byte_span(data.data, data.data_length);
 
@@ -61,11 +63,252 @@ static iree_status_t CreateBuiltinTtexExecutable(
   return status;
 }
 
+TEST_F(DispatchTest, RejectsEmptyTtexData) {
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+}
+
+TEST_F(DispatchTest, RejectsMalformedTtexData) {
+  const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
+  exec_params.executable_data =
+      iree_make_const_byte_span(garbage, sizeof(garbage));
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+}
+
+TEST_F(DispatchTest, RejectsUnsupportedTtexVersion) {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.name = "future_version";
+  ep.binding_count = 3;
+  ep.workgroup_size[0] = 1;
+  ep.workgroup_size[1] = 1;
+  ep.workgroup_size[2] = 1;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
+
+  iree_byte_span_t data = {0};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      host_allocator(), TT_IREE_TTEX_CURRENT_VERSION + 1, 1, &ep, &data));
+
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
+  exec_params.executable_data =
+      iree_make_const_byte_span(data.data, data.data_length);
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_UNIMPLEMENTED);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+  iree_allocator_free(host_allocator(), data.data);
+}
+
+TEST_F(DispatchTest, RejectsUnsupportedTtexBuiltin) {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.name = "reserved_builtin";
+  ep.binding_count = 3;
+  ep.workgroup_size[0] = 1;
+  ep.workgroup_size[1] = 1;
+  ep.workgroup_size[2] = 1;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_TTNN_ELTWISE_ADD;
+
+  iree_byte_span_t data = {0};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def(
+      host_allocator(), 1, &ep, &data));
+
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
+  exec_params.executable_data =
+      iree_make_const_byte_span(data.data, data.data_length);
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+  iree_allocator_free(host_allocator(), data.data);
+}
+
+TEST_F(DispatchTest, RejectsUnknownExecutableFormat) {
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+  exec_params.executable_format = iree_make_cstring_view("unknown-format");
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+}
+
+TEST_F(DispatchTest, RejectsEmptyExecutableFormat) {
+  iree_hal_executable_params_t exec_params;
+  iree_hal_executable_params_initialize(&exec_params);
+
+  iree_hal_executable_t* executable = nullptr;
+  iree_status_t status = iree_hal_tt_executable_create(
+      device_, &exec_params, host_allocator(), &executable);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(executable, nullptr);
+}
+
+TEST_F(DispatchTest, RejectsDispatchBindingCountMismatch) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  IREE_ASSERT_OK(CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/0, /*builtin_m_tiles=*/1, /*builtin_n_tiles=*/1,
+      /*builtin_k_tiles=*/1, &executable_ptr));
+  executable.assign(executable_ptr);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+
+  constexpr iree_device_size_t kTileSizeBytes = 32 * 32 * 2;
+  iree_hal_buffer_ref_t bindings[2] = {
+      iree_hal_make_indirect_buffer_ref(0, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(1, 0, kTileSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  iree_status_t status = iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {2, bindings},
+      IREE_HAL_DISPATCH_FLAG_NONE);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+}
+
+TEST_F(DispatchTest, RejectsDispatchConstantCountMismatch) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  IREE_ASSERT_OK(CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/8, /*builtin_m_tiles=*/0, /*builtin_n_tiles=*/0,
+      /*builtin_k_tiles=*/0, &executable_ptr));
+  executable.assign(executable_ptr);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+
+  constexpr iree_device_size_t kTileSizeBytes = 32 * 32 * 2;
+  iree_hal_buffer_ref_t bindings[3] = {
+      iree_hal_make_indirect_buffer_ref(0, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(1, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(2, 0, kTileSizeBytes),
+  };
+  std::array<uint32_t, 7> too_few_constants = {};
+  iree_const_byte_span_t constants = iree_make_const_byte_span(
+      reinterpret_cast<const uint8_t*>(too_few_constants.data()),
+      sizeof(too_few_constants));
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  iree_status_t status = iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      constants, {3, bindings}, IREE_HAL_DISPATCH_FLAG_NONE);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+}
+
+TEST_F(DispatchTest, RejectsUnsupportedDispatchWorkgroupCount) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  IREE_ASSERT_OK(CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/0, /*builtin_m_tiles=*/1, /*builtin_n_tiles=*/1,
+      /*builtin_k_tiles=*/1, &executable_ptr));
+  executable.assign(executable_ptr);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+
+  constexpr iree_device_size_t kTileSizeBytes = 32 * 32 * 2;
+  iree_hal_buffer_ref_t bindings[3] = {
+      iree_hal_make_indirect_buffer_ref(0, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(1, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(2, 0, kTileSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {2, 1, 1}};
+  iree_status_t status = iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {3, bindings},
+      IREE_HAL_DISPATCH_FLAG_NONE);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_UNIMPLEMENTED);
+  iree_status_ignore(status);
+}
+
+TEST_F(DispatchTest, RejectsUnsupportedDispatchFlags) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  IREE_ASSERT_OK(CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/0, /*builtin_m_tiles=*/1, /*builtin_n_tiles=*/1,
+      /*builtin_k_tiles=*/1, &executable_ptr));
+  executable.assign(executable_ptr);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+
+  constexpr iree_device_size_t kTileSizeBytes = 32 * 32 * 2;
+  iree_hal_buffer_ref_t bindings[3] = {
+      iree_hal_make_indirect_buffer_ref(0, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(1, 0, kTileSizeBytes),
+      iree_hal_make_indirect_buffer_ref(2, 0, kTileSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  iree_status_t status = iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {3, bindings},
+      IREE_HAL_DISPATCH_FLAG_CUSTOM_DIRECT_ARGUMENTS);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_UNIMPLEMENTED);
+  iree_status_ignore(status);
+}
+
 TEST_F(DispatchTest, ElementwiseAddBfloat16) {
   // 1. Create executable (compiles reader/compute/writer kernels).
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);
-  exec_params.executable_format = iree_make_cstring_view("TT-METAL");
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT);
   exec_params.executable_data = iree_make_const_byte_span(NULL, 0);
 
   iree::vm::ref<iree_hal_executable_t> executable;
@@ -182,7 +425,8 @@ TEST_F(DispatchTest, ReDispatchSameExecutable) {
   // Verifies that a program survives dispatch and can be re-used.
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);
-  exec_params.executable_format = iree_make_cstring_view("TT-METAL");
+  exec_params.executable_format =
+      iree_make_cstring_view(IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT);
   exec_params.executable_data = iree_make_const_byte_span(NULL, 0);
 
   iree::vm::ref<iree_hal_executable_t> executable;
@@ -468,6 +712,104 @@ TEST_F(DispatchTest, BuiltinTiledMatmulBfloat16ViaTTEX) {
   for (uint32_t i = 0; i < kElementCount; ++i) {
     ASSERT_NEAR(static_cast<float>(host_out[i]), kExpected, kEps)
         << "tiled matmul mismatch at " << i;
+  }
+#endif  // !TT_IREE_ENABLE_MOCK
+}
+
+TEST_F(DispatchTest, BuiltinTiledMatmulHonorsIndirectSubranges) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  iree_status_t exec_status = CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/0, /*builtin_m_tiles=*/1, /*builtin_n_tiles=*/1,
+      /*builtin_k_tiles=*/1, &executable_ptr);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "tiled matmul executable creation not available";
+  }
+  executable.assign(executable_ptr);
+
+#ifndef TT_IREE_ENABLE_MOCK
+  constexpr uint32_t kRows = 32;
+  constexpr uint32_t kElementCount = kRows * kRows;
+  constexpr uint32_t kMatrixSizeBytes =
+      kElementCount * sizeof(bfloat16);
+  constexpr uint32_t kStorageElementCount = kElementCount * 2;
+  constexpr uint32_t kStorageSizeBytes = kMatrixSizeBytes * 2;
+
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree::vm::ref<iree_hal_buffer_t> lhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> rhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> out_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kStorageSizeBytes, &lhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kStorageSizeBytes, &rhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kStorageSizeBytes, &out_buffer));
+
+  std::vector<bfloat16> lhs(kStorageElementCount, bfloat16(7.0f));
+  std::vector<bfloat16> rhs(kStorageElementCount, bfloat16(9.0f));
+  std::vector<bfloat16> out(kStorageElementCount, bfloat16(-3.0f));
+  std::fill(lhs.begin() + kElementCount, lhs.end(), bfloat16(1.0f));
+  std::fill(rhs.begin() + kElementCount, rhs.end(), bfloat16(2.0f));
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(lhs_buffer.get()), lhs);
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(rhs_buffer.get()), rhs);
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(out_buffer.get()), out);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+
+  iree_hal_buffer_ref_t refs[3] = {
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/0, kMatrixSizeBytes, kMatrixSizeBytes),
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/1, kMatrixSizeBytes, kMatrixSizeBytes),
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/2, kMatrixSizeBytes, kMatrixSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {3, refs}, IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_buffer_binding_t bindings[3] = {
+      {lhs_buffer.get(), /*offset=*/0, kStorageSizeBytes},
+      {rhs_buffer.get(), /*offset=*/0, kStorageSizeBytes},
+      {out_buffer.get(), /*offset=*/0, kStorageSizeBytes},
+  };
+  iree_hal_buffer_binding_table_t binding_table = {3, bindings};
+  iree_hal_semaphore_list_t no_sema = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_sema, no_sema, cmd_buffer.get(),
+      binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  std::vector<bfloat16> host_out(kStorageElementCount);
+  tt::tt_metal::detail::ReadFromBuffer(
+      *iree_hal_tt_buffer_handle(out_buffer.get()), host_out);
+
+  constexpr float kEps = 0.25f;
+  for (uint32_t i = 0; i < kElementCount; ++i) {
+    ASSERT_NEAR(static_cast<float>(host_out[i]), -3.0f, kEps)
+        << "prefix sentinel was modified at " << i;
+  }
+  for (uint32_t i = kElementCount; i < kStorageElementCount; ++i) {
+    ASSERT_NEAR(static_cast<float>(host_out[i]), 64.0f, kEps)
+        << "subrange matmul mismatch at " << i;
   }
 #endif  // !TT_IREE_ENABLE_MOCK
 }

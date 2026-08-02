@@ -3,9 +3,10 @@
 
 #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
 
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 
@@ -64,20 +65,28 @@ void iree_hal_tt_unpack_from_tiles(const float* src, float* dst,
 // iree_hal_tt_buffer_t
 //===----------------------------------------------------------------------===//
 
+#ifndef TT_IREE_ENABLE_MOCK
+struct iree_hal_tt_buffer_mapping_state_t {
+  iree_hal_tt_buffer_mapping_state_t* next;
+  iree_device_size_t byte_offset;
+  iree_device_size_t byte_length;
+  uint8_t* data;
+};
+#endif
+
 struct iree_hal_tt_buffer_t {
   iree_hal_buffer_t base;
   iree_allocator_t host_allocator;
   iree_hal_tt_device_t* device;
+  iree_device_size_t physical_allocation_size;
   
 #ifndef TT_IREE_ENABLE_MOCK
   std::shared_ptr<tt::tt_metal::Buffer> tt_buffer;
+  std::mutex mapping_mutex;
+  iree_hal_tt_buffer_mapping_state_t* active_mappings;
 #else
   void* host_ptr;
 #endif
-  
-  int32_t rows;
-  int32_t cols;
-  bool uses_tile_layout;
 };
 
 static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t*);
@@ -100,19 +109,128 @@ static iree_hal_tt_buffer_t* iree_hal_tt_buffer_cast(iree_hal_buffer_t* base) {
   return (iree_hal_tt_buffer_t*)base;
 }
 
+#ifndef TT_IREE_ENABLE_MOCK
+static iree_status_t iree_hal_tt_buffer_read_physical_allocation(
+    iree_hal_tt_buffer_t* buffer, uint8_t* target) {
+  if (!buffer->tt_buffer) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "TT-Metal buffer is not initialized");
+  }
+  try {
+    tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, target);
+    return iree_ok_status();
+  } catch (const std::exception& e) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "TT-Metal buffer read failed: %s", e.what());
+  } catch (...) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "TT-Metal buffer read failed");
+  }
+}
+
+static iree_status_t iree_hal_tt_buffer_write_physical_allocation(
+    iree_hal_tt_buffer_t* buffer, const uint8_t* source) {
+  if (!buffer->tt_buffer) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "TT-Metal buffer is not initialized");
+  }
+  try {
+    tt::stl::Span<const uint8_t> span(
+        source, static_cast<size_t>(buffer->physical_allocation_size));
+    tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
+    return iree_ok_status();
+  } catch (const std::exception& e) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "TT-Metal buffer write failed: %s", e.what());
+  } catch (...) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "TT-Metal buffer write failed");
+  }
+}
+
+static iree_status_t iree_hal_tt_buffer_read_range(
+    iree_hal_tt_buffer_t* buffer, iree_device_size_t byte_offset,
+    iree_device_size_t byte_length, uint8_t* target) {
+  void* physical_data = nullptr;
+  iree_status_t status = iree_allocator_malloc(
+      buffer->host_allocator,
+      static_cast<iree_host_size_t>(buffer->physical_allocation_size),
+      &physical_data);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_tt_buffer_read_physical_allocation(
+        buffer, static_cast<uint8_t*>(physical_data));
+  }
+  if (iree_status_is_ok(status)) {
+    std::memcpy(target, static_cast<uint8_t*>(physical_data) + byte_offset,
+                static_cast<size_t>(byte_length));
+  }
+  if (physical_data) {
+    iree_allocator_free(buffer->host_allocator, physical_data);
+  }
+  return status;
+}
+
+static iree_status_t iree_hal_tt_buffer_write_range(
+    iree_hal_tt_buffer_t* buffer, iree_device_size_t byte_offset,
+    iree_device_size_t byte_length, const uint8_t* source) {
+  void* physical_data = nullptr;
+  iree_status_t status = iree_allocator_malloc(
+      buffer->host_allocator,
+      static_cast<iree_host_size_t>(buffer->physical_allocation_size),
+      &physical_data);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_tt_buffer_read_physical_allocation(
+        buffer, static_cast<uint8_t*>(physical_data));
+  }
+  if (iree_status_is_ok(status)) {
+    std::memcpy(static_cast<uint8_t*>(physical_data) + byte_offset, source,
+                static_cast<size_t>(byte_length));
+    status = iree_hal_tt_buffer_write_physical_allocation(
+        buffer, static_cast<const uint8_t*>(physical_data));
+  }
+  if (physical_data) {
+    iree_allocator_free(buffer->host_allocator, physical_data);
+  }
+  return status;
+}
+
+static iree_hal_tt_buffer_mapping_state_t*
+iree_hal_tt_buffer_find_mapping(iree_hal_tt_buffer_t* buffer,
+                                iree_device_size_t byte_offset,
+                                iree_device_size_t byte_length) {
+  for (iree_hal_tt_buffer_mapping_state_t* state = buffer->active_mappings;
+       state; state = state->next) {
+    if (byte_offset < state->byte_offset) continue;
+    iree_device_size_t relative_offset = byte_offset - state->byte_offset;
+    if (relative_offset <= state->byte_length &&
+        byte_length <= state->byte_length - relative_offset) {
+      return state;
+    }
+  }
+  return nullptr;
+}
+#endif
+
 //===----------------------------------------------------------------------===//
 // Buffer accessors for kernel runtime arguments
 //===----------------------------------------------------------------------===//
 
 #ifndef TT_IREE_ENABLE_MOCK
 uint32_t iree_hal_tt_buffer_device_address(iree_hal_buffer_t* base_buffer) {
-  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  if (!base_buffer) return 0;
+  auto* buffer = iree_hal_tt_buffer_cast(
+      iree_hal_buffer_allocated_buffer(base_buffer));
   if (!buffer || !buffer->tt_buffer) return 0;
-  return buffer->tt_buffer->address();
+  uint64_t address = static_cast<uint64_t>(buffer->tt_buffer->address()) +
+                     iree_hal_buffer_byte_offset(base_buffer);
+  if (address > std::numeric_limits<uint32_t>::max()) return 0;
+  return static_cast<uint32_t>(address);
 }
 
 tt::tt_metal::Buffer* iree_hal_tt_buffer_handle(iree_hal_buffer_t* base_buffer) {
-  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  if (!base_buffer) return nullptr;
+  auto* buffer = iree_hal_tt_buffer_cast(
+      iree_hal_buffer_allocated_buffer(base_buffer));
   return buffer ? buffer->tt_buffer.get() : nullptr;
 }
 #endif
@@ -142,19 +260,7 @@ iree_status_t iree_hal_tt_buffer_create(
 
     buffer->host_allocator = host_allocator;
     buffer->device = device;
-
-    iree_device_size_t num_elements = allocation_size / sizeof(float);
-    if (num_elements == 1024) {
-      buffer->rows = 32;
-      buffer->cols = 32;
-    } else {
-      buffer->rows = (int32_t)std::sqrt((double)num_elements);
-      buffer->cols = buffer->rows;
-      buffer->rows = ((buffer->rows + 31) / 32) * 32;
-      buffer->cols = ((buffer->cols + 31) / 32) * 32;
-    }
-
-    buffer->uses_tile_layout = (buffer->rows % 32 == 0) && (buffer->cols % 32 == 0);
+    buffer->physical_allocation_size = allocation_size;
 
     iree_hal_buffer_placement_t placement = {
         .device = (iree_hal_device_t*)device,
@@ -194,6 +300,7 @@ iree_status_t iree_hal_tt_buffer_create(
         // Ensure allocation is aligned to tile size
         uint64_t aligned_size = ((static_cast<uint64_t>(allocation_size) + bf16_tile_size - 1)
                                 / bf16_tile_size) * bf16_tile_size;
+        buffer->physical_allocation_size = aligned_size;
         tt::tt_metal::BufferConfig config{
             .device = tt_device,
             .size = aligned_size,
@@ -259,37 +366,77 @@ static iree_status_t iree_hal_tt_buffer_map_range(
   
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  if (iree_all_bits_set(mapping_mode, IREE_HAL_MAPPING_MODE_PERSISTENT)) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "Tenstorrent device buffers only support scoped mapping");
+  }
+  if (local_byte_offset > buffer->physical_allocation_size ||
+      local_byte_length >
+          buffer->physical_allocation_size - local_byte_offset) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(
+        IREE_STATUS_OUT_OF_RANGE,
+        "mapping range exceeds the physical TT-Metal allocation");
+  }
+  if (local_byte_length == 0) {
+    mapping->contents = iree_byte_span_empty();
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
+  }
+
 #ifdef TT_IREE_ENABLE_MOCK
   uint8_t* data_ptr = (uint8_t*)buffer->host_ptr + local_byte_offset;
   mapping->contents = iree_make_byte_span(data_ptr, local_byte_length);
 #else
-  // Allocate staging buffer
-  void* staging = std::malloc(local_byte_length);
-  if (!staging) {
+  iree_hal_tt_buffer_mapping_state_t* state = nullptr;
+  iree_status_t status = iree_allocator_malloc(
+      buffer->host_allocator, sizeof(*state),
+      reinterpret_cast<void**>(&state));
+  if (!iree_status_is_ok(status)) {
     IREE_TRACE_ZONE_END(z0);
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
-                           "failed to allocate staging buffer");
+    return status;
   }
-  
-  if (memory_access & IREE_HAL_MEMORY_ACCESS_READ) {
-    try {
-      // ReadFromBuffer fills a host-side vector; copy only what was requested.
-      std::vector<uint8_t> tmp;
-      tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, tmp);
-      iree_device_size_t copy_len =
-          std::min(local_byte_length, (iree_device_size_t)tmp.size());
-      std::memcpy(staging, tmp.data(), copy_len);
-      if (copy_len < local_byte_length)
-        std::memset((uint8_t*)staging + copy_len, 0,
-                    local_byte_length - copy_len);
-    } catch (...) {
-      std::memset(staging, 0, local_byte_length);
+  state->next = nullptr;
+  state->byte_offset = local_byte_offset;
+  state->byte_length = local_byte_length;
+  state->data = nullptr;
+  status = iree_allocator_malloc(
+      buffer->host_allocator, static_cast<iree_host_size_t>(local_byte_length),
+      reinterpret_cast<void**>(&state->data));
+  if (!iree_status_is_ok(status)) {
+    iree_allocator_free(buffer->host_allocator, state);
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+
+  bool requires_read =
+      iree_any_bit_set(memory_access, IREE_HAL_MEMORY_ACCESS_READ);
+  if (!requires_read) {
+    std::memset(state->data, 0, static_cast<size_t>(local_byte_length));
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
+    if (requires_read) {
+      status = iree_hal_tt_buffer_read_range(
+          buffer, local_byte_offset, local_byte_length, state->data);
     }
-  } else {
-    std::memset(staging, 0, local_byte_length);
+    if (iree_status_is_ok(status)) {
+      state->next = buffer->active_mappings;
+      buffer->active_mappings = state;
+    }
   }
-  
-  mapping->contents = iree_make_byte_span(staging, local_byte_length);
+  if (!iree_status_is_ok(status)) {
+    iree_allocator_free(buffer->host_allocator, state->data);
+    iree_allocator_free(buffer->host_allocator, state);
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+  mapping->impl.reserved[0] =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state));
+  mapping->contents = iree_make_byte_span(state->data, local_byte_length);
 #endif
   
   IREE_TRACE_ZONE_END(z0);
@@ -308,33 +455,75 @@ static iree_status_t iree_hal_tt_buffer_unmap_range(
 #ifdef TT_IREE_ENABLE_MOCK
   // No-op for mock mode
 #else
-  // Only write back to device if the mapping allowed writes.
-  if (mapping->impl.allowed_access & IREE_HAL_MEMORY_ACCESS_WRITE) {
-    try {
-      tt::stl::Span<const uint8_t> span(
-          mapping->contents.data, local_byte_length);
-      tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
-    } catch (const std::exception& e) {
-      fprintf(stderr, "tt-iree: unmap_range: WriteToBuffer threw: %s\n", e.what());
-    } catch (...) {
-      fprintf(stderr, "tt-iree: unmap_range: WriteToBuffer threw unknown\n");
+  auto* state = reinterpret_cast<iree_hal_tt_buffer_mapping_state_t*>(
+      static_cast<uintptr_t>(mapping->impl.reserved[0]));
+  iree_status_t status = iree_ok_status();
+  if (!state) {
+    status = iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                              "mapping state is missing during unmap");
+  } else {
+    {
+      std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
+      if (mapping->impl.allowed_access & IREE_HAL_MEMORY_ACCESS_WRITE) {
+        status = iree_hal_tt_buffer_write_range(
+            buffer, local_byte_offset, local_byte_length, state->data);
+      }
+      iree_hal_tt_buffer_mapping_state_t** link = &buffer->active_mappings;
+      while (*link && *link != state) link = &(*link)->next;
+      if (*link == state) *link = state->next;
     }
+    iree_allocator_free(buffer->host_allocator, state->data);
+    iree_allocator_free(buffer->host_allocator, state);
   }
-
-  std::free(mapping->contents.data);
 #endif
 
   mapping->contents = iree_byte_span_empty();
   IREE_TRACE_ZONE_END(z0);
+#ifndef TT_IREE_ENABLE_MOCK
+  return status;
+#else
   return iree_ok_status();
+#endif
 }
 
 static iree_status_t iree_hal_tt_buffer_invalidate_range(
-    iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t) {
+    iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
+    iree_device_size_t local_byte_length) {
+#ifndef TT_IREE_ENABLE_MOCK
+  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
+  iree_hal_tt_buffer_mapping_state_t* state =
+      iree_hal_tt_buffer_find_mapping(buffer, local_byte_offset,
+                                      local_byte_length);
+  if (!state) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "invalidate range has no active mapping");
+  }
+  return iree_hal_tt_buffer_read_range(
+      buffer, local_byte_offset, local_byte_length,
+      state->data + (local_byte_offset - state->byte_offset));
+#else
   return iree_ok_status();
+#endif
 }
 
 static iree_status_t iree_hal_tt_buffer_flush_range(
-    iree_hal_buffer_t*, iree_device_size_t, iree_device_size_t) {
+    iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
+    iree_device_size_t local_byte_length) {
+#ifndef TT_IREE_ENABLE_MOCK
+  auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
+  std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
+  iree_hal_tt_buffer_mapping_state_t* state =
+      iree_hal_tt_buffer_find_mapping(buffer, local_byte_offset,
+                                      local_byte_length);
+  if (!state) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "flush range has no active mapping");
+  }
+  return iree_hal_tt_buffer_write_range(
+      buffer, local_byte_offset, local_byte_length,
+      state->data + (local_byte_offset - state->byte_offset));
+#else
   return iree_ok_status();
+#endif
 }

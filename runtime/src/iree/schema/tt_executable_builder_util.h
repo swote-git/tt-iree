@@ -16,6 +16,12 @@
 extern "C" {
 #endif
 
+// TTEX wire-format versions. Version 0 represents legacy/unversioned blobs;
+// new blobs must explicitly encode the current version.
+#define TT_IREE_TTEX_VERSION_LEGACY 0u
+#define TT_IREE_TTEX_VERSION_1 1u
+#define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_1
+
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
 // Must stay in sync with BuiltinProgram in tt_executable_def.fbs.
 typedef enum tt_iree_ttex_builtin_program_e {
@@ -50,6 +56,15 @@ typedef struct tt_iree_ttex_entry_point_desc_t {
 //   - Contain |entry_point_count| EntryPointDef entries
 iree_status_t tt_iree_build_ttex_executable_def(
     iree_allocator_t allocator,
+    iree_host_size_t entry_point_count,
+    const tt_iree_ttex_entry_point_desc_t* entry_points,
+    iree_byte_span_t* out_data);
+
+// Builds a TTEX blob with an explicit version. Intended for compatibility
+// tests; production serializers should use the current-version wrapper above.
+iree_status_t tt_iree_build_ttex_executable_def_with_version(
+    iree_allocator_t allocator,
+    uint32_t version,
     iree_host_size_t entry_point_count,
     const tt_iree_ttex_entry_point_desc_t* entry_points,
     iree_byte_span_t* out_data);

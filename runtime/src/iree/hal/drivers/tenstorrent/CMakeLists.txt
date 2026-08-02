@@ -65,6 +65,7 @@ if(TT_IREE_ENABLE_TTNN)
     target_include_directories(iree_hal_tenstorrent PRIVATE
       $<TARGET_PROPERTY:tt_executable_def_c_fbs,INTERFACE_INCLUDE_DIRECTORIES>
     )
+    target_link_libraries(iree_hal_tenstorrent PRIVATE flatcc::runtime)
     add_dependencies(iree_hal_tenstorrent tt_executable_def_gen)
     target_compile_definitions(iree_hal_tenstorrent PRIVATE TT_IREE_ENABLE_TTEX=1)
     message(STATUS "  TTEX FlatBuffer support: enabled")

@@ -18,6 +18,17 @@ iree_status_t tt_iree_build_ttex_executable_def(
     iree_host_size_t entry_point_count,
     const tt_iree_ttex_entry_point_desc_t* entry_points,
     iree_byte_span_t* out_data) {
+  return tt_iree_build_ttex_executable_def_with_version(
+      allocator, TT_IREE_TTEX_CURRENT_VERSION, entry_point_count, entry_points,
+      out_data);
+}
+
+iree_status_t tt_iree_build_ttex_executable_def_with_version(
+    iree_allocator_t allocator,
+    uint32_t version,
+    iree_host_size_t entry_point_count,
+    const tt_iree_ttex_entry_point_desc_t* entry_points,
+    iree_byte_span_t* out_data) {
   if (!out_data) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "out_data is null");
   }
@@ -33,7 +44,7 @@ iree_status_t tt_iree_build_ttex_executable_def(
 
   // Build ExecutableDef root
   ns(ExecutableDef_start_as_root(&builder));
-  ns(ExecutableDef_version_add(&builder, 0));
+  ns(ExecutableDef_version_add(&builder, version));
 
   // Build entry_points vector
   ns(ExecutableDef_entry_points_start(&builder));

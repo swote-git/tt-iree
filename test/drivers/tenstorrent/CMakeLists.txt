@@ -61,17 +61,16 @@ function(tt_iree_hal_test)
   # code). Wrap with shell to mask the signal; judge pass/fail by gtest output.
   add_test(NAME tt_${_RULE_NAME}
     COMMAND sh -c "$<TARGET_FILE:${_RULE_NAME}> 2>&1 || true")
-  set(_TT_IREE_HAL_TEST_PROPERTIES
+  set_tests_properties(tt_${_RULE_NAME} PROPERTIES
     LABELS "tt-iree;hal"
     PASS_REGULAR_EXPRESSION "\\[  PASSED  \\]"
     FAIL_REGULAR_EXPRESSION "\\[  FAILED  \\]"
   )
   if(NOT TT_IREE_ENABLE_MOCK)
-    list(APPEND _TT_IREE_HAL_TEST_PROPERTIES
+    set_tests_properties(tt_${_RULE_NAME} PROPERTIES
       ENVIRONMENT "TT_METAL_RUNTIME_ROOT=${CMAKE_SOURCE_DIR}/third_party/tt-metal"
     )
   endif()
-  set_tests_properties(tt_${_RULE_NAME} PROPERTIES ${_TT_IREE_HAL_TEST_PROPERTIES})
 endfunction()
 
 #-------------------------------------------------------------------------------
@@ -91,6 +90,11 @@ tt_iree_hal_test(
 tt_iree_hal_test(
   NAME buffer_test
   SRCS buffer_test.cc
+)
+
+tt_iree_hal_test(
+  NAME copy_test
+  SRCS copy_test.cc
 )
 
 tt_iree_hal_test(

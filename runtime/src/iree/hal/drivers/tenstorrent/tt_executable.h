@@ -87,7 +87,10 @@ typedef struct iree_hal_tt_entry_point_t {
 //
 // Dispatch by executable_format:
 //   - "tenstorrent-ttex-fb": parse TTEX FlatBuffer from executable_data
-//   - anything else / NULL data: legacy path (hardcoded single entry point)
+//   - "TT-METAL": explicit legacy path (hardcoded single entry point)
+// Unknown formats and malformed or unsupported TTEX blobs are rejected.
+#define IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT "TT-METAL"
+
 iree_status_t iree_hal_tt_executable_create(
     iree_hal_device_t* device,
     const iree_hal_executable_params_t* executable_params,

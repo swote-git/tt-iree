@@ -93,7 +93,8 @@ table EntryPointDef {
 // ---------------------------------------------------------------------------
 
 table ExecutableDef {
-  // Schema version. Bump on breaking changes.
+  // Schema version. Keep the default at 0 forever so old blobs with an absent
+  // field remain distinguishable. Current serializers explicitly emit v1.
   version:uint32 = 0;
 
   // One entry per HAL export ordinal.

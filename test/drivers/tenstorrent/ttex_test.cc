@@ -44,7 +44,8 @@ TEST(TtexSchemaTest, BuildVerifySingleEntry) {
   ASSERT_EQ(ret, 0);
 
   ttex_ns(ExecutableDef_table_t) def = ttex_ns(ExecutableDef_as_root(data.data));
-  ASSERT_EQ(ttex_ns(ExecutableDef_version(def)), 0u);
+  ASSERT_EQ(ttex_ns(ExecutableDef_version(def)),
+            TT_IREE_TTEX_CURRENT_VERSION);
 
   ttex_ns(EntryPointDef_vec_t) eps = ttex_ns(ExecutableDef_entry_points(def));
   ASSERT_EQ(ttex_ns(EntryPointDef_vec_len(eps)), 1u);
@@ -57,6 +58,30 @@ TEST(TtexSchemaTest, BuildVerifySingleEntry) {
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_y(ep0)), 1u);
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_z(ep0)), 1u);
   ASSERT_EQ(ttex_ns(EntryPointDef_builtin(ep0)), 0u);
+
+  iree_allocator_free(alloc, data.data);
+}
+
+TEST(TtexSchemaTest, BuildExplicitVersion) {
+  iree_allocator_t alloc = iree_allocator_system();
+
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.name = "future_version";
+  ep.binding_count = 3;
+  ep.workgroup_size[0] = 1;
+  ep.workgroup_size[1] = 1;
+  ep.workgroup_size[2] = 1;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
+
+  constexpr uint32_t kFutureVersion = TT_IREE_TTEX_CURRENT_VERSION + 1;
+  iree_byte_span_t data = {0};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      alloc, kFutureVersion, 1, &ep, &data));
+
+  ASSERT_EQ(
+      ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)), 0);
+  ttex_ns(ExecutableDef_table_t) def = ttex_ns(ExecutableDef_as_root(data.data));
+  ASSERT_EQ(ttex_ns(ExecutableDef_version(def)), kFutureVersion);
 
   iree_allocator_free(alloc, data.data);
 }

@@ -29,6 +29,17 @@
 #define ttex_ns(x) FLATBUFFERS_WRAP_NAMESPACE(iree_tenstorrent_hal, x)
 #endif
 
+static bool iree_hal_tt_is_supported_builtin(uint32_t builtin_program) {
+  switch (builtin_program) {
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
+      return true;
+    default:
+      return false;
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Executable Structure
 //===----------------------------------------------------------------------===//
@@ -447,15 +458,35 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
                             verify_ret);
   }
 
-  // 2) Read entry point count
+  // 2) Validate the wire-format version and entry point metadata before any
+  // allocations or TT-Metal program creation.
   ttex_ns(ExecutableDef_table_t) def =
       ttex_ns(ExecutableDef_as_root(fb_data));
+  uint32_t version = ttex_ns(ExecutableDef_version(def));
+  if (version != TT_IREE_TTEX_CURRENT_VERSION) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "unsupported TTEX version %u (runtime supports version %u)", version,
+        TT_IREE_TTEX_CURRENT_VERSION);
+  }
+
   ttex_ns(EntryPointDef_vec_t) eps =
       ttex_ns(ExecutableDef_entry_points(def));
   iree_host_size_t ep_count = ttex_ns(EntryPointDef_vec_len(eps));
   if (ep_count == 0) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "TTEX contains 0 entry points");
+  }
+  for (iree_host_size_t i = 0; i < ep_count; ++i) {
+    ttex_ns(EntryPointDef_table_t) fb_ep =
+        ttex_ns(EntryPointDef_vec_at(eps, i));
+    uint32_t builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
+    if (!iree_hal_tt_is_supported_builtin(builtin_program)) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "TTEX entry point %zu uses unsupported builtin "
+                              "program %u",
+                              i, builtin_program);
+    }
   }
 
   // 3) Allocate executable + flexible array
@@ -475,8 +506,12 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
   executable->entry_point_count = ep_count;
 
   // 4) Copy executable_data (string pointers from reader reference this buffer)
-  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
-      host_allocator, fb_size, (void**)&executable->owned_data));
+  iree_status_t status = iree_allocator_malloc(
+      host_allocator, fb_size, (void**)&executable->owned_data);
+  if (!iree_status_is_ok(status)) {
+    iree_allocator_free(host_allocator, executable);
+    return status;
+  }
   memcpy(executable->owned_data, fb_data, fb_size);
   executable->owned_data_length = fb_size;
 
@@ -519,7 +554,7 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
 
     // Create TT-Metal program for this builtin
 #ifndef TT_IREE_ENABLE_MOCK
-    iree_status_t status = iree_hal_tt_create_program_for_builtin(
+    status = iree_hal_tt_create_program_for_builtin(
         device, ep->builtin_program, &ep->kernel_params);
     if (!iree_status_is_ok(status)) {
       // Cleanup already-created programs
@@ -555,11 +590,11 @@ iree_status_t iree_hal_tt_executable_create(
   IREE_ASSERT_ARGUMENT(out_executable);
   *out_executable = NULL;
 
-#ifdef TT_IREE_ENABLE_TTEX
-  // Primary path: TTEX FlatBuffer format
+  // Primary path: TTEX FlatBuffer format.
   if (iree_string_view_equal(
           params->executable_format,
           iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT))) {
+#ifdef TT_IREE_ENABLE_TTEX
     if (params->executable_data.data == NULL ||
         params->executable_data.data_length == 0) {
       return iree_make_status(
@@ -569,13 +604,32 @@ iree_status_t iree_hal_tt_executable_create(
     }
     return iree_hal_tt_executable_create_ttex(
         device, params, host_allocator, out_executable);
-  }
+#else
+    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                            "TTEX support is not enabled in this build");
 #endif
+  }
 
-  // Legacy fallback: hardcoded PoC program
-  // Handles: format=="TT-METAL", format=="" (dispatch_test), or unknown format
-  return iree_hal_tt_executable_create_legacy(
-      device, params, host_allocator, out_executable);
+  // Keep the add-first PoC available only through its explicit legacy format.
+  if (iree_string_view_equal(
+          params->executable_format,
+          iree_make_cstring_view(IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT))) {
+    if (params->executable_data.data_length != 0) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "legacy executable format '%s' does not accept executable data",
+          IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT);
+    }
+    return iree_hal_tt_executable_create_legacy(
+        device, params, host_allocator, out_executable);
+  }
+
+  const char* format_data = params->executable_format.data
+                                ? params->executable_format.data
+                                : "";
+  return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                          "unsupported Tenstorrent executable format '%.*s'",
+                          (int)params->executable_format.size, format_data);
 }
 
 //===----------------------------------------------------------------------===//

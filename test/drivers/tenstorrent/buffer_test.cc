@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include "utils.h"
 
@@ -62,18 +63,12 @@ TEST_F(BufferTest, MapWrite) {
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                IREE_HAL_BUFFER_USAGE_MAPPING,
       .access = IREE_HAL_MEMORY_ACCESS_ALL,
-      .type = IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
-              IREE_HAL_MEMORY_TYPE_HOST_COHERENT,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
-  iree_status_t status = iree_hal_allocator_allocate_buffer(
-      device_allocator(), params, kBufferSize, &buffer);
-
-  if (!iree_status_is_ok(status)) {
-    iree_status_ignore(status);
-    GTEST_SKIP() << "host-visible buffer allocation not supported";
-  }
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
 
   iree_hal_buffer_mapping_t mapping;
   IREE_ASSERT_OK(iree_hal_buffer_map_range(
@@ -97,17 +92,12 @@ TEST_F(BufferTest, RoundtripSingleTile) {
       .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                IREE_HAL_BUFFER_USAGE_MAPPING,
       .access = IREE_HAL_MEMORY_ACCESS_ALL,
-      .type = IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
-              IREE_HAL_MEMORY_TYPE_HOST_COHERENT,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
   };
 
   iree_hal_buffer_t* buffer = nullptr;
-  iree_status_t status = iree_hal_allocator_allocate_buffer(
-      device_allocator(), params, kBufferSize, &buffer);
-  if (!iree_status_is_ok(status)) {
-    iree_status_ignore(status);
-    GTEST_SKIP() << "host-visible buffer allocation not supported";
-  }
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
 
   // Write.
   {
@@ -136,6 +126,76 @@ TEST_F(BufferTest, RoundtripSingleTile) {
     }
     IREE_ASSERT_OK(iree_hal_buffer_unmap_range(&mapping));
   }
+
+  iree_hal_buffer_release(buffer);
+}
+
+TEST_F(BufferTest, PartialMapReadWritePreservesSurroundingBytes) {
+  constexpr iree_device_size_t kBufferSize = 4096;
+  constexpr iree_device_size_t kPatchOffset = 333;
+  constexpr iree_device_size_t kPatchLength = 517;
+
+  iree_hal_buffer_params_t params = {
+      .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
+               IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree_hal_buffer_t* buffer = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+
+  std::vector<uint8_t> expected(kBufferSize);
+  for (iree_device_size_t i = 0; i < kBufferSize; ++i) {
+    expected[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+  }
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      buffer, 0, expected.data(), expected.size()));
+
+  std::vector<uint8_t> patch(kPatchLength, 0xA5);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      buffer, kPatchOffset, patch.data(), patch.size()));
+  std::memcpy(expected.data() + kPatchOffset, patch.data(), patch.size());
+
+  iree_hal_buffer_mapping_t mapping = {};
+  IREE_ASSERT_OK(iree_hal_buffer_map_range(
+      buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
+      kPatchOffset - 17, kPatchLength + 34, &mapping));
+  ASSERT_EQ(mapping.contents.data_length, kPatchLength + 34);
+  EXPECT_EQ(std::memcmp(mapping.contents.data,
+                        expected.data() + kPatchOffset - 17,
+                        mapping.contents.data_length),
+            0);
+  IREE_ASSERT_OK(iree_hal_buffer_unmap_range(&mapping));
+
+  std::vector<uint8_t> actual(kBufferSize);
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(
+      buffer, 0, actual.data(), actual.size()));
+  EXPECT_EQ(actual, expected);
+
+  iree_hal_buffer_release(buffer);
+}
+
+TEST_F(BufferTest, MapRangeRejectsOutOfBoundsAccess) {
+  constexpr iree_device_size_t kBufferSize = 4096;
+  iree_hal_buffer_params_t params = {
+      .usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
+               IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree_hal_buffer_t* buffer = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+
+  iree_hal_buffer_mapping_t mapping = {};
+  iree_status_t status = iree_hal_buffer_map_range(
+      buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
+      kBufferSize - 8, 16, &mapping);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_OUT_OF_RANGE);
+  iree_status_ignore(status);
 
   iree_hal_buffer_release(buffer);
 }

@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <vector>
@@ -47,14 +48,70 @@ struct iree_hal_tt_device_t {
 #endif
 };
 
+static iree_status_t iree_hal_tt_copy_resolved_buffer_refs(
+    const iree_hal_buffer_ref_t& source_ref,
+    const iree_hal_buffer_ref_t& target_ref) {
+  if (!source_ref.buffer || !target_ref.buffer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "resolved copy buffers must not be null");
+  }
+  if (source_ref.length != target_ref.length) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "resolved copy ranges must have equal lengths (source=%" PRIdsz
+        " target=%" PRIdsz ")",
+        source_ref.length, target_ref.length);
+  }
+  if (source_ref.length == 0) return iree_ok_status();
+
+  if (iree_hal_buffer_test_overlap(
+          source_ref.buffer, source_ref.offset, source_ref.length,
+          target_ref.buffer, target_ref.offset, target_ref.length) !=
+      IREE_HAL_BUFFER_OVERLAP_DISJOINT) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "resolved copy source and target ranges overlap");
+  }
+
+  iree_hal_buffer_mapping_t source_mapping = {};
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      source_ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_READ, source_ref.offset, source_ref.length,
+      &source_mapping));
+
+  iree_hal_buffer_mapping_t target_mapping = {};
+  iree_status_t status = iree_hal_buffer_map_range(
+      target_ref.buffer, IREE_HAL_MAPPING_MODE_SCOPED,
+      IREE_HAL_MEMORY_ACCESS_WRITE, target_ref.offset, target_ref.length,
+      &target_mapping);
+  if (iree_status_is_ok(status)) {
+    std::memcpy(target_mapping.contents.data, source_mapping.contents.data,
+                static_cast<size_t>(source_ref.length));
+    status = iree_status_join(
+        status, iree_hal_buffer_unmap_range(&target_mapping));
+  }
+  status = iree_status_join(
+      status, iree_hal_buffer_unmap_range(&source_mapping));
+  return status;
+}
+
 #ifndef TT_IREE_ENABLE_MOCK
 static iree_status_t iree_hal_tt_set_add_runtime_args(
     tt::tt_metal::Program& program, const iree_hal_tt_kernel_params_t* params,
     const tt::tt_metal::CoreCoord& core, uint32_t in0_addr, uint32_t in1_addr,
-    uint32_t out_addr, uint32_t input_byte_length) {
+    uint32_t out_addr, uint32_t in0_byte_length, uint32_t in1_byte_length,
+    uint32_t out_byte_length) {
   constexpr uint32_t bf16_tile_bytes = 32 * 32 * 2;
-  uint32_t n_tiles = input_byte_length / bf16_tile_bytes;
-  if (n_tiles == 0) n_tiles = 1;
+  if (in0_byte_length == 0 || in0_byte_length != in1_byte_length ||
+      in0_byte_length != out_byte_length ||
+      in0_byte_length % bf16_tile_bytes != 0) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "builtin add expects equal, non-empty, tile-aligned bindings "
+        "(in0=%u in1=%u out=%u bytes)",
+        in0_byte_length, in1_byte_length, out_byte_length);
+  }
+  uint32_t n_tiles = in0_byte_length / bf16_tile_bytes;
 
   std::vector<uint32_t> reader_args = {in0_addr, in1_addr, n_tiles};
   tt::tt_metal::SetRuntimeArgs(program, params->reader_kernel_id, core,
@@ -128,6 +185,90 @@ static bool iree_hal_tt_is_tile_aligned(uint64_t value) {
   return value != 0 && value % TT_TILE_WIDTH == 0;
 }
 
+static iree_status_t iree_hal_tt_resolve_buffer_ref(
+    iree_hal_buffer_binding_table_t binding_table,
+    const iree_hal_buffer_ref_t& buffer_ref,
+    iree_hal_buffer_ref_t* out_resolved_ref) {
+  if (!out_resolved_ref) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "out_resolved_ref is null");
+  }
+  *out_resolved_ref = {};
+
+  if (!buffer_ref.buffer) {
+    if (!binding_table.bindings || buffer_ref.buffer_slot >= binding_table.count) {
+      return iree_make_status(
+          IREE_STATUS_OUT_OF_RANGE,
+          "indirect buffer slot %u is not present in binding table of size %zu",
+          buffer_ref.buffer_slot, binding_table.count);
+    }
+    const iree_hal_buffer_binding_t& binding =
+        binding_table.bindings[buffer_ref.buffer_slot];
+    if (!binding.buffer) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "indirect buffer slot %u is null",
+                              buffer_ref.buffer_slot);
+    }
+    iree_device_size_t binding_offset = 0;
+    iree_device_size_t binding_length = 0;
+    IREE_RETURN_IF_ERROR(iree_hal_buffer_calculate_range(
+        /*base_offset=*/0, iree_hal_buffer_byte_length(binding.buffer),
+        binding.offset, binding.length, &binding_offset, &binding_length));
+  }
+
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_binding_table_resolve_ref(
+      binding_table, buffer_ref, out_resolved_ref));
+  if (!out_resolved_ref->buffer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "resolved buffer reference is null");
+  }
+
+  iree_device_size_t resolved_offset = 0;
+  iree_device_size_t resolved_length = 0;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_calculate_range(
+      /*base_offset=*/0,
+      iree_hal_buffer_byte_length(out_resolved_ref->buffer),
+      out_resolved_ref->offset, out_resolved_ref->length, &resolved_offset,
+      &resolved_length));
+  out_resolved_ref->offset = resolved_offset;
+  out_resolved_ref->length = resolved_length;
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_copy_buffer_refs(
+    iree_hal_buffer_binding_table_t binding_table,
+    const iree_hal_buffer_ref_t& source_ref,
+    const iree_hal_buffer_ref_t& target_ref) {
+  iree_hal_buffer_ref_t resolved_source_ref = {};
+  iree_hal_buffer_ref_t resolved_target_ref = {};
+  IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+      binding_table, source_ref, &resolved_source_ref));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+      binding_table, target_ref, &resolved_target_ref));
+  return iree_hal_tt_copy_resolved_buffer_refs(resolved_source_ref,
+                                               resolved_target_ref);
+}
+
+static iree_status_t iree_hal_tt_get_binding_runtime_args(
+    const iree_hal_buffer_ref_t& resolved_ref, uint32_t* out_device_address,
+    uint32_t* out_byte_length) {
+  if (resolved_ref.length > std::numeric_limits<uint32_t>::max()) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "binding length exceeds 32-bit runtime ABI");
+  }
+  uint32_t base_address =
+      iree_hal_tt_buffer_device_address(resolved_ref.buffer);
+  if (resolved_ref.offset >
+      std::numeric_limits<uint32_t>::max() - base_address) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "binding device address exceeds 32-bit runtime ABI");
+  }
+  *out_device_address =
+      base_address + static_cast<uint32_t>(resolved_ref.offset);
+  *out_byte_length = static_cast<uint32_t>(resolved_ref.length);
+  return iree_ok_status();
+}
+
 static uint32_t iree_hal_tt_greatest_divisor_at_most(uint32_t value,
                                                      uint32_t limit) {
   if (value == 0 || limit == 0) return 1;
@@ -159,7 +300,8 @@ static std::vector<uint32_t> iree_hal_tt_transpose_tiles(
 }
 
 static iree_status_t iree_hal_tt_read_buffer_bfloat16(
-    iree_hal_buffer_t* buffer, iree_device_size_t byte_length,
+    iree_hal_buffer_t* buffer, iree_device_size_t byte_offset,
+    iree_device_size_t byte_length,
     std::vector<bfloat16>* out_values) {
   if (!out_values) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
@@ -170,22 +312,21 @@ static iree_status_t iree_hal_tt_read_buffer_bfloat16(
   iree_hal_buffer_mapping_t mapping = {};
   IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
       buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
-      /*local_byte_offset=*/0, byte_length, &mapping));
+      byte_offset, byte_length, &mapping));
   std::memcpy(out_values->data(), mapping.contents.data, byte_length);
-  iree_hal_buffer_unmap_range(&mapping);
-  return iree_ok_status();
+  return iree_hal_buffer_unmap_range(&mapping);
 }
 
 static iree_status_t iree_hal_tt_write_buffer_bfloat16(
-    iree_hal_buffer_t* buffer, const std::vector<bfloat16>& values) {
+    iree_hal_buffer_t* buffer, iree_device_size_t byte_offset,
+    const std::vector<bfloat16>& values) {
   iree_device_size_t byte_length = values.size() * sizeof(bfloat16);
   iree_hal_buffer_mapping_t mapping = {};
   IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
       buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
-      /*local_byte_offset=*/0, byte_length, &mapping));
+      byte_offset, byte_length, &mapping));
   std::memcpy(mapping.contents.data, values.data(), byte_length);
-  iree_hal_buffer_unmap_range(&mapping);
-  return iree_ok_status();
+  return iree_hal_buffer_unmap_range(&mapping);
 }
 
 static std::vector<bfloat16> iree_hal_tt_slice_row_major_matrix(
@@ -252,7 +393,7 @@ static iree_status_t iree_hal_tt_decode_tiled_matmul_shape(
     return iree_ok_status();
   }
 
-  if (cmd.constants_length < 8 * sizeof(uint32_t)) {
+  if (cmd.constants_length != 8 * sizeof(uint32_t)) {
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
         "dynamic tiled matmul expects 8 i32 dispatch constants, got %zu bytes",
@@ -277,9 +418,20 @@ static iree_status_t iree_hal_tt_decode_tiled_matmul_shape(
         "dynamic tiled matmul expects M/N/K to be multiples of 32");
   }
 
-  *out_m_tiles = static_cast<uint32_t>(lhs_m / TT_TILE_HEIGHT);
-  *out_n_tiles = static_cast<uint32_t>(rhs_n / TT_TILE_WIDTH);
-  *out_k_tiles = static_cast<uint32_t>(lhs_k / TT_TILE_WIDTH);
+  uint64_t m_tiles = lhs_m / TT_TILE_HEIGHT;
+  uint64_t n_tiles = rhs_n / TT_TILE_WIDTH;
+  uint64_t k_tiles = lhs_k / TT_TILE_WIDTH;
+  if (m_tiles > std::numeric_limits<uint32_t>::max() ||
+      n_tiles > std::numeric_limits<uint32_t>::max() ||
+      k_tiles > std::numeric_limits<uint32_t>::max()) {
+    return iree_make_status(
+        IREE_STATUS_OUT_OF_RANGE,
+        "dynamic tiled matmul dimensions exceed the 32-bit runtime ABI");
+  }
+
+  *out_m_tiles = static_cast<uint32_t>(m_tiles);
+  *out_n_tiles = static_cast<uint32_t>(n_tiles);
+  *out_k_tiles = static_cast<uint32_t>(k_tiles);
   return iree_ok_status();
 }
 
@@ -287,27 +439,22 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_dispatch(
     iree_hal_tt_device_t* device, const iree_hal_tt_kernel_params_t* params,
     const iree_hal_tt_dispatch_command_t& cmd,
     iree_hal_buffer_binding_table_t binding_table) {
-  auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref)
-      -> iree_hal_buffer_t* {
-    if (ref.buffer) return ref.buffer;
-    if (ref.buffer_slot < binding_table.count) {
-      return binding_table.bindings[ref.buffer_slot].buffer;
-    }
-    return nullptr;
-  };
-
-  if (cmd.binding_count < 3) {
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "tiled matmul expects 3 bindings");
+  if (cmd.binding_count != 3) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "tiled matmul expects exactly 3 bindings, got %zu",
+        cmd.binding_count);
   }
 
-  iree_hal_buffer_t* lhs_buffer = resolve_buffer(cmd.bindings[0]);
-  iree_hal_buffer_t* rhs_buffer = resolve_buffer(cmd.bindings[1]);
-  iree_hal_buffer_t* out_buffer = resolve_buffer(cmd.bindings[2]);
-  if (!lhs_buffer || !rhs_buffer || !out_buffer) {
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "tiled matmul missing one or more buffers");
-  }
+  iree_hal_buffer_ref_t lhs_ref = {};
+  iree_hal_buffer_ref_t rhs_ref = {};
+  iree_hal_buffer_ref_t out_ref = {};
+  IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+      binding_table, cmd.bindings[0], &lhs_ref));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+      binding_table, cmd.bindings[1], &rhs_ref));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+      binding_table, cmd.bindings[2], &out_ref));
 
   uint32_t m_tiles = 0;
   uint32_t n_tiles = 0;
@@ -334,16 +481,14 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_dispatch(
   iree_device_size_t expected_out_bytes =
       static_cast<iree_device_size_t>(out_rows) * out_cols * sizeof(bfloat16);
 
-  if (iree_hal_buffer_byte_length(lhs_buffer) != expected_lhs_bytes ||
-      iree_hal_buffer_byte_length(rhs_buffer) != expected_rhs_bytes ||
-      iree_hal_buffer_byte_length(out_buffer) != expected_out_bytes) {
+  if (lhs_ref.length != expected_lhs_bytes ||
+      rhs_ref.length != expected_rhs_bytes ||
+      out_ref.length != expected_out_bytes) {
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
-        "tiled matmul buffer sizes do not match M/N/K"
+        "tiled matmul binding ranges do not match M/N/K"
         " (lhs=%" PRIhsz " rhs=%" PRIhsz " out=%" PRIhsz ")",
-        iree_hal_buffer_byte_length(lhs_buffer),
-        iree_hal_buffer_byte_length(rhs_buffer),
-        iree_hal_buffer_byte_length(out_buffer));
+        lhs_ref.length, rhs_ref.length, out_ref.length);
   }
 
   tt::tt_metal::IDevice* idevice = iree_hal_tt_device_idevice(device);
@@ -364,9 +509,9 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_dispatch(
   std::vector<bfloat16> lhs_row_major;
   std::vector<bfloat16> rhs_row_major;
   IREE_RETURN_IF_ERROR(iree_hal_tt_read_buffer_bfloat16(
-      lhs_buffer, expected_lhs_bytes, &lhs_row_major));
+      lhs_ref.buffer, lhs_ref.offset, lhs_ref.length, &lhs_row_major));
   IREE_RETURN_IF_ERROR(iree_hal_tt_read_buffer_bfloat16(
-      rhs_buffer, expected_rhs_bytes, &rhs_row_major));
+      rhs_ref.buffer, rhs_ref.offset, rhs_ref.length, &rhs_row_major));
 
   try {
     std::vector<std::shared_ptr<tt::tt_metal::Buffer>> lhs_scratch(
@@ -567,8 +712,8 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_dispatch(
       }
     }
 
-    iree_status_t write_status =
-        iree_hal_tt_write_buffer_bfloat16(out_buffer, out_row_major);
+    iree_status_t write_status = iree_hal_tt_write_buffer_bfloat16(
+        out_ref.buffer, out_ref.offset, out_row_major);
     return write_status;
   } catch (const std::exception& e) {
     return iree_make_status(IREE_STATUS_INTERNAL,
@@ -973,24 +1118,33 @@ static iree_status_t iree_hal_tt_device_queue_copy(
     iree_hal_buffer_t* source_buffer, iree_device_size_t source_offset,
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
     iree_device_size_t length, iree_hal_copy_flags_t flags) {
-  iree_hal_buffer_mapping_t src_mapping = {};
-  iree_status_t status = iree_hal_buffer_map_range(
-      source_buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
-      source_offset, length, &src_mapping);
-  if (!iree_status_is_ok(status)) return status;
-
-  iree_hal_buffer_mapping_t dst_mapping = {};
-  status = iree_hal_buffer_map_range(
-      target_buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
-      target_offset, length, &dst_mapping);
-  if (iree_status_is_ok(status)) {
-    iree_device_size_t copy_len =
-        std::min(length, (iree_device_size_t)dst_mapping.contents.data_length);
-    std::memcpy(dst_mapping.contents.data, src_mapping.contents.data, copy_len);
-    iree_hal_buffer_unmap_range(&dst_mapping);
+  if (flags != IREE_HAL_COPY_FLAG_NONE) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "Tenstorrent queue copy does not support flags 0x%" PRIx64, flags);
   }
-  iree_hal_buffer_unmap_range(&src_mapping);
-  IREE_RETURN_IF_ERROR(status);
+  if (!source_buffer || !target_buffer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "queue copy buffers must not be null");
+  }
+
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(
+      wait_semaphore_list, iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT));
+
+  iree_hal_buffer_ref_t source_ref =
+      iree_hal_make_buffer_ref(source_buffer, source_offset, length);
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_calculate_range(
+      /*base_offset=*/0, iree_hal_buffer_byte_length(source_buffer),
+      source_offset, length, &source_ref.offset, &source_ref.length));
+
+  iree_hal_buffer_ref_t target_ref =
+      iree_hal_make_buffer_ref(target_buffer, target_offset, length);
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_calculate_range(
+      /*base_offset=*/0, iree_hal_buffer_byte_length(target_buffer),
+      target_offset, length, &target_ref.offset, &target_ref.length));
+
+  IREE_RETURN_IF_ERROR(
+      iree_hal_tt_copy_resolved_buffer_refs(source_ref, target_ref));
 
   for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
     IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
@@ -1091,14 +1245,22 @@ static iree_status_t iree_hal_tt_device_queue_execute(
                                 cmd.export_ordinal);
       }
 
-      auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref)
-          -> iree_hal_buffer_t* {
-        if (ref.buffer) return ref.buffer;
-        if (ref.buffer_slot < binding_table.count) {
-          return binding_table.bindings[ref.buffer_slot].buffer;
-        }
-        return nullptr;
-      };
+      if (cmd.binding_count != 3) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "Tenstorrent builtin expects exactly 3 bindings, got %zu",
+            cmd.binding_count);
+      }
+
+      iree_hal_buffer_ref_t in0_ref = {};
+      iree_hal_buffer_ref_t in1_ref = {};
+      iree_hal_buffer_ref_t out_ref = {};
+      IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+          binding_table, cmd.bindings[0], &in0_ref));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+          binding_table, cmd.bindings[1], &in1_ref));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_buffer_ref(
+          binding_table, cmd.bindings[2], &out_ref));
 
       uint32_t in0_addr = 0;
       uint32_t in1_addr = 0;
@@ -1106,27 +1268,12 @@ static iree_status_t iree_hal_tt_device_queue_execute(
       uint32_t in0_byte_length = 0;
       uint32_t in1_byte_length = 0;
       uint32_t out_byte_length = 0;
-      if (cmd.binding_count > 0) {
-        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[0]);
-        if (buf) {
-          in0_addr = iree_hal_tt_buffer_device_address(buf);
-          in0_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
-        }
-      }
-      if (cmd.binding_count > 1) {
-        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[1]);
-        if (buf) {
-          in1_addr = iree_hal_tt_buffer_device_address(buf);
-          in1_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
-        }
-      }
-      if (cmd.binding_count > 2) {
-        iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[2]);
-        if (buf) {
-          out_addr = iree_hal_tt_buffer_device_address(buf);
-          out_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
-        }
-      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_get_binding_runtime_args(
+          in0_ref, &in0_addr, &in0_byte_length));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_get_binding_runtime_args(
+          in1_ref, &in1_addr, &in1_byte_length));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_get_binding_runtime_args(
+          out_ref, &out_addr, &out_byte_length));
 
       tt::tt_metal::Program* program =
           static_cast<tt::tt_metal::Program*>(params->program);
@@ -1137,7 +1284,7 @@ static iree_status_t iree_hal_tt_device_queue_execute(
           case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
             status = iree_hal_tt_set_add_runtime_args(
                 *program, params, core, in0_addr, in1_addr, out_addr,
-                in0_byte_length);
+                in0_byte_length, in1_byte_length, out_byte_length);
             break;
           case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
             status = iree_hal_tt_set_matmul_runtime_args(
@@ -1181,34 +1328,8 @@ static iree_status_t iree_hal_tt_device_queue_execute(
 
     if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_COPY) {
       auto& cmd = commands[i].copy;
-      iree_hal_buffer_t* src_buf = cmd.source_ref.buffer;
-      iree_hal_buffer_t* dst_buf = cmd.target_ref.buffer;
-      if (!src_buf || !dst_buf) continue;
-
-      iree_device_size_t length = cmd.source_ref.length;
-      if (length == IREE_HAL_WHOLE_BUFFER) {
-        iree_device_size_t src_len = iree_hal_buffer_byte_length(src_buf);
-        iree_device_size_t src_off = cmd.source_ref.offset;
-        length = src_len > src_off ? src_len - src_off : 0;
-      }
-      if (length == 0) continue;
-
-      iree_hal_buffer_mapping_t src_mapping = {};
-      IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
-          src_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
-          cmd.source_ref.offset, length, &src_mapping));
-      iree_hal_buffer_mapping_t dst_mapping = {};
-      iree_status_t copy_status = iree_hal_buffer_map_range(
-          dst_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
-          cmd.target_ref.offset, length, &dst_mapping);
-      if (iree_status_is_ok(copy_status)) {
-        iree_device_size_t copy_len = std::min(
-            length, static_cast<iree_device_size_t>(dst_mapping.contents.data_length));
-        std::memcpy(dst_mapping.contents.data, src_mapping.contents.data, copy_len);
-        iree_hal_buffer_unmap_range(&dst_mapping);
-      }
-      iree_hal_buffer_unmap_range(&src_mapping);
-      IREE_RETURN_IF_ERROR(copy_status);
+      IREE_RETURN_IF_ERROR(iree_hal_tt_copy_buffer_refs(
+          binding_table, cmd.source_ref, cmd.target_ref));
       continue;
     }
   }
