@@ -3,8 +3,14 @@
 
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
 
+#include <algorithm>
+#include <array>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <set>
+#include <vector>
 
 #include "iree/hal/drivers/tenstorrent/tt_allocator.h"
 #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
@@ -16,8 +22,11 @@
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
+#include "tt-metalium/bfloat16.hpp"
+#include "tt-metalium/tilize_utils.hpp"
 #include "tt-metalium/device.hpp"
 #include "tt-metalium/distributed.hpp"
+#include "tt-metalium/tt_metal.hpp"
 #endif
 
 //===----------------------------------------------------------------------===//
@@ -100,6 +109,471 @@ static iree_status_t iree_hal_tt_set_matmul_runtime_args(
                                writer_args);
 
   return iree_ok_status();
+}
+
+static uint32_t iree_hal_tt_decode_u32_le(const uint8_t* data) {
+  return static_cast<uint32_t>(data[0]) |
+         (static_cast<uint32_t>(data[1]) << 8) |
+         (static_cast<uint32_t>(data[2]) << 16) |
+         (static_cast<uint32_t>(data[3]) << 24);
+}
+
+static uint64_t iree_hal_tt_decode_index_pair(const uint8_t* data) {
+  uint64_t lo = iree_hal_tt_decode_u32_le(data);
+  uint64_t hi = iree_hal_tt_decode_u32_le(data + 4);
+  return lo | (hi << 32);
+}
+
+static bool iree_hal_tt_is_tile_aligned(uint64_t value) {
+  return value != 0 && value % TT_TILE_WIDTH == 0;
+}
+
+static uint32_t iree_hal_tt_greatest_divisor_at_most(uint32_t value,
+                                                     uint32_t limit) {
+  if (value == 0 || limit == 0) return 1;
+  uint32_t upper = std::min(value, limit);
+  for (uint32_t candidate = upper; candidate >= 1; --candidate) {
+    if (value % candidate == 0) return candidate;
+  }
+  return 1;
+}
+
+static std::vector<uint32_t> iree_hal_tt_transpose_tiles(
+    const std::vector<uint32_t>& data, uint32_t row_tiles, uint32_t col_tiles,
+    uint32_t block_width_tiles) {
+  constexpr uint32_t kWordsPerTile = (TT_TILE_SIZE * sizeof(uint16_t)) /
+                                     sizeof(uint32_t);
+  std::vector<uint32_t> result;
+  result.reserve(data.size());
+  for (uint32_t c = 0; c < col_tiles; c += block_width_tiles) {
+    for (uint32_t r = 0; r < row_tiles; ++r) {
+      for (uint32_t k = 0; k < block_width_tiles; ++k) {
+        uint32_t tile_index = r * col_tiles + c + k;
+        uint32_t offset = tile_index * kWordsPerTile;
+        result.insert(result.end(), data.begin() + offset,
+                      data.begin() + offset + kWordsPerTile);
+      }
+    }
+  }
+  return result;
+}
+
+static iree_status_t iree_hal_tt_read_buffer_bfloat16(
+    iree_hal_buffer_t* buffer, iree_device_size_t byte_length,
+    std::vector<bfloat16>* out_values) {
+  if (!out_values) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "out_values is null");
+  }
+  out_values->assign(byte_length / sizeof(bfloat16), bfloat16(0.0f));
+
+  iree_hal_buffer_mapping_t mapping = {};
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
+      /*local_byte_offset=*/0, byte_length, &mapping));
+  std::memcpy(out_values->data(), mapping.contents.data, byte_length);
+  iree_hal_buffer_unmap_range(&mapping);
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_write_buffer_bfloat16(
+    iree_hal_buffer_t* buffer, const std::vector<bfloat16>& values) {
+  iree_device_size_t byte_length = values.size() * sizeof(bfloat16);
+  iree_hal_buffer_mapping_t mapping = {};
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
+      buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
+      /*local_byte_offset=*/0, byte_length, &mapping));
+  std::memcpy(mapping.contents.data, values.data(), byte_length);
+  iree_hal_buffer_unmap_range(&mapping);
+  return iree_ok_status();
+}
+
+static std::vector<bfloat16> iree_hal_tt_slice_row_major_matrix(
+    const std::vector<bfloat16>& matrix, uint32_t rows, uint32_t cols,
+    uint32_t row_offset, uint32_t col_offset, uint32_t slice_rows,
+    uint32_t slice_cols) {
+  std::vector<bfloat16> slice(slice_rows * slice_cols);
+  for (uint32_t r = 0; r < slice_rows; ++r) {
+    const bfloat16* src = matrix.data() + (row_offset + r) * cols + col_offset;
+    bfloat16* dst = slice.data() + r * slice_cols;
+    std::copy(src, src + slice_cols, dst);
+  }
+  return slice;
+}
+
+static void iree_hal_tt_scatter_row_major_matrix(
+    const std::vector<bfloat16>& slice, uint32_t slice_rows,
+    uint32_t slice_cols, uint32_t row_offset, uint32_t col_offset,
+    uint32_t full_cols, std::vector<bfloat16>* full_matrix) {
+  for (uint32_t r = 0; r < slice_rows; ++r) {
+    const bfloat16* src = slice.data() + r * slice_cols;
+    bfloat16* dst =
+        full_matrix->data() + (row_offset + r) * full_cols + col_offset;
+    std::copy(src, src + slice_cols, dst);
+  }
+}
+
+static std::vector<uint32_t> iree_hal_tt_stage_lhs_tiles(
+    const std::vector<bfloat16>& row_major, uint32_t rows, uint32_t cols,
+    uint32_t row_tiles, uint32_t col_tiles, uint32_t block_width_tiles) {
+  auto swizzled = tilize_swizzled(row_major, rows, cols);
+  auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
+      tt::stl::make_const_span(swizzled));
+  auto packed = pack_bfloat16_vec_into_uint32_vec(nfaces);
+  return iree_hal_tt_transpose_tiles(packed, row_tiles, col_tiles,
+                                     block_width_tiles);
+}
+
+static std::vector<uint32_t> iree_hal_tt_stage_rhs_tiles(
+    const std::vector<bfloat16>& row_major, uint32_t rows, uint32_t cols) {
+  auto swizzled = tilize_swizzled(row_major, rows, cols);
+  auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
+      tt::stl::make_const_span(swizzled));
+  return pack_bfloat16_vec_into_uint32_vec(nfaces);
+}
+
+static std::vector<bfloat16> iree_hal_tt_collect_output_tiles(
+    const std::vector<uint32_t>& packed_tiles, uint32_t rows, uint32_t cols) {
+  auto bfloat_tiles = unpack_uint32_vec_into_bfloat16_vec(packed_tiles);
+  auto swizzled = convert_layout_tile_nfaces_to_tile_swizzled(
+      tt::stl::make_const_span(bfloat_tiles));
+  return untilize_swizzled(swizzled, rows, cols);
+}
+
+static iree_status_t iree_hal_tt_decode_tiled_matmul_shape(
+    const iree_hal_tt_kernel_params_t* params,
+    const iree_hal_tt_dispatch_command_t& cmd, uint32_t* out_m_tiles,
+    uint32_t* out_n_tiles, uint32_t* out_k_tiles) {
+  if (params->builtin_m_tiles && params->builtin_n_tiles &&
+      params->builtin_k_tiles) {
+    *out_m_tiles = params->builtin_m_tiles;
+    *out_n_tiles = params->builtin_n_tiles;
+    *out_k_tiles = params->builtin_k_tiles;
+    return iree_ok_status();
+  }
+
+  if (cmd.constants_length < 8 * sizeof(uint32_t)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "dynamic tiled matmul expects 8 i32 dispatch constants, got %zu bytes",
+        cmd.constants_length);
+  }
+
+  uint64_t lhs_k = iree_hal_tt_decode_index_pair(cmd.constants + 0);
+  uint64_t rhs_k = iree_hal_tt_decode_index_pair(cmd.constants + 8);
+  uint64_t lhs_m = iree_hal_tt_decode_index_pair(cmd.constants + 16);
+  uint64_t rhs_n = iree_hal_tt_decode_index_pair(cmd.constants + 24);
+  if (lhs_k != rhs_k) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "matmul K dimensions disagree (%" PRIu64
+                            " vs %" PRIu64 ")",
+                            lhs_k, rhs_k);
+  }
+  if (!iree_hal_tt_is_tile_aligned(lhs_m) ||
+      !iree_hal_tt_is_tile_aligned(rhs_n) ||
+      !iree_hal_tt_is_tile_aligned(lhs_k)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "dynamic tiled matmul expects M/N/K to be multiples of 32");
+  }
+
+  *out_m_tiles = static_cast<uint32_t>(lhs_m / TT_TILE_HEIGHT);
+  *out_n_tiles = static_cast<uint32_t>(rhs_n / TT_TILE_WIDTH);
+  *out_k_tiles = static_cast<uint32_t>(lhs_k / TT_TILE_WIDTH);
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_execute_tiled_matmul_dispatch(
+    iree_hal_tt_device_t* device, const iree_hal_tt_kernel_params_t* params,
+    const iree_hal_tt_dispatch_command_t& cmd,
+    iree_hal_buffer_binding_table_t binding_table) {
+  auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref)
+      -> iree_hal_buffer_t* {
+    if (ref.buffer) return ref.buffer;
+    if (ref.buffer_slot < binding_table.count) {
+      return binding_table.bindings[ref.buffer_slot].buffer;
+    }
+    return nullptr;
+  };
+
+  if (cmd.binding_count < 3) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "tiled matmul expects 3 bindings");
+  }
+
+  iree_hal_buffer_t* lhs_buffer = resolve_buffer(cmd.bindings[0]);
+  iree_hal_buffer_t* rhs_buffer = resolve_buffer(cmd.bindings[1]);
+  iree_hal_buffer_t* out_buffer = resolve_buffer(cmd.bindings[2]);
+  if (!lhs_buffer || !rhs_buffer || !out_buffer) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "tiled matmul missing one or more buffers");
+  }
+
+  uint32_t m_tiles = 0;
+  uint32_t n_tiles = 0;
+  uint32_t k_tiles = 0;
+  IREE_RETURN_IF_ERROR(iree_hal_tt_decode_tiled_matmul_shape(
+      params, cmd, &m_tiles, &n_tiles, &k_tiles));
+
+  constexpr uint32_t kTileBytes = TT_TILE_SIZE * sizeof(uint16_t);
+  constexpr uint32_t kBlockWidthTiles = 1;
+  constexpr uint32_t kOutSubblockH = 1;
+  constexpr uint32_t kOutSubblockW = 1;
+
+  uint32_t lhs_rows = m_tiles * TT_TILE_HEIGHT;
+  uint32_t lhs_cols = k_tiles * TT_TILE_WIDTH;
+  uint32_t rhs_rows = k_tiles * TT_TILE_HEIGHT;
+  uint32_t rhs_cols = n_tiles * TT_TILE_WIDTH;
+  uint32_t out_rows = m_tiles * TT_TILE_HEIGHT;
+  uint32_t out_cols = n_tiles * TT_TILE_WIDTH;
+
+  iree_device_size_t expected_lhs_bytes =
+      static_cast<iree_device_size_t>(lhs_rows) * lhs_cols * sizeof(bfloat16);
+  iree_device_size_t expected_rhs_bytes =
+      static_cast<iree_device_size_t>(rhs_rows) * rhs_cols * sizeof(bfloat16);
+  iree_device_size_t expected_out_bytes =
+      static_cast<iree_device_size_t>(out_rows) * out_cols * sizeof(bfloat16);
+
+  if (iree_hal_buffer_byte_length(lhs_buffer) != expected_lhs_bytes ||
+      iree_hal_buffer_byte_length(rhs_buffer) != expected_rhs_bytes ||
+      iree_hal_buffer_byte_length(out_buffer) != expected_out_bytes) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "tiled matmul buffer sizes do not match M/N/K"
+        " (lhs=%" PRIhsz " rhs=%" PRIhsz " out=%" PRIhsz ")",
+        iree_hal_buffer_byte_length(lhs_buffer),
+        iree_hal_buffer_byte_length(rhs_buffer),
+        iree_hal_buffer_byte_length(out_buffer));
+  }
+
+  tt::tt_metal::IDevice* idevice = iree_hal_tt_device_idevice(device);
+  if (!idevice) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "TT-Metal device not initialized");
+  }
+
+  auto grid = idevice->compute_with_storage_grid_size();
+  uint32_t num_cores_r =
+      iree_hal_tt_greatest_divisor_at_most(m_tiles, grid.y);
+  uint32_t num_cores_c =
+      iree_hal_tt_greatest_divisor_at_most(n_tiles, grid.x);
+  uint32_t per_core_m_tiles = m_tiles / num_cores_r;
+  uint32_t per_core_n_tiles = n_tiles / num_cores_c;
+  uint32_t per_core_count = num_cores_r * num_cores_c;
+
+  std::vector<bfloat16> lhs_row_major;
+  std::vector<bfloat16> rhs_row_major;
+  IREE_RETURN_IF_ERROR(iree_hal_tt_read_buffer_bfloat16(
+      lhs_buffer, expected_lhs_bytes, &lhs_row_major));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_read_buffer_bfloat16(
+      rhs_buffer, expected_rhs_bytes, &rhs_row_major));
+
+  try {
+    std::vector<std::shared_ptr<tt::tt_metal::Buffer>> lhs_scratch(
+        per_core_count);
+    std::vector<std::shared_ptr<tt::tt_metal::Buffer>> rhs_scratch(
+        per_core_count);
+    std::vector<std::shared_ptr<tt::tt_metal::Buffer>> out_scratch(
+        per_core_count);
+
+    for (uint32_t core_index = 0; core_index < per_core_count; ++core_index) {
+      iree_device_size_t lhs_size = static_cast<iree_device_size_t>(per_core_m_tiles) *
+                                    k_tiles * kTileBytes;
+      iree_device_size_t rhs_size = static_cast<iree_device_size_t>(k_tiles) *
+                                    per_core_n_tiles * kTileBytes;
+      iree_device_size_t out_size =
+          static_cast<iree_device_size_t>(per_core_m_tiles) * per_core_n_tiles *
+          kTileBytes;
+      lhs_scratch[core_index] = tt::tt_metal::CreateBuffer(
+          tt::tt_metal::InterleavedBufferConfig{
+              .device = idevice,
+              .size = static_cast<uint32_t>(lhs_size),
+              .page_size = static_cast<uint32_t>(lhs_size),
+              .buffer_type = tt::tt_metal::BufferType::DRAM,
+          });
+      rhs_scratch[core_index] = tt::tt_metal::CreateBuffer(
+          tt::tt_metal::InterleavedBufferConfig{
+              .device = idevice,
+              .size = static_cast<uint32_t>(rhs_size),
+              .page_size = static_cast<uint32_t>(rhs_size),
+              .buffer_type = tt::tt_metal::BufferType::DRAM,
+          });
+      out_scratch[core_index] = tt::tt_metal::CreateBuffer(
+          tt::tt_metal::InterleavedBufferConfig{
+              .device = idevice,
+              .size = static_cast<uint32_t>(out_size),
+              .page_size = static_cast<uint32_t>(out_size),
+              .buffer_type = tt::tt_metal::BufferType::DRAM,
+          });
+    }
+
+    for (uint32_t core_r = 0; core_r < num_cores_r; ++core_r) {
+      for (uint32_t core_c = 0; core_c < num_cores_c; ++core_c) {
+        uint32_t core_index = core_r * num_cores_c + core_c;
+        uint32_t lhs_row_offset = core_r * per_core_m_tiles * TT_TILE_HEIGHT;
+        uint32_t rhs_col_offset = core_c * per_core_n_tiles * TT_TILE_WIDTH;
+
+        auto lhs_slice = iree_hal_tt_slice_row_major_matrix(
+            lhs_row_major, lhs_rows, lhs_cols, lhs_row_offset,
+            /*col_offset=*/0, per_core_m_tiles * TT_TILE_HEIGHT, lhs_cols);
+        auto rhs_slice = iree_hal_tt_slice_row_major_matrix(
+            rhs_row_major, rhs_rows, rhs_cols, /*row_offset=*/0, rhs_col_offset,
+            rhs_rows, per_core_n_tiles * TT_TILE_WIDTH);
+
+        auto lhs_packed = iree_hal_tt_stage_lhs_tiles(
+            lhs_slice, per_core_m_tiles * TT_TILE_HEIGHT, lhs_cols,
+            per_core_m_tiles, k_tiles, kBlockWidthTiles);
+        auto rhs_packed = iree_hal_tt_stage_rhs_tiles(
+            rhs_slice, rhs_rows, per_core_n_tiles * TT_TILE_WIDTH);
+
+        tt::tt_metal::detail::WriteToBuffer(
+            lhs_scratch[core_index], lhs_packed);
+        tt::tt_metal::detail::WriteToBuffer(
+            rhs_scratch[core_index], rhs_packed);
+      }
+    }
+
+    tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
+    tt::tt_metal::CoreRange all_cores({0, 0},
+                                      {num_cores_c - 1, num_cores_r - 1});
+    tt::tt_metal::CoreRangeSet all_core_set(
+        std::set<tt::tt_metal::CoreRange>{all_cores});
+
+    for (uint32_t core_r = 0; core_r < num_cores_r; ++core_r) {
+      for (uint32_t core_c = 0; core_c < num_cores_c; ++core_c) {
+        tt::tt_metal::CoreCoord core = {core_c, core_r};
+        uint32_t cb0_tiles = per_core_m_tiles * kBlockWidthTiles * 2;
+        uint32_t cb1_tiles = per_core_n_tiles * kBlockWidthTiles * 2;
+        tt::tt_metal::CreateCircularBuffer(
+            program, core,
+            tt::tt_metal::CircularBufferConfig(
+                cb0_tiles * kTileBytes,
+                {{tt::CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(tt::CBIndex::c_0, kTileBytes));
+        tt::tt_metal::CreateCircularBuffer(
+            program, core,
+            tt::tt_metal::CircularBufferConfig(
+                cb1_tiles * kTileBytes,
+                {{tt::CBIndex::c_1, tt::DataFormat::Float16_b}})
+                .set_page_size(tt::CBIndex::c_1, kTileBytes));
+
+        std::map<uint8_t, tt::DataFormat> output_data_format = {
+            {tt::CBIndex::c_16, tt::DataFormat::Float16_b},
+            {tt::CBIndex::c_24, tt::DataFormat::Float16_b},
+        };
+        tt::tt_metal::CoreRangeSet one_core_set(
+            std::set<tt::tt_metal::CoreRange>{
+                tt::tt_metal::CoreRange(core, core)});
+        tt::tt_metal::CreateCircularBuffer(
+            program, one_core_set,
+            tt::tt_metal::CircularBufferConfig(
+                per_core_m_tiles * per_core_n_tiles * kTileBytes,
+                output_data_format)
+                .set_page_size(tt::CBIndex::c_16, kTileBytes)
+                .set_page_size(tt::CBIndex::c_24, kTileBytes));
+      }
+    }
+
+    auto reader_kernel = tt::tt_metal::CreateKernel(
+        program,
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_blocked.cpp",
+        all_core_set,
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt::tt_metal::NOC::RISCV_1_default});
+    auto writer_kernel = tt::tt_metal::CreateKernel(
+        program,
+        "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_unswizzle.cpp",
+        all_core_set,
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+            .noc = tt::tt_metal::NOC::RISCV_0_default});
+
+    std::vector<uint32_t> compute_kernel_args = {
+        kBlockWidthTiles,
+        per_core_m_tiles / kOutSubblockH,
+        per_core_m_tiles,
+        kOutSubblockH * kBlockWidthTiles,
+        per_core_n_tiles / kOutSubblockW,
+        per_core_n_tiles,
+        per_core_n_tiles,
+        k_tiles / kBlockWidthTiles,
+        kOutSubblockH,
+        kOutSubblockW,
+        kOutSubblockH * kOutSubblockW,
+    };
+    auto compute_kernel = tt::tt_metal::CreateKernel(
+        program,
+        "tests/tt_metal/tt_metal/test_kernels/compute/matmul_large_block_zm.cpp",
+        all_core_set,
+        tt::tt_metal::ComputeConfig{.compile_args = compute_kernel_args});
+    (void)compute_kernel;
+
+    for (uint32_t core_r = 0; core_r < num_cores_r; ++core_r) {
+      for (uint32_t core_c = 0; core_c < num_cores_c; ++core_c) {
+        uint32_t core_index = core_r * num_cores_c + core_c;
+        tt::tt_metal::CoreCoord core = {core_c, core_r};
+        std::array<uint32_t, 9> reader_args = {
+            lhs_scratch[core_index]->address(),
+            0,
+            rhs_scratch[core_index]->address(),
+            0,
+            k_tiles / kBlockWidthTiles,
+            per_core_m_tiles * kBlockWidthTiles,
+            per_core_n_tiles * kBlockWidthTiles,
+            per_core_m_tiles * kBlockWidthTiles * kTileBytes,
+            per_core_n_tiles * kBlockWidthTiles * kTileBytes,
+        };
+        std::array<uint32_t, 9> writer_args = {
+            out_scratch[core_index]->address(),
+            0,
+            kOutSubblockH,
+            kOutSubblockW,
+            per_core_m_tiles / kOutSubblockH,
+            per_core_n_tiles / kOutSubblockW,
+            kOutSubblockW * kTileBytes * (per_core_n_tiles / kOutSubblockW),
+            kOutSubblockH * kOutSubblockW * kTileBytes *
+                (per_core_n_tiles / kOutSubblockW),
+            kOutSubblockW * kTileBytes,
+        };
+        tt::tt_metal::SetRuntimeArgs(program, reader_kernel, core, reader_args);
+        tt::tt_metal::SetRuntimeArgs(program, writer_kernel, core, writer_args);
+      }
+    }
+
+    tt::tt_metal::distributed::MeshWorkload workload;
+    auto device_range = tt::tt_metal::distributed::MeshCoordinateRange(
+        device->mesh_device->shape());
+    workload.add_program(device_range, std::move(program));
+    tt::tt_metal::distributed::EnqueueMeshWorkload(
+        *device->mesh_cq, workload, /*blocking=*/true);
+
+    std::vector<bfloat16> out_row_major(out_rows * out_cols, bfloat16(0.0f));
+    for (uint32_t core_r = 0; core_r < num_cores_r; ++core_r) {
+      for (uint32_t core_c = 0; core_c < num_cores_c; ++core_c) {
+        uint32_t core_index = core_r * num_cores_c + core_c;
+        std::vector<uint32_t> packed_output;
+        tt::tt_metal::detail::ReadFromBuffer(
+            out_scratch[core_index], packed_output);
+        auto slice_row_major = iree_hal_tt_collect_output_tiles(
+            packed_output, per_core_m_tiles * TT_TILE_HEIGHT,
+            per_core_n_tiles * TT_TILE_WIDTH);
+        iree_hal_tt_scatter_row_major_matrix(
+            slice_row_major, per_core_m_tiles * TT_TILE_HEIGHT,
+            per_core_n_tiles * TT_TILE_WIDTH,
+            core_r * per_core_m_tiles * TT_TILE_HEIGHT,
+            core_c * per_core_n_tiles * TT_TILE_WIDTH, out_cols,
+            &out_row_major);
+      }
+    }
+
+    iree_status_t write_status =
+        iree_hal_tt_write_buffer_bfloat16(out_buffer, out_row_major);
+    return write_status;
+  } catch (const std::exception& e) {
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "tiled matmul setup failed: %s", e.what());
+  }
 }
 #endif
 
@@ -575,17 +1049,14 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   auto* device = iree_hal_tt_device_cast(base_device);
 
 #ifndef TT_IREE_ENABLE_MOCK
-  // Get MeshDevice and MeshCommandQueue
-  tt::tt_metal::distributed::MeshDevice* mesh_device = device->mesh_device.get();
-  tt::tt_metal::distributed::MeshCommandQueue& mesh_cq = *device->mesh_cq;
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(
+      wait_semaphores, iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT));
 
-  // Get recorded commands from command buffer
   iree_host_size_t command_count = 0;
   iree_hal_tt_command_t* commands =
       iree_hal_tt_command_buffer_get_commands(command_buffer, &command_count);
 
   if (command_count == 0) {
-    // No commands to execute, just signal semaphores
     for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
       IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
           signal_semaphores.semaphores[i],
@@ -594,78 +1065,74 @@ static iree_status_t iree_hal_tt_device_queue_execute(
     return iree_ok_status();
   }
 
-  // Create MeshWorkload for this execution batch
-  tt::tt_metal::distributed::MeshWorkload workload;
-
-  // Device range for unit mesh (single device at coordinate {0,0})
-  tt::tt_metal::distributed::MeshCoordinateRange device_range =
-      tt::tt_metal::distributed::MeshCoordinateRange(mesh_device->shape());
-
-  // Track dispatched params so we can restore programs after execution.
-  iree_hal_tt_kernel_params_t* dispatched_params = nullptr;
-
-  // Phase 1: process dispatch commands and build workload
-  bool has_dispatch = false;
   for (iree_host_size_t i = 0; i < command_count; ++i) {
     if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH) {
-      has_dispatch = true;
       auto& cmd = commands[i].dispatch;
-
-      // Lookup kernel params (mutable: we need write access to restore program)
       iree_hal_tt_kernel_params_t* params = nullptr;
       IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params_mutable(
           cmd.executable, cmd.export_ordinal, &params));
 
-      if (!params || !params->program) {
+      if (!params) {
         return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
-                               "executable export ordinal %d has no program",
-                               cmd.export_ordinal);
+                                "executable export ordinal %d has no params",
+                                cmd.export_ordinal);
       }
 
-      tt::tt_metal::Program* program = static_cast<tt::tt_metal::Program*>(params->program);
+      if (params->builtin_program ==
+          TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED) {
+        IREE_RETURN_IF_ERROR(iree_hal_tt_execute_tiled_matmul_dispatch(
+            device, params, cmd, binding_table));
+        continue;
+      }
 
-      // Set runtime arguments from bindings (v3.9.0 API)
-      tt::tt_metal::CoreCoord core = {0, 0};  // Using single core for PoC
+      if (!params->program) {
+        return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                                "executable export ordinal %d has no program",
+                                cmd.export_ordinal);
+      }
 
-      // Resolve a binding ref to its actual iree_hal_buffer_t*.
-      // If ref.buffer is non-NULL it's a direct binding; otherwise look up
-      // the buffer from the binding_table using ref.buffer_slot.
-      auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref) -> iree_hal_buffer_t* {
+      auto resolve_buffer = [&](const iree_hal_buffer_ref_t& ref)
+          -> iree_hal_buffer_t* {
         if (ref.buffer) return ref.buffer;
-        if (ref.buffer_slot < binding_table.count)
+        if (ref.buffer_slot < binding_table.count) {
           return binding_table.bindings[ref.buffer_slot].buffer;
+        }
         return nullptr;
       };
 
-      // Extract buffer addresses from bindings.
-      // Expected layout: bindings = [input0, input1, output]
-      uint32_t in0_addr = 0, in1_addr = 0, out_addr = 0;
-      uint32_t in0_byte_length = 0, in1_byte_length = 0, out_byte_length = 0;
-
+      uint32_t in0_addr = 0;
+      uint32_t in1_addr = 0;
+      uint32_t out_addr = 0;
+      uint32_t in0_byte_length = 0;
+      uint32_t in1_byte_length = 0;
+      uint32_t out_byte_length = 0;
       if (cmd.binding_count > 0) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[0]);
         if (buf) {
           in0_addr = iree_hal_tt_buffer_device_address(buf);
-          in0_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
+          in0_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
         }
       }
       if (cmd.binding_count > 1) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[1]);
         if (buf) {
           in1_addr = iree_hal_tt_buffer_device_address(buf);
-          in1_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
+          in1_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
         }
       }
       if (cmd.binding_count > 2) {
         iree_hal_buffer_t* buf = resolve_buffer(cmd.bindings[2]);
         if (buf) {
           out_addr = iree_hal_tt_buffer_device_address(buf);
-          out_byte_length = (uint32_t)iree_hal_buffer_byte_length(buf);
+          out_byte_length = static_cast<uint32_t>(iree_hal_buffer_byte_length(buf));
         }
       }
 
+      tt::tt_metal::Program* program =
+          static_cast<tt::tt_metal::Program*>(params->program);
+      tt::tt_metal::CoreCoord core = {0, 0};
+      iree_status_t status = iree_ok_status();
       try {
-        iree_status_t status = iree_ok_status();
         switch (params->builtin_program) {
           case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
             status = iree_hal_tt_set_add_runtime_args(
@@ -684,57 +1151,39 @@ static iree_status_t iree_hal_tt_device_queue_execute(
                 params->builtin_program);
             break;
         }
-        IREE_RETURN_IF_ERROR(status);
       } catch (const std::exception& e) {
         return iree_make_status(IREE_STATUS_INTERNAL,
-                               "Failed to set runtime args: %s", e.what());
+                                "failed to set runtime args: %s", e.what());
       }
+      IREE_RETURN_IF_ERROR(status);
 
-      // Move program into workload (required by MeshWorkload API).
-      // We restore it after execution completes.
+      tt::tt_metal::distributed::MeshWorkload workload;
+      auto device_range = tt::tt_metal::distributed::MeshCoordinateRange(
+          device->mesh_device->shape());
       try {
         workload.add_program(device_range, std::move(*program));
-        dispatched_params = params;
-      } catch (const std::exception& e) {
-        return iree_make_status(IREE_STATUS_INTERNAL,
-                               "Failed to add program to workload: %s", e.what());
-      }
-    }
-  }
-
-  // Execute the workload (blocking) only if we have dispatch commands
-  if (has_dispatch) {
-    try {
-      tt::tt_metal::distributed::EnqueueMeshWorkload(mesh_cq, workload, /*blocking=*/true);
-    } catch (const std::exception& e) {
-      if (dispatched_params) {
+        tt::tt_metal::distributed::EnqueueMeshWorkload(
+            *device->mesh_cq, workload, /*blocking=*/true);
         auto& programs = workload.get_programs();
         if (!programs.empty()) {
-          *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
-              std::move(programs.begin()->second);
+          *program = std::move(programs.begin()->second);
         }
+      } catch (const std::exception& e) {
+        auto& programs = workload.get_programs();
+        if (!programs.empty()) {
+          *program = std::move(programs.begin()->second);
+        }
+        return iree_make_status(IREE_STATUS_INTERNAL,
+                                "dispatch execution failed: %s", e.what());
       }
-      return iree_make_status(IREE_STATUS_INTERNAL,
-                             "Failed to execute workload: %s", e.what());
+      continue;
     }
 
-    // Restore program back from workload so the executable can be re-dispatched.
-    if (dispatched_params) {
-      auto& programs = workload.get_programs();
-      if (!programs.empty()) {
-        *static_cast<tt::tt_metal::Program*>(dispatched_params->program) =
-            std::move(programs.begin()->second);
-      }
-    }
-  }
-
-  // Phase 2: execute copy commands (host-mediated device-to-device copy)
-  for (iree_host_size_t i = 0; i < command_count; ++i) {
     if (commands[i].type == IREE_HAL_TT_COMMAND_TYPE_COPY) {
       auto& cmd = commands[i].copy;
       iree_hal_buffer_t* src_buf = cmd.source_ref.buffer;
       iree_hal_buffer_t* dst_buf = cmd.target_ref.buffer;
-      if (!src_buf || !dst_buf) { continue; }
+      if (!src_buf || !dst_buf) continue;
 
       iree_device_size_t length = cmd.source_ref.length;
       if (length == IREE_HAL_WHOLE_BUFFER) {
@@ -745,34 +1194,33 @@ static iree_status_t iree_hal_tt_device_queue_execute(
       if (length == 0) continue;
 
       iree_hal_buffer_mapping_t src_mapping = {};
-      iree_status_t copy_status = iree_hal_buffer_map_range(
+      IREE_RETURN_IF_ERROR(iree_hal_buffer_map_range(
           src_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ,
-          cmd.source_ref.offset, length, &src_mapping);
-      if (!iree_status_is_ok(copy_status)) return copy_status;
-
+          cmd.source_ref.offset, length, &src_mapping));
       iree_hal_buffer_mapping_t dst_mapping = {};
-      copy_status = iree_hal_buffer_map_range(
+      iree_status_t copy_status = iree_hal_buffer_map_range(
           dst_buf, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_WRITE,
           cmd.target_ref.offset, length, &dst_mapping);
       if (iree_status_is_ok(copy_status)) {
-        iree_device_size_t copy_len =
-            std::min(length, (iree_device_size_t)dst_mapping.contents.data_length);
+        iree_device_size_t copy_len = std::min(
+            length, static_cast<iree_device_size_t>(dst_mapping.contents.data_length));
         std::memcpy(dst_mapping.contents.data, src_mapping.contents.data, copy_len);
         iree_hal_buffer_unmap_range(&dst_mapping);
       }
       iree_hal_buffer_unmap_range(&src_mapping);
       IREE_RETURN_IF_ERROR(copy_status);
+      continue;
     }
   }
 
-  // Signal completion semaphores
   for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
     IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
         signal_semaphores.semaphores[i],
         signal_semaphores.payload_values[i]));
   }
 #else
-  // Mock mode - just signal completion
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_list_wait(
+      wait_semaphores, iree_infinite_timeout(), IREE_HAL_WAIT_FLAG_DEFAULT));
   for (iree_host_size_t i = 0; i < signal_semaphores.count; ++i) {
     IREE_RETURN_IF_ERROR(iree_hal_semaphore_signal(
         signal_semaphores.semaphores[i],

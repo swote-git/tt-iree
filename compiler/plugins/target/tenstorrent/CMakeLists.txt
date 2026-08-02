@@ -7,6 +7,8 @@
 message(STATUS "tt-iree: Configuring Tenstorrent compiler target plugin")
 
 add_library(TenstorrentTarget STATIC
+  TenstorrentPreprocessingPass.h
+  TenstorrentPreprocessingPass.cpp
   TenstorrentTarget.h
   TenstorrentTarget.cpp
   TenstorrentRegistration.cpp
@@ -26,6 +28,7 @@ target_link_libraries(TenstorrentTarget
     iree_compiler_Codegen_Common_Common
     iree_compiler_Dialect_HAL_Target_Target
     iree_compiler_PluginAPI_PluginAPI
+    MLIRPass
     MLIRIR
     MLIRSupport
     tt_executable_builder_util

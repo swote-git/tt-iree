@@ -37,6 +37,10 @@ enum BuiltinProgram : uint32 {
 
   // Narrow M1 path: one static 32x32x32 bf16 matmul on a single core.
   BF16_MATMUL_32X32X32 = 2,
+
+  // Correctness-first tiled bf16 matmul path. Static shapes may be encoded
+  // in EntryPointDef, and dynamic shapes are supplied via dispatch constants.
+  BF16_MATMUL_TILED = 3,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +73,13 @@ table EntryPointDef {
   // --- Tenstorrent dispatch routing (Phase A) ---
 
   builtin:BuiltinProgram = CUSTOM_SFPI_ADD;
+
+  // Static tiled matmul metadata expressed in 32x32 tile counts.
+  // These are 0 when the builtin does not use them or when runtime dispatch
+  // constants provide the shape dynamically.
+  builtin_m_tiles:uint32 = 0;
+  builtin_n_tiles:uint32 = 0;
+  builtin_k_tiles:uint32 = 0;
 
   // --- Phase B extension point (TT-Metal JIT) ---
   // ttmetal_kernel:TTMetalKernelBundle;  // kernel source + CB config + core range

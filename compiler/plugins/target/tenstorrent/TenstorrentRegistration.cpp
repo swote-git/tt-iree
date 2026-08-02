@@ -8,9 +8,11 @@
 //   2. Activation: --iree-hal-target-backends=tenstorrent triggers session
 //
 #include "TenstorrentTarget.h"
+#include "TenstorrentPreprocessingPass.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
 #include "iree/compiler/Utils/OptionUtils.h"
+#include "mlir/Pass/PassManager.h"
 
 namespace mlir::iree_compiler {
 
@@ -49,6 +51,12 @@ struct TenstorrentSession
     : public PluginSession<TenstorrentSession,
                            TenstorrentOptions,
                            PluginActivationPolicy::DefaultActivated> {
+  static void registerPasses() {}
+
+  void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
+    passManager.addPass(
+        IREE::HAL::createTenstorrentAnnotateMatmulPreprocessingPass());
+  }
 
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) {
     IREE::HAL::TenstorrentTargetOptions opts;

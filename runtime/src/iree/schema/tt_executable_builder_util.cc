@@ -49,6 +49,9 @@ iree_status_t tt_iree_build_ttex_executable_def(
     ns(EntryPointDef_workgroup_size_y_add(&builder, ep->workgroup_size[1]));
     ns(EntryPointDef_workgroup_size_z_add(&builder, ep->workgroup_size[2]));
     ns(EntryPointDef_builtin_add(&builder, ep->builtin_program));
+    ns(EntryPointDef_builtin_m_tiles_add(&builder, ep->builtin_m_tiles));
+    ns(EntryPointDef_builtin_n_tiles_add(&builder, ep->builtin_n_tiles));
+    ns(EntryPointDef_builtin_k_tiles_add(&builder, ep->builtin_k_tiles));
     ns(ExecutableDef_entry_points_push_end(&builder));
   }
   ns(ExecutableDef_entry_points_end(&builder));

@@ -216,6 +216,11 @@ static iree_status_t iree_hal_tt_create_program_for_builtin(
         return iree_hal_tt_create_program_for_custom_sfpi_add(params);
       case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
         return iree_hal_tt_create_program_for_bf16_matmul_32x32x32(params);
+      case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
+        // The tiled matmul path builds a program at dispatch time because
+        // shape and core-grid selection may depend on runtime constants.
+        params->program = nullptr;
+        return iree_ok_status();
       default:
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                                 "unsupported TTEX builtin program %u",
@@ -404,6 +409,9 @@ static iree_status_t iree_hal_tt_executable_create_legacy(
   ep->workgroup_size[1] = 1;
   ep->workgroup_size[2] = 1;
   ep->builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
+  ep->builtin_m_tiles = 0;
+  ep->builtin_n_tiles = 0;
+  ep->builtin_k_tiles = 0;
 
 #ifndef TT_IREE_ENABLE_MOCK
   iree_status_t status = iree_hal_tt_create_program_for_builtin(
@@ -502,6 +510,12 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
 
     // Dispatch routing
     ep->builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
+    ep->builtin_m_tiles = ttex_ns(EntryPointDef_builtin_m_tiles(fb_ep));
+    ep->builtin_n_tiles = ttex_ns(EntryPointDef_builtin_n_tiles(fb_ep));
+    ep->builtin_k_tiles = ttex_ns(EntryPointDef_builtin_k_tiles(fb_ep));
+    ep->kernel_params.builtin_m_tiles = ep->builtin_m_tiles;
+    ep->kernel_params.builtin_n_tiles = ep->builtin_n_tiles;
+    ep->kernel_params.builtin_k_tiles = ep->builtin_k_tiles;
 
     // Create TT-Metal program for this builtin
 #ifndef TT_IREE_ENABLE_MOCK

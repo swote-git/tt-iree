@@ -3,6 +3,7 @@
 //
 // End-to-end dispatch test: bfloat16 tile addition on P100A hardware.
 
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -27,16 +28,21 @@ using DispatchTest = TenstorrentTestBase;
 
 static iree_status_t CreateBuiltinTtexExecutable(
     iree_hal_device_t* device, iree_allocator_t host_allocator,
-    uint32_t builtin_program, iree_hal_executable_t** out_executable) {
+    uint32_t builtin_program, uint16_t constant_count,
+    uint32_t builtin_m_tiles, uint32_t builtin_n_tiles,
+    uint32_t builtin_k_tiles, iree_hal_executable_t** out_executable) {
   tt_iree_ttex_entry_point_desc_t ep = {};
   ep.name = "builtin_dispatch_0";
-  ep.constant_count = 0;
+  ep.constant_count = constant_count;
   ep.binding_count = 3;
   ep.flags = 0;
   ep.workgroup_size[0] = 1;
   ep.workgroup_size[1] = 1;
   ep.workgroup_size[2] = 1;
   ep.builtin_program = builtin_program;
+  ep.builtin_m_tiles = builtin_m_tiles;
+  ep.builtin_n_tiles = builtin_n_tiles;
+  ep.builtin_k_tiles = builtin_k_tiles;
 
   iree_byte_span_t data = {0};
   IREE_RETURN_IF_ERROR(
@@ -311,7 +317,9 @@ TEST_F(DispatchTest, BuiltinMatmulBfloat16ViaTTEX) {
   iree_hal_executable_t* executable_ptr = nullptr;
   iree_status_t exec_status = CreateBuiltinTtexExecutable(
       device_, host_allocator(),
-      TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32, &executable_ptr);
+      TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32,
+      /*constant_count=*/0, /*builtin_m_tiles=*/1, /*builtin_n_tiles=*/1,
+      /*builtin_k_tiles=*/1, &executable_ptr);
   if (!iree_status_is_ok(exec_status)) {
     iree_status_ignore(exec_status);
     GTEST_SKIP() << "matmul builtin kernel compilation not available";
@@ -380,6 +388,176 @@ TEST_F(DispatchTest, BuiltinMatmulBfloat16ViaTTEX) {
   for (uint32_t i = 0; i < kElementsPerTile; ++i) {
     ASSERT_NEAR(static_cast<float>(host_out[i]), kExpected, kEps)
         << "matmul mismatch at " << i;
+  }
+#endif  // !TT_IREE_ENABLE_MOCK
+}
+
+TEST_F(DispatchTest, BuiltinTiledMatmulBfloat16ViaTTEX) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  iree_status_t exec_status = CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/0, /*builtin_m_tiles=*/2, /*builtin_n_tiles=*/2,
+      /*builtin_k_tiles=*/2, &executable_ptr);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "tiled matmul builtin kernel compilation not available";
+  }
+  executable.assign(executable_ptr);
+
+#ifndef TT_IREE_ENABLE_MOCK
+  constexpr uint32_t kRows = 64;
+  constexpr uint32_t kCols = 64;
+  constexpr uint32_t kElementCount = kRows * kCols;
+  constexpr uint32_t kBufferSizeBytes = kElementCount * sizeof(bfloat16);
+
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree::vm::ref<iree_hal_buffer_t> lhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> rhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> out_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &lhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &rhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &out_buffer));
+
+  std::vector<bfloat16> lhs(kElementCount, bfloat16(1.0f));
+  std::vector<bfloat16> rhs(kElementCount, bfloat16(2.0f));
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(lhs_buffer.get()), lhs);
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(rhs_buffer.get()), rhs);
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, 0, 16, &cmd_buffer));
+
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  iree_hal_buffer_ref_t bindings[3] = {
+      iree_hal_make_buffer_ref(lhs_buffer.get(), 0, kBufferSizeBytes),
+      iree_hal_make_buffer_ref(rhs_buffer.get(), 0, kBufferSizeBytes),
+      iree_hal_make_buffer_ref(out_buffer.get(), 0, kBufferSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  iree_const_byte_span_t constants = {0};
+  iree_hal_buffer_ref_list_t binding_list = {3, bindings};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      constants, binding_list, /*flags=*/0));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_sema = {0};
+  iree_hal_buffer_binding_table_t no_bt = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, 0, no_sema, no_sema, cmd_buffer.get(), no_bt, 0));
+
+  std::vector<bfloat16> host_out(kElementCount);
+  tt::tt_metal::detail::ReadFromBuffer(
+      *iree_hal_tt_buffer_handle(out_buffer.get()), host_out);
+
+  constexpr float kExpected = 128.0f;
+  constexpr float kEps = 0.5f;
+  for (uint32_t i = 0; i < kElementCount; ++i) {
+    ASSERT_NEAR(static_cast<float>(host_out[i]), kExpected, kEps)
+        << "tiled matmul mismatch at " << i;
+  }
+#endif  // !TT_IREE_ENABLE_MOCK
+}
+
+TEST_F(DispatchTest, BuiltinDynamicTiledMatmulBfloat16ViaTTEX) {
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t* executable_ptr = nullptr;
+  iree_status_t exec_status = CreateBuiltinTtexExecutable(
+      device_, host_allocator(), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      /*constant_count=*/8, /*builtin_m_tiles=*/0, /*builtin_n_tiles=*/0,
+      /*builtin_k_tiles=*/0, &executable_ptr);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "dynamic tiled matmul builtin kernel compilation not "
+                    "available";
+  }
+  executable.assign(executable_ptr);
+
+#ifndef TT_IREE_ENABLE_MOCK
+  constexpr uint32_t kRows = 64;
+  constexpr uint32_t kCols = 64;
+  constexpr uint32_t kElementCount = kRows * kCols;
+  constexpr uint32_t kBufferSizeBytes = kElementCount * sizeof(bfloat16);
+
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+
+  iree::vm::ref<iree_hal_buffer_t> lhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> rhs_buffer;
+  iree::vm::ref<iree_hal_buffer_t> out_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &lhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &rhs_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBufferSizeBytes, &out_buffer));
+
+  std::vector<bfloat16> lhs(kElementCount, bfloat16(1.0f));
+  std::vector<bfloat16> rhs(kElementCount, bfloat16(2.0f));
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(lhs_buffer.get()), lhs);
+  tt::tt_metal::detail::WriteToBuffer(
+      *iree_hal_tt_buffer_handle(rhs_buffer.get()), rhs);
+
+  std::array<uint32_t, 8> shape_constants = {
+      64u, 0u,  // lhs_k
+      64u, 0u,  // rhs_k
+      64u, 0u,  // lhs_m
+      64u, 0u,  // rhs_n
+  };
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, 0, 16, &cmd_buffer));
+
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  iree_hal_buffer_ref_t bindings[3] = {
+      iree_hal_make_buffer_ref(lhs_buffer.get(), 0, kBufferSizeBytes),
+      iree_hal_make_buffer_ref(rhs_buffer.get(), 0, kBufferSizeBytes),
+      iree_hal_make_buffer_ref(out_buffer.get(), 0, kBufferSizeBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
+  iree_const_byte_span_t constants = iree_make_const_byte_span(
+      reinterpret_cast<const uint8_t*>(shape_constants.data()),
+      sizeof(shape_constants));
+  iree_hal_buffer_ref_list_t binding_list = {3, bindings};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      constants, binding_list, /*flags=*/0));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_sema = {0};
+  iree_hal_buffer_binding_table_t no_bt = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, 0, no_sema, no_sema, cmd_buffer.get(), no_bt, 0));
+
+  std::vector<bfloat16> host_out(kElementCount);
+  tt::tt_metal::detail::ReadFromBuffer(
+      *iree_hal_tt_buffer_handle(out_buffer.get()), host_out);
+
+  constexpr float kExpected = 128.0f;
+  constexpr float kEps = 0.5f;
+  for (uint32_t i = 0; i < kElementCount; ++i) {
+    ASSERT_NEAR(static_cast<float>(host_out[i]), kExpected, kEps)
+        << "dynamic tiled matmul mismatch at " << i;
   }
 #endif  // !TT_IREE_ENABLE_MOCK
 }

@@ -74,10 +74,13 @@ TEST(TtexSchemaTest, BuildVerifyMultiEntry) {
 
   eps[1].name = "dispatch_1_matmul";
   eps[1].binding_count = 3;
-  eps[1].builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32;
+  eps[1].builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
   eps[1].workgroup_size[0] = 4;
   eps[1].workgroup_size[1] = 2;
   eps[1].workgroup_size[2] = 1;
+  eps[1].builtin_m_tiles = 2;
+  eps[1].builtin_n_tiles = 3;
+  eps[1].builtin_k_tiles = 4;
 
   iree_byte_span_t data = {0};
   IREE_ASSERT_OK(tt_iree_build_ttex_executable_def(alloc, 2, eps, &data));
@@ -92,9 +95,12 @@ TEST(TtexSchemaTest, BuildVerifyMultiEntry) {
   ttex_ns(EntryPointDef_table_t) ep1 = ttex_ns(EntryPointDef_vec_at(parsed_eps, 1));
   ASSERT_STREQ(ttex_ns(EntryPointDef_name(ep1)), "dispatch_1_matmul");
   ASSERT_EQ(ttex_ns(EntryPointDef_builtin(ep1)),
-            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32);
+            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED);
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_x(ep1)), 4u);
   ASSERT_EQ(ttex_ns(EntryPointDef_workgroup_size_y(ep1)), 2u);
+  ASSERT_EQ(ttex_ns(EntryPointDef_builtin_m_tiles(ep1)), 2u);
+  ASSERT_EQ(ttex_ns(EntryPointDef_builtin_n_tiles(ep1)), 3u);
+  ASSERT_EQ(ttex_ns(EntryPointDef_builtin_k_tiles(ep1)), 4u);
 
   iree_allocator_free(alloc, data.data);
 }

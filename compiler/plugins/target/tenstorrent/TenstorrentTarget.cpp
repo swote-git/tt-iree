@@ -33,7 +33,24 @@ static bool isStaticBf16TensorOfShape(Type type, ArrayRef<int64_t> shape) {
   return rankedType.getShape() == shape;
 }
 
-static FailureOr<uint32_t> inferBuiltinProgram(func::FuncOp funcOp) {
+static bool isRank2Bf16Tensor(Type type) {
+  auto rankedType = dyn_cast<RankedTensorType>(type);
+  return rankedType && rankedType.getRank() == 2 &&
+         rankedType.getElementType().isBF16();
+}
+
+static bool isDynamicDimOrTileAligned(int64_t dim) {
+  return ShapedType::isDynamic(dim) || (dim > 0 && dim % 32 == 0);
+}
+
+struct BuiltinSelection {
+  uint32_t program = 0;
+  uint32_t mTiles = 0;
+  uint32_t nTiles = 0;
+  uint32_t kTiles = 0;
+};
+
+static FailureOr<BuiltinSelection> inferBuiltinProgram(func::FuncOp funcOp) {
   linalg::MatmulOp matchedMatmulOp;
   int matmulCount = 0;
   funcOp.walk([&](linalg::MatmulOp matmulOp) {
@@ -55,18 +72,75 @@ static FailureOr<uint32_t> inferBuiltinProgram(func::FuncOp funcOp) {
     if (!isStaticBf16TensorOfShape(inputs[0].getType(), {32, 32}) ||
         !isStaticBf16TensorOfShape(inputs[1].getType(), {32, 32}) ||
         !isStaticBf16TensorOfShape(outputs[0].getType(), {32, 32})) {
-      return failure();
+      auto lhsType = dyn_cast<RankedTensorType>(inputs[0].getType());
+      auto rhsType = dyn_cast<RankedTensorType>(inputs[1].getType());
+      auto outType = dyn_cast<RankedTensorType>(outputs[0].getType());
+      if (!lhsType || !rhsType || !outType || lhsType.getRank() != 2 ||
+          rhsType.getRank() != 2 || outType.getRank() != 2 ||
+          !isRank2Bf16Tensor(lhsType) || !isRank2Bf16Tensor(rhsType) ||
+          !isRank2Bf16Tensor(outType)) {
+        return failure();
+      }
+
+      int64_t lhsM = lhsType.getDimSize(0);
+      int64_t lhsK = lhsType.getDimSize(1);
+      int64_t rhsK = rhsType.getDimSize(0);
+      int64_t rhsN = rhsType.getDimSize(1);
+      int64_t outM = outType.getDimSize(0);
+      int64_t outN = outType.getDimSize(1);
+
+      if (!isDynamicDimOrTileAligned(lhsM) ||
+          !isDynamicDimOrTileAligned(lhsK) ||
+          !isDynamicDimOrTileAligned(rhsK) ||
+          !isDynamicDimOrTileAligned(rhsN) ||
+          !isDynamicDimOrTileAligned(outM) ||
+          !isDynamicDimOrTileAligned(outN)) {
+        return failure();
+      }
+      if (!ShapedType::isDynamic(lhsM) && !ShapedType::isDynamic(outM) &&
+          lhsM != outM) {
+        return failure();
+      }
+      if (!ShapedType::isDynamic(lhsK) && !ShapedType::isDynamic(rhsK) &&
+          lhsK != rhsK) {
+        return failure();
+      }
+      if (!ShapedType::isDynamic(rhsN) && !ShapedType::isDynamic(outN) &&
+          rhsN != outN) {
+        return failure();
+      }
+
+      BuiltinSelection selection;
+      selection.program =
+          static_cast<uint32_t>(TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED);
+      if (!lhsType.isDynamicDim(0) && !lhsType.isDynamicDim(1) &&
+          !rhsType.isDynamicDim(1)) {
+        selection.mTiles = static_cast<uint32_t>(lhsM / 32);
+        selection.kTiles = static_cast<uint32_t>(lhsK / 32);
+        selection.nTiles = static_cast<uint32_t>(rhsN / 32);
+      }
+      return selection;
     }
 
-    return static_cast<uint32_t>(
-        TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32);
+    return BuiltinSelection{
+        static_cast<uint32_t>(
+            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32),
+        1,
+        1,
+        1,
+    };
   }
 
   int addCount = 0;
   funcOp.walk([&](arith::AddFOp) { ++addCount; });
   if (addCount == 1) {
-    return static_cast<uint32_t>(
-        TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD);
+    return BuiltinSelection{
+        static_cast<uint32_t>(
+            TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD),
+        0,
+        0,
+        0,
+    };
   }
 
   return failure();
@@ -208,19 +282,23 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       return exportOp.emitError("missing inner function for executable export");
     }
 
-    FailureOr<uint32_t> builtinProgram = inferBuiltinProgram(funcOp);
-    if (failed(builtinProgram)) {
+    FailureOr<BuiltinSelection> builtinSelection = inferBuiltinProgram(funcOp);
+    if (failed(builtinSelection)) {
       return exportOp.emitError(
           "unsupported Tenstorrent dispatch; supported builtins are a single "
-          "arith.addf path and a single static linalg.matmul on "
-          "tensor<32x32xbf16>");
+          "arith.addf path, a single static linalg.matmul on "
+          "tensor<32x32xbf16>, and tile-aligned rank-2 bf16 linalg.matmul "
+          "(static or dynamic)");
     }
 
     desc.constant_count = inferConstantCount(exportOp);
     desc.binding_count = inferBindingCount(exportOp);
     desc.flags = 0;
     inferWorkgroupSize(exportOp, desc);
-    desc.builtin_program = *builtinProgram;
+    desc.builtin_program = builtinSelection->program;
+    desc.builtin_m_tiles = builtinSelection->mTiles;
+    desc.builtin_n_tiles = builtinSelection->nTiles;
+    desc.builtin_k_tiles = builtinSelection->kTiles;
 
     entryDescs.push_back(desc);
   }

@@ -47,6 +47,12 @@ typedef struct iree_hal_tt_kernel_params_t {
   uint32_t core_range_x;
   uint32_t core_range_y;
 
+  // Static matmul shape metadata expressed in 32x32 tile counts.
+  // These remain 0 when runtime dispatch constants provide the shape.
+  uint32_t builtin_m_tiles;
+  uint32_t builtin_n_tiles;
+  uint32_t builtin_k_tiles;
+
   // Debug info
   iree_string_view_t kernel_name;
 } iree_hal_tt_kernel_params_t;
@@ -65,6 +71,9 @@ typedef struct iree_hal_tt_entry_point_t {
 
   // Tenstorrent dispatch routing
   uint32_t builtin_program;  // BuiltinProgram enum value
+  uint32_t builtin_m_tiles;
+  uint32_t builtin_n_tiles;
+  uint32_t builtin_k_tiles;
 
   // TT-Metal program (created at executable_create time)
   iree_hal_tt_kernel_params_t kernel_params;

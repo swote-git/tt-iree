@@ -32,3 +32,13 @@ tt_iree_add_compile_smoke_test(
   NAME tt_e2e_compile_simple_matmul
   SRC simple_matmul.mlir
 )
+
+tt_iree_add_compile_smoke_test(
+  NAME tt_e2e_compile_simple_matmul_64
+  SRC simple_matmul_64.mlir
+)
+
+tt_iree_add_compile_smoke_test(
+  NAME tt_e2e_compile_dynamic_matmul
+  SRC dynamic_matmul.mlir
+)

@@ -22,6 +22,7 @@ typedef enum tt_iree_ttex_builtin_program_e {
   TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD = 0,
   TT_IREE_TTEX_BUILTIN_PROGRAM_TTNN_ELTWISE_ADD = 1,
   TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32 = 2,
+  TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED = 3,
 } tt_iree_ttex_builtin_program_e;
 
 // Describes a single entry point to be serialized into a TTEX blob.
@@ -33,6 +34,9 @@ typedef struct tt_iree_ttex_entry_point_desc_t {
   uint64_t flags;
   uint32_t workgroup_size[3];  // [x, y, z]
   uint32_t builtin_program;    // BuiltinProgram enum value
+  uint32_t builtin_m_tiles;    // static matmul M tile count, 0 if dynamic/unused
+  uint32_t builtin_n_tiles;    // static matmul N tile count, 0 if dynamic/unused
+  uint32_t builtin_k_tiles;    // static matmul K tile count, 0 if dynamic/unused
 } tt_iree_ttex_entry_point_desc_t;
 
 // Builds a complete TTEX FlatBuffer from the given entry point descriptors.
