@@ -44,6 +44,8 @@ add_library(iree_hal_tenstorrent STATIC
 
 # TT-Metal requires C++20 (CMAKE_CXX_STANDARD 20 in tt-metal/CMakeLists.txt).
 target_compile_features(iree_hal_tenstorrent PRIVATE cxx_std_20)
+# The driver does not use C++ modules and should not require clang-scan-deps.
+set_property(TARGET iree_hal_tenstorrent PROPERTY CXX_SCAN_FOR_MODULES OFF)
 
 if(TT_IREE_ENABLE_TTNN)
   target_include_directories(iree_hal_tenstorrent
@@ -90,7 +92,8 @@ get_filename_component(_TT_IREE_RUNTIME_SRC
 target_include_directories(iree_hal_tenstorrent
   PUBLIC
     # runtime/src — allows: #include "iree/hal/drivers/tenstorrent/tt_buffer.h"
-    ${_TT_IREE_RUNTIME_SRC}
+    $<BUILD_INTERFACE:${_TT_IREE_RUNTIME_SRC}>
+    $<INSTALL_INTERFACE:include>
 )
 
 # Link against IREE HAL

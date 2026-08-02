@@ -41,6 +41,7 @@ struct iree_hal_tt_device_t {
   iree_string_view_t identifier;
   iree_hal_device_id_t device_id;
   iree_hal_allocator_t* device_allocator;
+  iree_hal_device_topology_info_t topology_info;
 
 #ifndef TT_IREE_ENABLE_MOCK
   std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device;
@@ -359,7 +360,7 @@ static std::vector<uint32_t> iree_hal_tt_stage_lhs_tiles(
     uint32_t row_tiles, uint32_t col_tiles, uint32_t block_width_tiles) {
   auto swizzled = tilize_swizzled(row_major, rows, cols);
   auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
-      tt::stl::make_const_span(swizzled));
+      ttsl::make_const_span(swizzled));
   auto packed = pack_bfloat16_vec_into_uint32_vec(nfaces);
   return iree_hal_tt_transpose_tiles(packed, row_tiles, col_tiles,
                                      block_width_tiles);
@@ -369,7 +370,7 @@ static std::vector<uint32_t> iree_hal_tt_stage_rhs_tiles(
     const std::vector<bfloat16>& row_major, uint32_t rows, uint32_t cols) {
   auto swizzled = tilize_swizzled(row_major, rows, cols);
   auto nfaces = convert_layout_tile_swizzled_to_tile_nfaces(
-      tt::stl::make_const_span(swizzled));
+      ttsl::make_const_span(swizzled));
   return pack_bfloat16_vec_into_uint32_vec(nfaces);
 }
 
@@ -377,7 +378,7 @@ static std::vector<bfloat16> iree_hal_tt_collect_output_tiles(
     const std::vector<uint32_t>& packed_tiles, uint32_t rows, uint32_t cols) {
   auto bfloat_tiles = unpack_uint32_vec_into_bfloat16_vec(packed_tiles);
   auto swizzled = convert_layout_tile_nfaces_to_tile_swizzled(
-      tt::stl::make_const_span(bfloat_tiles));
+      ttsl::make_const_span(bfloat_tiles));
   return untilize_swizzled(swizzled, rows, cols);
 }
 
@@ -731,6 +732,14 @@ static void iree_hal_tt_device_replace_allocator(iree_hal_device_t*, iree_hal_al
 static void iree_hal_tt_device_replace_channel_provider(iree_hal_device_t*, iree_hal_channel_provider_t*);
 static iree_status_t iree_hal_tt_device_trim(iree_hal_device_t*);
 static iree_status_t iree_hal_tt_device_query_i64(iree_hal_device_t*, iree_string_view_t, iree_string_view_t, int64_t*);
+static iree_status_t iree_hal_tt_device_query_capabilities(
+    iree_hal_device_t*, iree_hal_device_capabilities_t*);
+static const iree_hal_device_topology_info_t*
+iree_hal_tt_device_topology_info(iree_hal_device_t*);
+static iree_status_t iree_hal_tt_device_refine_topology_edge(
+    iree_hal_device_t*, iree_hal_device_t*, iree_hal_topology_edge_t*);
+static iree_status_t iree_hal_tt_device_assign_topology_info(
+    iree_hal_device_t*, const iree_hal_device_topology_info_t*);
 static iree_status_t iree_hal_tt_device_create_channel(iree_hal_device_t*, iree_hal_queue_affinity_t, iree_hal_channel_params_t, iree_hal_channel_t**);
 // Implemented in tt_command_buffer.cc
 extern iree_status_t iree_hal_tt_device_create_command_buffer(iree_hal_device_t*, iree_hal_command_buffer_mode_t, iree_hal_command_category_t, iree_hal_queue_affinity_t, iree_host_size_t, iree_hal_command_buffer_t**);
@@ -765,6 +774,10 @@ static const iree_hal_device_vtable_t iree_hal_tt_device_vtable = {
     .replace_channel_provider = iree_hal_tt_device_replace_channel_provider,
     .trim = iree_hal_tt_device_trim,
     .query_i64 = iree_hal_tt_device_query_i64,
+    .query_capabilities = iree_hal_tt_device_query_capabilities,
+    .topology_info = iree_hal_tt_device_topology_info,
+    .refine_topology_edge = iree_hal_tt_device_refine_topology_edge,
+    .assign_topology_info = iree_hal_tt_device_assign_topology_info,
     .create_channel = iree_hal_tt_device_create_channel,
     .create_command_buffer = iree_hal_tt_device_create_command_buffer,
     .create_event = iree_hal_tt_device_create_event,
@@ -810,8 +823,9 @@ tt::tt_metal::distributed::MeshCommandQueue* iree_hal_tt_device_mesh_queue(iree_
 
 tt::tt_metal::IDevice* iree_hal_tt_device_idevice(iree_hal_tt_device_t* device) {
   if (!device || !device->mesh_device) return nullptr;
-  // For unit mesh, get the single device at coordinate {0,0}
-  return device->mesh_device->get_device({0, 0});
+  // Legacy Buffer requires the local physical device backing the unit mesh.
+  auto devices = device->mesh_device->get_devices();
+  return devices.empty() ? nullptr : devices.front();
 }
 #endif
 
@@ -842,7 +856,7 @@ iree_status_t iree_hal_tt_device_create(
   }
 
 #ifndef TT_IREE_ENABLE_MOCK
-  // Create TT-Metal MeshDevice (v0.65 API - even for single device)
+  // Create a TT-Metal MeshDevice even for a single physical device.
   if (iree_status_is_ok(status)) {
     try {
       // Create a 1x1 mesh (unit mesh) for single device
@@ -863,15 +877,14 @@ iree_status_t iree_hal_tt_device_create(
     try {
       device->mesh_cq = &device->mesh_device->mesh_command_queue();
 
-      // Get underlying IDevice for queries
-      tt::tt_metal::IDevice* idevice = device->mesh_device->get_device({0, 0});
+      tt::tt_metal::IDevice* idevice = device->mesh_device.get();
       if (idevice) {
         auto grid = idevice->compute_with_storage_grid_size();
         auto arch = idevice->arch();
         const char* arch_name = (arch == tt::ARCH::BLACKHOLE) ? "Blackhole" :
                                 (arch == tt::ARCH::WORMHOLE_B0) ? "Wormhole" : "Unknown";
 
-        fprintf(stderr, "tt-iree: MeshDevice %d opened (%s, %ux%u cores, %lu MB DRAM)\n",
+        fprintf(stderr, "tt-iree: MeshDevice %d opened (%s, %zux%zu cores, %lu MB DRAM)\n",
                 (int)device_id, arch_name, grid.x, grid.y,
                 (unsigned long)(idevice->num_dram_channels() *
                                idevice->dram_size_per_channel() / (1024*1024)));
@@ -990,7 +1003,7 @@ static iree_status_t iree_hal_tt_device_query_i64(
 
 #ifndef TT_IREE_ENABLE_MOCK
   if (iree_string_view_equal(category, IREE_SV("hal.device")) && device->mesh_device) {
-    tt::tt_metal::IDevice* idevice = device->mesh_device->get_device({0, 0});
+    tt::tt_metal::IDevice* idevice = device->mesh_device.get();
     if (idevice) {
       auto grid = idevice->compute_with_storage_grid_size();
       if (iree_string_view_equal(key, IREE_SV("core_count_x"))) {
@@ -1012,6 +1025,29 @@ static iree_status_t iree_hal_tt_device_query_i64(
   
   return iree_make_status(IREE_STATUS_NOT_FOUND, "unknown key '%.*s::%.*s'",
       (int)category.size, category.data, (int)key.size, key.data);
+}
+
+static iree_status_t iree_hal_tt_device_query_capabilities(
+    iree_hal_device_t*, iree_hal_device_capabilities_t* out_capabilities) {
+  std::memset(out_capabilities, 0, sizeof(*out_capabilities));
+  return iree_ok_status();
+}
+
+static const iree_hal_device_topology_info_t*
+iree_hal_tt_device_topology_info(iree_hal_device_t* base) {
+  return &iree_hal_tt_device_cast(base)->topology_info;
+}
+
+static iree_status_t iree_hal_tt_device_refine_topology_edge(
+    iree_hal_device_t*, iree_hal_device_t*, iree_hal_topology_edge_t*) {
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_device_assign_topology_info(
+    iree_hal_device_t* base,
+    const iree_hal_device_topology_info_t* topology_info) {
+  iree_hal_tt_device_cast(base)->topology_info = *topology_info;
+  return iree_ok_status();
 }
 
 // Stub implementations

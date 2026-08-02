@@ -3,6 +3,7 @@
 //
 // Tests for Tenstorrent HAL device creation and queries.
 
+#include "iree/hal/device_group.h"
 #include "utils.h"
 
 namespace iree {
@@ -58,6 +59,15 @@ TEST_F(DeviceTest, Allocator) {
   ASSERT_NE(allocator, nullptr);
 }
 
+TEST_F(DeviceTest, DeviceGroupCreation) {
+  iree_hal_device_group_t* group = nullptr;
+  IREE_ASSERT_OK(iree_hal_device_group_create_from_device(
+      device_, host_allocator(), &group));
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(iree_hal_device_group_device_count(group), 1u);
+  EXPECT_EQ(iree_hal_device_group_device_at(group, 0), device_);
+  iree_hal_device_group_release(group);
+}
 
 }  // namespace
 }  // namespace tenstorrent

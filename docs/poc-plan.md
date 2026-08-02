@@ -9,8 +9,8 @@ Achieve end-to-end execution of a single operation on real P100A hardware via IR
 | Attribute | Value |
 |-----------|-------|
 | Target Hardware | Tenstorrent P100A (Blackhole, 120 Cores) |
-| SDK Version | tt-metal v0.65.0 |
-| IREE Version | v3.9.0 |
+| SDK Version | tt-metal v0.75.0 |
+| IREE Version | v3.11.0 |
 | Target Operation | Elementwise Add (`x + 1.0`) on 32x32 Tile |
 | Success Criteria | Correct calculation result on hardware |
 | Duration | 6-8 Weeks |
@@ -70,7 +70,7 @@ To ensure success within 8 weeks, strictly limit scope:
 
 **Tasks:**
 - [✔] Install P100A drivers & firmware
-- [✔] Build TT-Metal from source (v0.65.0)
+- [✔] Build TT-Metal from source (v0.75.0)
 - [✔] Run SDK examples: `hello_world`, `eltwise_binary`
 - [✔] Verify 120-core grid: `tt-smi` shows full 10x12 grid
 - [✔] Set up tt-iree repo with TT-Metal linking

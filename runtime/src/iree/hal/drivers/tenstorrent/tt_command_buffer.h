@@ -21,7 +21,7 @@ typedef enum iree_hal_tt_command_type_t {
 #define IREE_HAL_TT_MAX_BINDINGS 16
 #define IREE_HAL_TT_MAX_CONSTANTS 256
 
-// --- Dispatch Command (v3.9.0 API) ---
+// --- Dispatch Command ---
 typedef struct iree_hal_tt_dispatch_command_t {
   iree_hal_executable_t* executable;
   iree_hal_executable_export_ordinal_t export_ordinal;  // Changed from entry_point

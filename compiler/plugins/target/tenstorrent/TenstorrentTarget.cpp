@@ -223,12 +223,11 @@ void TenstorrentTargetBackend::getDefaultExecutableTargets(
 void TenstorrentTargetBackend::buildTranslationPassPipeline(
     IREE::HAL::ExecutableTargetAttr targetAttr,
     OpPassManager &passManager) {
-  // Lower dispatch.workgroup_count_from_slice → concrete workgroup counts.
-  // Without this, index-typed results reach VM conversion and cause a
-  // vm.trunc.i64.i32 type error (op expects i64, gets index).
-  // When there are no scf.forall distribution loops, ReconcileTranslationInfo
-  // replaces the op with {1,1,1} workgroup counts (one tile per dispatch).
+  // Lower dispatch.workgroup_count_from_slice to concrete workgroup counts.
+  // IREE v3.11 split hint resolution out of ReconcileTranslationInfo, so both
+  // passes are required to materialize the default {1, 1, 1} launch shape.
   passManager.addPass(createReconcileTranslationInfoPass());
+  passManager.addPass(createResolveWorkgroupCountHintsPass());
 }
 
 //===----------------------------------------------------------------------===//

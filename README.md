@@ -37,8 +37,8 @@ WIP & Planned:
 
 | Dependency | Version | Notes |
 |------------|---------|-------|
-| IREE | v3.9.0 | Compiler & runtime infrastructure |
-| tt-metal | v0.65.0 | Tenstorrent SDK (TTNN, TT-Metalium) |
+| IREE | v3.11.0 | Compiler & runtime infrastructure |
+| tt-metal | v0.75.0 | Tenstorrent SDK (TTNN, TT-Metalium) |
 
 
 ## Project Structure
@@ -50,8 +50,8 @@ tt-iree/
 ├── runtime/               # IREE HAL driver
 │   └── src/iree/hal/drivers/tenstorrent/
 ├── third_party/
-│   ├── iree/              # IREE v3.9.0 (submodule)
-│   └── tt-metal/          # tt-metal v0.65.0 (submodule)
+│   ├── iree/              # IREE v3.11.0 (submodule)
+│   └── tt-metal/          # tt-metal v0.75.0 (submodule)
 ├── docs/                  # Documentation
 ├── test/                  # Tests
 └── examples/              # Example programs

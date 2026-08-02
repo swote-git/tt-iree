@@ -383,7 +383,7 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
   return iree_ok_status();
 }
 
-// Records a dispatch command (v3.9.0 API)
+// Records a dispatch command using the current IREE HAL API.
 static iree_status_t iree_hal_tt_command_buffer_dispatch(
     iree_hal_command_buffer_t* base,
     iree_hal_executable_t* executable,
@@ -446,7 +446,7 @@ iree_hal_tt_command_t* iree_hal_tt_command_buffer_get_commands(
 }
 
 //===----------------------------------------------------------------------===//
-// VTable (v3.9.0 API)
+// VTable
 //===----------------------------------------------------------------------===//
 
 const iree_hal_command_buffer_vtable_t iree_hal_tt_command_buffer_vtable = {

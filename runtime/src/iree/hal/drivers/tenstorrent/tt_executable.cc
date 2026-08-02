@@ -117,12 +117,18 @@ static iree_status_t iree_hal_tt_create_program_for_custom_sfpi_add(
   std::vector<uint32_t> reader_compile_args;
   tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
       reader_compile_args);
+  // v0.75 passes the aligned page size through TensorAccessor compile args.
+  // The buffer-free factory cannot infer it, while this builtin's ABI fixes it
+  // to one bfloat16 tile.
+  reader_compile_args.back() = tile_size_bytes;
   tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
       reader_compile_args);
+  reader_compile_args.back() = tile_size_bytes;
 
   std::vector<uint32_t> writer_compile_args;
   tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(
       writer_compile_args);
+  writer_compile_args.back() = tile_size_bytes;
 
   params->reader_kernel_id = tt::tt_metal::CreateKernel(
       program,
@@ -192,7 +198,7 @@ static iree_status_t iree_hal_tt_create_program_for_bf16_matmul_32x32x32(
 
   params->writer_kernel_id = tt::tt_metal::CreateKernel(
       program,
-      "tt_metal/kernels/dataflow/writer_unary.cpp",
+      "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_unary.cpp",
       core,
       tt::tt_metal::DataMovementConfig{
           .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
@@ -366,9 +372,9 @@ static void iree_hal_tt_executable_destroy(
 }
 
 //===----------------------------------------------------------------------===//
-// Vtable — all required fields for IREE v3.9.0
+// Vtable with all required fields for the current IREE HAL API.
 //===----------------------------------------------------------------------===//
-// NOTE: In v3.9.0, iree_hal_executable_vtable_t includes:
+// iree_hal_executable_vtable_t includes:
 //   destroy, export_count, export_info, export_parameters,
 //   lookup_export_by_name
 // Leaving any of these NULL risks a crash when IREE dispatches through

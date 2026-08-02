@@ -47,3 +47,6 @@ Thumbs.db
 
 # Cache
 .cache
+
+# TT-Metal runtime inspector artifacts
+generated/

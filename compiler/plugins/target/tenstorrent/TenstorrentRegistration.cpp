@@ -58,7 +58,8 @@ struct TenstorrentSession
         IREE::HAL::createTenstorrentAnnotateMatmulPreprocessingPass());
   }
 
-  void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) {
+  void populateHALTargetDevices(
+      IREE::HAL::TargetDeviceList &targets) override {
     IREE::HAL::TenstorrentTargetOptions opts;
     opts.deviceId = options.deviceId;
     opts.dumpTTEX = options.dumpTTEX;
@@ -70,7 +71,8 @@ struct TenstorrentSession
                 });
   }
 
-  void populateHALTargetBackends(IREE::HAL::TargetBackendList &targets) {
+  void populateHALTargetBackends(
+      IREE::HAL::TargetBackendList &targets) override {
     IREE::HAL::TenstorrentTargetOptions opts;
     opts.deviceId = options.deviceId;
     opts.dumpTTEX = options.dumpTTEX;

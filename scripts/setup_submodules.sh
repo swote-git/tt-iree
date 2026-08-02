@@ -8,8 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # Pinned versions
-IREE_VERSION="v3.9.0"
-TT_METAL_VERSION="v0.65.0"
+IREE_VERSION="v3.11.0"
+TT_METAL_VERSION="v0.75.0"
 
 echo "=== Setting up tt-iree submodules ==="
 echo "  IREE version: ${IREE_VERSION}"

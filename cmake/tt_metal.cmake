@@ -1,7 +1,7 @@
 # Copyright 2025 The tt-iree Authors
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-# Find and configure TT-Metal SDK v0.65.0 for Blackhole architecture
+# Find and configure TT-Metal SDK v0.75.0 for Blackhole architecture
 
 function(find_tt_metal)
   # Check for TT_METAL_HOME: CMake variable > env var > submodule paths
@@ -36,6 +36,8 @@ function(find_tt_metal)
   # Include directories
   #-----------------------------------------------------------------------------
   set(_TT_METAL_INCLUDE_DIRS
+    "${TT_METAL_HOME}/build_Release/include"
+    "${TT_METAL_HOME}/build_Release/include/metalium-thirdparty"
     "${TT_METAL_HOME}"
     "${TT_METAL_HOME}/tt_metal"
     "${TT_METAL_HOME}/tt_metal/api"
@@ -47,8 +49,6 @@ function(find_tt_metal)
     "${TT_METAL_HOME}/tt_metal/third_party/fmt"
     "${TT_METAL_HOME}/ttnn"
     "${TT_METAL_HOME}/ttnn/cpp"
-    "${TT_METAL_HOME}/build_Release/include"
-    "${TT_METAL_HOME}/build_Release/include/metalium-thirdparty"
   )
   set(TT_METAL_INCLUDE_DIRS "${_TT_METAL_INCLUDE_DIRS}" CACHE STRING "TT-Metal include directories" FORCE)
   set(TT_METAL_INCLUDE_DIRS "${_TT_METAL_INCLUDE_DIRS}" PARENT_SCOPE)
@@ -78,19 +78,12 @@ function(find_tt_metal)
     REQUIRED
   )
 
-  find_library(TT_DEVICE_LIB
-    NAMES device
-    PATHS ${TT_METAL_LIB_DIR}
-    NO_DEFAULT_PATH
-    REQUIRED
-  )
-
   message(STATUS "Found TT-Metal: ${TT_METAL_LIB}")
-  message(STATUS "Found TT-Device: ${TT_DEVICE_LIB}")
 
-  # Set variables for linking
-  set(TT_METAL_LIBRARIES "${TT_METAL_LIB};${TT_DEVICE_LIB}" CACHE STRING "TT-Metal libraries" FORCE)
-  set(TT_METAL_LIBRARIES "${TT_METAL_LIB};${TT_DEVICE_LIB}" PARENT_SCOPE)
+  # Device and UMD support are dependencies of libtt_metal in v0.75.
+  unset(TT_DEVICE_LIB CACHE)
+  set(TT_METAL_LIBRARIES "${TT_METAL_LIB}" CACHE STRING "TT-Metal libraries" FORCE)
+  set(TT_METAL_LIBRARIES "${TT_METAL_LIB}" PARENT_SCOPE)
 
   # Architecture
   if(DEFINED ENV{ARCH_NAME})

@@ -135,7 +135,7 @@ static iree_status_t iree_hal_tt_buffer_write_physical_allocation(
                             "TT-Metal buffer is not initialized");
   }
   try {
-    tt::stl::Span<const uint8_t> span(
+    ttsl::Span<const uint8_t> span(
         source, static_cast<size_t>(buffer->physical_allocation_size));
     tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
     return iree_ok_status();
