@@ -48,8 +48,14 @@ target_compile_features(iree_hal_tenstorrent PRIVATE cxx_std_20)
 set_property(TARGET iree_hal_tenstorrent PROPERTY CXX_SCAN_FOR_MODULES OFF)
 
 if(TT_IREE_ENABLE_TTNN)
-  target_include_directories(iree_hal_tenstorrent
+  target_include_directories(iree_hal_tenstorrent BEFORE
     PRIVATE
+      "${TT_METAL_HOME}/tt_metal/api"
+      "${TT_METAL_HOME}/tt_metal/api/tt-metalium"
+      "${TT_METAL_HOME}/tt_metal"
+      "${TT_METAL_HOME}/tt_metal/llrt"
+      "${TT_METAL_HOME}/tt_metal/hostdevcommon/api"
+      "${TT_METAL_HOME}/tt_stl"
       ${TT_METAL_INCLUDE_DIRS}
   )
 
@@ -59,30 +65,31 @@ if(TT_IREE_ENABLE_TTNN)
       "${TT_METAL_LIB_DIR}/libfmt.so"
   )
 
-  # TTEX FlatBuffer schema support.
-  # Expand tt_executable_def_c_fbs's include dirs via generator expression instead of
-  # target_link_libraries to avoid creating a CMake target dep that would require
-  # tt_executable_def_c_fbs to appear in IREE's install export set.
-  if(TARGET tt_executable_def_c_fbs)
-    target_include_directories(iree_hal_tenstorrent PRIVATE
-      $<TARGET_PROPERTY:tt_executable_def_c_fbs,INTERFACE_INCLUDE_DIRECTORIES>
-    )
-    target_link_libraries(iree_hal_tenstorrent PRIVATE flatcc::runtime)
-    add_dependencies(iree_hal_tenstorrent tt_executable_def_gen)
-    target_compile_definitions(iree_hal_tenstorrent PRIVATE TT_IREE_ENABLE_TTEX=1)
-    message(STATUS "  TTEX FlatBuffer support: enabled")
-  else()
-    message(STATUS "  TTEX FlatBuffer support: disabled (schema not built)")
-  endif()
-  
   target_compile_definitions(iree_hal_tenstorrent
     PRIVATE
       SPDLOG_FMT_EXTERNAL=1
   )
+  target_compile_options(iree_hal_tenstorrent PRIVATE -fsized-deallocation)
   set_target_properties(iree_hal_tenstorrent PROPERTIES
     BUILD_RPATH "${TT_METAL_LIB_DIR}"
     INSTALL_RPATH "${TT_METAL_LIB_DIR}"
   )
+endif()
+
+# TTEX parsing is independent of TT-Metal and must also be available in mock
+# builds so executable contract tests exercise the production parser.
+# Expand the schema target's include dirs without adding it to IREE's install
+# export set.
+if(TARGET tt_executable_def_c_fbs)
+  target_include_directories(iree_hal_tenstorrent PRIVATE
+    $<TARGET_PROPERTY:tt_executable_def_c_fbs,INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(iree_hal_tenstorrent PRIVATE flatcc::runtime)
+  add_dependencies(iree_hal_tenstorrent tt_executable_def_gen)
+  target_compile_definitions(iree_hal_tenstorrent PRIVATE TT_IREE_ENABLE_TTEX=1)
+  message(STATUS "  TTEX FlatBuffer support: enabled")
+else()
+  message(STATUS "  TTEX FlatBuffer support: disabled (schema not built)")
 endif()
 
 # Set include directories

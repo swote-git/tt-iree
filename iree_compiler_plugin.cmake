@@ -8,6 +8,13 @@ set(TT_IREE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 include("${TT_IREE_SOURCE_DIR}/cmake/tt_iree_options.cmake")
 
+# AOT kernel generation runs inside iree-compile and uses tt-metal's offline
+# compiler. Keep mock-only compiler builds independent of tt-metal.
+if(TT_IREE_ENABLE_TTNN AND NOT TT_METAL_LIB)
+  include("${TT_IREE_SOURCE_DIR}/cmake/tt_metal.cmake")
+  find_tt_metal()
+endif()
+
 # Schema targets are needed by the compiler plugin (TTEX FlatBuffer builder).
 # Guard against double-inclusion (runtime plugin may also add these).
 if(NOT TARGET tt_executable_builder_util)

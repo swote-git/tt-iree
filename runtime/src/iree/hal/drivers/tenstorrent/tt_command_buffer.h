@@ -13,6 +13,8 @@ extern "C" {
 // --- Command Types ---
 typedef enum iree_hal_tt_command_type_t {
   IREE_HAL_TT_COMMAND_TYPE_DISPATCH,
+  IREE_HAL_TT_COMMAND_TYPE_FILL,
+  IREE_HAL_TT_COMMAND_TYPE_UPDATE,
   IREE_HAL_TT_COMMAND_TYPE_COPY,
   IREE_HAL_TT_COMMAND_TYPE_BARRIER,
 } iree_hal_tt_command_type_t;
@@ -40,11 +42,27 @@ typedef struct iree_hal_tt_copy_command_t {
   iree_hal_buffer_ref_t target_ref;
 } iree_hal_tt_copy_command_t;
 
+// --- Fill Command ---
+typedef struct iree_hal_tt_fill_command_t {
+  iree_hal_buffer_ref_t target_ref;
+  uint8_t pattern[4];
+  iree_host_size_t pattern_length;
+} iree_hal_tt_fill_command_t;
+
+// --- Update Command ---
+typedef struct iree_hal_tt_update_command_t {
+  iree_hal_buffer_ref_t target_ref;
+  iree_host_size_t source_data_offset;
+  iree_host_size_t source_data_length;
+} iree_hal_tt_update_command_t;
+
 // --- Generic Command Wrapper ---
 typedef struct iree_hal_tt_command_t {
   iree_hal_tt_command_type_t type;
   union {
     iree_hal_tt_dispatch_command_t dispatch;
+    iree_hal_tt_fill_command_t fill;
+    iree_hal_tt_update_command_t update;
     iree_hal_tt_copy_command_t copy;
   };
 } iree_hal_tt_command_t;
@@ -59,6 +77,11 @@ iree_status_t iree_hal_tt_device_create_command_buffer(
 // --- Accessor ---
 iree_hal_tt_command_t* iree_hal_tt_command_buffer_get_commands(
     iree_hal_command_buffer_t* command_buffer, iree_host_size_t* out_count);
+
+// Returns an immutable slice of host update data snapshotted while recording.
+iree_status_t iree_hal_tt_command_buffer_get_update_data(
+    iree_hal_command_buffer_t* command_buffer, iree_host_size_t offset,
+    iree_host_size_t length, iree_const_byte_span_t* out_data);
 
 #ifdef __cplusplus
 }

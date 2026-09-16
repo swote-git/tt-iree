@@ -103,10 +103,32 @@ tt_iree_hal_test(
   DEPS tt_executable_builder_util
 )
 
+# Physical dispatch tests exercise the same compiler-generated AOT bundles as
+# production VMFBs instead of relying on tt-metal example/test kernel paths.
+if(TARGET TenstorrentAOTCompiler)
+  target_link_libraries(dispatch_test PRIVATE TenstorrentAOTCompiler)
+  target_include_directories(dispatch_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent
+  )
+  target_compile_definitions(dispatch_test PRIVATE
+    TT_IREE_ENABLE_AOT_TESTS=1
+  )
+endif()
+
 # dispatch_test needs direct TT-Metal access for bfloat16 data transfer.
 if(NOT TT_IREE_ENABLE_MOCK)
   tt_metal_target_link_libraries(dispatch_test)
 endif()
+
+# Descriptor-only executable creation does not require a physical device.
+add_test(
+  NAME tt_dispatch_aot_contract_test
+  COMMAND dispatch_test
+    --gtest_filter=DispatchContractTest.*
+)
+set_tests_properties(tt_dispatch_aot_contract_test PROPERTIES
+  LABELS "tt-iree;unit;aot"
+)
 
 #-------------------------------------------------------------------------------
 # Schema tests (no hardware, no MPI — run directly)

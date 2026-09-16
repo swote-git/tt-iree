@@ -1,6 +1,7 @@
 // Copyright 2025 The tt-iree Authors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -31,6 +32,14 @@ static std::vector<uint8_t> MakePattern(iree_device_size_t length,
     data[i] = static_cast<uint8_t>((i * 37 + seed) & 0xFF);
   }
   return data;
+}
+
+static void ApplyFill(std::vector<uint8_t>& data, iree_device_size_t offset,
+                      iree_device_size_t length, const void* pattern,
+                      iree_host_size_t pattern_length) {
+  for (iree_device_size_t i = 0; i < length; i += pattern_length) {
+    std::memcpy(data.data() + offset + i, pattern, pattern_length);
+  }
 }
 
 TEST_F(CopyTest, RejectsMismatchedRecordLengths) {
@@ -68,7 +77,163 @@ TEST_F(CopyTest, RejectsUnsupportedFlags) {
   iree_status_ignore(status);
 }
 
-#ifndef TT_IREE_ENABLE_MOCK
+TEST_F(CopyTest, RejectsOversizedRecordedUpdate) {
+  iree::vm::ref<iree_hal_command_buffer_t> command_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_TRANSFER, /*queue_affinity=*/0,
+      /*binding_capacity=*/1, &command_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(command_buffer.get()));
+
+  uint8_t source = 0;
+  iree_status_t status = iree_hal_command_buffer_update_buffer(
+      command_buffer.get(), &source, /*source_offset=*/0,
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/0, /*offset=*/0,
+          IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE + 1),
+      IREE_HAL_UPDATE_FLAG_NONE);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_RESOURCE_EXHAUSTED);
+  iree_status_ignore(status);
+}
+
+TEST_F(CopyTest, RecordedFillHandlesDirectAndIndirectSubranges) {
+  constexpr iree_device_size_t kBufferSize = 4096;
+  constexpr iree_device_size_t kBindingOffset = 1024;
+  constexpr iree_device_size_t kIndirectOffset = 64;
+
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  iree_hal_buffer_params_t params = TransferBufferParams();
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+
+  std::vector<uint8_t> expected(kBufferSize, 0xCC);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      buffer.get(), 0, expected.data(), expected.size()));
+
+  const uint32_t direct_pattern = 0xA1B2C3D4u;
+  const uint16_t indirect_pattern = 0x5E6Fu;
+  ApplyFill(expected, /*offset=*/256, /*length=*/512, &direct_pattern,
+            sizeof(direct_pattern));
+  ApplyFill(expected, kBindingOffset + kIndirectOffset, /*length=*/384,
+            &indirect_pattern, sizeof(indirect_pattern));
+
+  iree::vm::ref<iree_hal_command_buffer_t> command_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_TRANSFER, /*queue_affinity=*/0,
+      /*binding_capacity=*/1, &command_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(command_buffer.get()));
+  IREE_ASSERT_OK(iree_hal_command_buffer_fill_buffer(
+      command_buffer.get(),
+      iree_hal_make_buffer_ref(buffer.get(), /*offset=*/256, /*length=*/512),
+      &direct_pattern, sizeof(direct_pattern), IREE_HAL_FILL_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_fill_buffer(
+      command_buffer.get(),
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/0, kIndirectOffset, /*length=*/384),
+      &indirect_pattern, sizeof(indirect_pattern), IREE_HAL_FILL_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(command_buffer.get()));
+
+  iree_hal_buffer_binding_t binding = {
+      buffer.get(), kBindingOffset, /*length=*/1024};
+  iree_hal_buffer_binding_table_t binding_table = {1, &binding};
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      command_buffer.get(), binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  std::vector<uint8_t> actual(kBufferSize);
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(
+      buffer.get(), 0, actual.data(), actual.size()));
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(CopyTest, RecordedUpdateSnapshotsHostData) {
+  constexpr iree_device_size_t kBufferSize = 4096;
+  constexpr iree_device_size_t kBindingOffset = 700;
+  constexpr iree_device_size_t kTargetOffset = 211;
+  constexpr iree_device_size_t kUpdateLength = 389;
+  constexpr iree_host_size_t kSourceOffset = 113;
+
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  iree_hal_buffer_params_t params = TransferBufferParams();
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+
+  std::vector<uint8_t> source = MakePattern(1024, 57);
+  std::vector<uint8_t> expected(kBufferSize, 0x5A);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      buffer.get(), 0, expected.data(), expected.size()));
+  std::memcpy(expected.data() + kBindingOffset + kTargetOffset,
+              source.data() + kSourceOffset, kUpdateLength);
+
+  iree::vm::ref<iree_hal_command_buffer_t> command_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_TRANSFER, /*queue_affinity=*/0,
+      /*binding_capacity=*/1, &command_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(command_buffer.get()));
+  IREE_ASSERT_OK(iree_hal_command_buffer_update_buffer(
+      command_buffer.get(), source.data(), kSourceOffset,
+      iree_hal_make_indirect_buffer_ref(
+          /*buffer_slot=*/0, kTargetOffset, kUpdateLength),
+      IREE_HAL_UPDATE_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(command_buffer.get()));
+
+  std::fill(source.begin(), source.end(), 0);
+  iree_hal_buffer_binding_t binding = {
+      buffer.get(), kBindingOffset, /*length=*/1024};
+  iree_hal_buffer_binding_table_t binding_table = {1, &binding};
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      command_buffer.get(), binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  std::vector<uint8_t> actual(kBufferSize);
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(
+      buffer.get(), 0, actual.data(), actual.size()));
+  EXPECT_EQ(actual, expected);
+}
+
+TEST_F(CopyTest, QueueFillAndUpdatePreserveSurroundingBytes) {
+  constexpr iree_device_size_t kBufferSize = 4096;
+  constexpr iree_device_size_t kFillOffset = 128;
+  constexpr iree_device_size_t kFillLength = 512;
+  constexpr iree_host_size_t kSourceOffset = 77;
+  constexpr iree_device_size_t kUpdateOffset = 901;
+  constexpr iree_device_size_t kUpdateLength = 333;
+
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  iree_hal_buffer_params_t params = TransferBufferParams();
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+
+  std::vector<uint8_t> source = MakePattern(1024, 83);
+  std::vector<uint8_t> expected(kBufferSize, 0x7E);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      buffer.get(), 0, expected.data(), expected.size()));
+  const uint32_t fill_pattern = 0x10293847u;
+  ApplyFill(expected, kFillOffset, kFillLength, &fill_pattern,
+            sizeof(fill_pattern));
+  std::memcpy(expected.data() + kUpdateOffset,
+              source.data() + kSourceOffset, kUpdateLength);
+
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_fill(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      buffer.get(), kFillOffset, kFillLength, &fill_pattern,
+      sizeof(fill_pattern), IREE_HAL_FILL_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_device_queue_update(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      source.data(), kSourceOffset, buffer.get(), kUpdateOffset, kUpdateLength,
+      IREE_HAL_UPDATE_FLAG_NONE));
+
+  std::vector<uint8_t> actual(kBufferSize);
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(
+      buffer.get(), 0, actual.data(), actual.size()));
+  EXPECT_EQ(actual, expected);
+}
+
 TEST_F(CopyTest, DirectSubrangesPreserveSurroundingBytes) {
   constexpr iree_device_size_t kBufferSize = 4096;
   constexpr iree_device_size_t kSourceOffset = 137;
@@ -247,8 +412,6 @@ TEST_F(CopyTest, QueueCopyHonorsSubranges) {
       target_buffer.get(), 0, actual.data(), actual.size()));
   EXPECT_EQ(actual, expected);
 }
-#endif  // !TT_IREE_ENABLE_MOCK
-
 }  // namespace
 }  // namespace tenstorrent
 }  // namespace hal

@@ -29,7 +29,10 @@ WIP & Planned:
 - Compiler backend registration
 - HAL driver implementation
 - Mock mode execution
-- Basic operation support (elementwise add, single-tile matmul smoke)
+- AOT elementwise add and static/dynamic tile-aligned BF16 matmul smoke paths
+- Multicore tiled matmul execution with runtime shape arguments
+- ResNet50 compiler/TTEX coverage for all 37 fused exports; full runtime
+  validation remains in progress
 - TTNN integration
 - Hardware execution
 

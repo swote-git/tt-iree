@@ -11,17 +11,18 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/schema/tt_executable_builder_util.h"
 
 #ifdef __cplusplus
 namespace tt {
 namespace tt_metal {
 class Program;
 }
-}  // namespace tt
-typedef tt::tt_metal::Program* tt_metal_program_ptr_t;
+} // namespace tt
+typedef tt::tt_metal::Program *tt_metal_program_ptr_t;
 typedef uint32_t tt_metal_kernel_id_t;
 #else
-typedef void* tt_metal_program_ptr_t;
+typedef void *tt_metal_program_ptr_t;
 typedef uint32_t tt_metal_kernel_id_t;
 #endif
 
@@ -53,6 +54,25 @@ typedef struct iree_hal_tt_kernel_params_t {
   uint32_t builtin_n_tiles;
   uint32_t builtin_k_tiles;
 
+  // Descriptor-driven dispatch metadata (TTEX v2).
+  uint8_t dispatch_kind;
+  tt_iree_ttex_matmul_like_desc_t matmul_like;
+  tt_iree_ttex_conv2d_desc_t conv2d;
+  tt_iree_ttex_padded_copy_desc_t padded_copy;
+  tt_iree_ttex_max_pool_2d_desc_t max_pool;
+  tt_iree_ttex_global_sum_desc_t global_sum;
+  tt_iree_ttex_scalar_div_desc_t scalar_div;
+  tt_iree_ttex_linear_desc_t linear;
+
+  // Points into the executable-owned TTEX buffer when a v3 AOT bundle exists.
+  // The concrete FlatBuffer table type remains private to the runtime.
+  const void *aot_kernel_bundle;
+  uint8_t aot_target_arch;
+
+  // Executable-owned directory containing the materialized AOT artifacts.
+  // Empty for metadata-only entries and valid until executable destruction.
+  iree_string_view_t aot_artifact_root;
+
   // Debug info
   iree_string_view_t kernel_name;
 } iree_hal_tt_kernel_params_t;
@@ -70,10 +90,11 @@ typedef struct iree_hal_tt_entry_point_t {
   uint32_t workgroup_size[3];
 
   // Tenstorrent dispatch routing
-  uint32_t builtin_program;  // BuiltinProgram enum value
+  uint32_t builtin_program; // BuiltinProgram enum value
   uint32_t builtin_m_tiles;
   uint32_t builtin_n_tiles;
   uint32_t builtin_k_tiles;
+  uint8_t dispatch_kind;
 
   // TT-Metal program (created at executable_create time)
   iree_hal_tt_kernel_params_t kernel_params;
@@ -87,33 +108,30 @@ typedef struct iree_hal_tt_entry_point_t {
 //
 // Dispatch by executable_format:
 //   - "tenstorrent-ttex-fb": parse TTEX FlatBuffer from executable_data
-//   - "TT-METAL": explicit legacy path (hardcoded single entry point)
+//   - "TT-METAL": recognized only to report that the legacy path was removed
 // Unknown formats and malformed or unsupported TTEX blobs are rejected.
 #define IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT "TT-METAL"
 
 iree_status_t iree_hal_tt_executable_create(
-    iree_hal_device_t* device,
-    const iree_hal_executable_params_t* executable_params,
-    iree_allocator_t host_allocator,
-    iree_hal_executable_t** out_executable);
+    iree_hal_device_t *device,
+    const iree_hal_executable_params_t *executable_params,
+    iree_allocator_t host_allocator, iree_hal_executable_t **out_executable);
 
 // Looks up kernel params for a given entry point ordinal.
 // Used by queue_execute to get the TT-Metal Program for dispatch.
 // This is our internal fast-path; the vtable export_info path is
 // also available for IREE-standard queries.
 iree_status_t iree_hal_tt_executable_lookup_kernel_params(
-    iree_hal_executable_t* executable,
-    int32_t entry_point,
-    const iree_hal_tt_kernel_params_t** out_params);
+    iree_hal_executable_t *executable, int32_t entry_point,
+    const iree_hal_tt_kernel_params_t **out_params);
 
 // Mutable variant — used by dispatch to restore moved programs after execute.
 iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
-    iree_hal_executable_t* executable,
-    int32_t entry_point,
-    iree_hal_tt_kernel_params_t** out_params);
+    iree_hal_executable_t *executable, int32_t entry_point,
+    iree_hal_tt_kernel_params_t **out_params);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  // IREE_HAL_DRIVERS_TENSTORRENT_TT_EXECUTABLE_H_
+#endif // IREE_HAL_DRIVERS_TENSTORRENT_TT_EXECUTABLE_H_

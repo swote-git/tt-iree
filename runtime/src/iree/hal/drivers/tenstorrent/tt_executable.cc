@@ -5,7 +5,15 @@
 
 #include <string.h>
 
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "iree/base/api.h"
@@ -14,6 +22,9 @@
 #include "iree/schema/tt_executable_builder_util.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
+#include "impl/kernels/kernel.hpp"
+#include "impl/program/program_impl.hpp"
+#include "tt-metalium/experimental/offline_kernel_compile.hpp"
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/tensor_accessor_args.hpp"
 #include "tt-metalium/tt_metal.hpp"
@@ -27,17 +38,1253 @@
 #include "tt_executable_def_reader.h"
 #include "tt_executable_def_verifier.h"
 #define ttex_ns(x) FLATBUFFERS_WRAP_NAMESPACE(iree_tenstorrent_hal, x)
+
+static bool
+iree_hal_tt_is_safe_aot_artifact_path(flatbuffers_string_t fb_path) {
+  if (!fb_path)
+    return false;
+  std::string_view path(fb_path, flatbuffers_string_len(fb_path));
+  if (path.empty() || path.front() == '/' || path.front() == '\\' ||
+      path.find('\\') != std::string_view::npos) {
+    return false;
+  }
+  size_t component_start = 0;
+  while (component_start < path.size()) {
+    size_t component_end = path.find('/', component_start);
+    if (component_end == std::string_view::npos)
+      component_end = path.size();
+    std::string_view component =
+        path.substr(component_start, component_end - component_start);
+    if (component.empty() || component == "." || component == "..") {
+      return false;
+    }
+    component_start = component_end + 1;
+  }
+  return true;
+}
+
+static iree_status_t
+iree_hal_tt_validate_aot_kernel_bundle(ttex_ns(TTMetalKernelBundleDef_table_t)
+                                           bundle) {
+  if (!bundle) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX AOT kernel bundle is missing");
+  }
+
+  uint8_t target_arch = ttex_ns(TTMetalKernelBundleDef_target_arch(bundle));
+  if (target_arch < TT_IREE_TTEX_TARGET_ARCH_WORMHOLE_B0 ||
+      target_arch > TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX AOT target architecture is invalid");
+  }
+
+  ttex_ns(KernelSourceDef_vec_t) kernels =
+      ttex_ns(TTMetalKernelBundleDef_kernels(bundle));
+  if (ttex_ns(KernelSourceDef_vec_len(kernels)) !=
+      TT_IREE_TTEX_AOT_KERNEL_COUNT) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX AOT bundle must contain reader/writer/compute kernels");
+  }
+  bool seen_roles[TT_IREE_TTEX_AOT_KERNEL_COUNT + 1] = {};
+  for (iree_host_size_t i = 0; i < TT_IREE_TTEX_AOT_KERNEL_COUNT; ++i) {
+    ttex_ns(KernelSourceDef_table_t) kernel =
+        ttex_ns(KernelSourceDef_vec_at(kernels, i));
+    uint8_t role = ttex_ns(KernelSourceDef_role(kernel));
+    flatbuffers_string_t source = ttex_ns(KernelSourceDef_source(kernel));
+    if (role < TT_IREE_TTEX_KERNEL_ROLE_READER ||
+        role > TT_IREE_TTEX_KERNEL_ROLE_COMPUTE || seen_roles[role] ||
+        !source || flatbuffers_string_len(source) == 0) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "TTEX AOT kernel %zu has invalid role/source", i);
+    }
+    seen_roles[role] = true;
+  }
+
+  ttex_ns(ArtifactFileDef_vec_t) artifacts =
+      ttex_ns(TTMetalKernelBundleDef_artifacts(bundle));
+  iree_host_size_t artifact_count = ttex_ns(ArtifactFileDef_vec_len(artifacts));
+  if (artifact_count == 0) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX AOT bundle contains no artifacts");
+  }
+  for (iree_host_size_t i = 0; i < artifact_count; ++i) {
+    ttex_ns(ArtifactFileDef_table_t) artifact =
+        ttex_ns(ArtifactFileDef_vec_at(artifacts, i));
+    flatbuffers_string_t path = ttex_ns(ArtifactFileDef_path(artifact));
+    flatbuffers_uint8_vec_t data = ttex_ns(ArtifactFileDef_data(artifact));
+    if (!iree_hal_tt_is_safe_aot_artifact_path(path) || !data ||
+        flatbuffers_uint8_vec_len(data) == 0) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "TTEX AOT artifact %zu has invalid path/data", i);
+    }
+    for (iree_host_size_t j = 0; j < i; ++j) {
+      flatbuffers_string_t prior_path = ttex_ns(
+          ArtifactFileDef_path(ttex_ns(ArtifactFileDef_vec_at(artifacts, j))));
+      if (flatbuffers_string_len(path) == flatbuffers_string_len(prior_path) &&
+          memcmp(path, prior_path, flatbuffers_string_len(path)) == 0) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "TTEX AOT artifact path is duplicated: %s",
+                                path);
+      }
+    }
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_tt_materialize_aot_artifacts(
+    ttex_ns(TTMetalKernelBundleDef_table_t) bundle,
+    iree_allocator_t host_allocator, iree_string_view_t *out_root) {
+  IREE_ASSERT_ARGUMENT(out_root);
+  *out_root = iree_string_view_empty();
+
+  static std::atomic<uint64_t> next_id{0};
+  std::filesystem::path root;
+  try {
+    root = std::filesystem::temp_directory_path() /
+           ("tt-iree-runtime-aot-" +
+            std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()) +
+            "-" + std::to_string(next_id.fetch_add(1)));
+    std::filesystem::create_directories(root);
+
+    ttex_ns(ArtifactFileDef_vec_t) artifacts =
+        ttex_ns(TTMetalKernelBundleDef_artifacts(bundle));
+    iree_host_size_t artifact_count =
+        ttex_ns(ArtifactFileDef_vec_len(artifacts));
+    for (iree_host_size_t i = 0; i < artifact_count; ++i) {
+      ttex_ns(ArtifactFileDef_table_t) artifact =
+          ttex_ns(ArtifactFileDef_vec_at(artifacts, i));
+      flatbuffers_string_t path = ttex_ns(ArtifactFileDef_path(artifact));
+      flatbuffers_uint8_vec_t data = ttex_ns(ArtifactFileDef_data(artifact));
+      std::filesystem::path output_path =
+          root / std::string(path, flatbuffers_string_len(path));
+      std::filesystem::create_directories(output_path.parent_path());
+      std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+      if (!output) {
+        throw std::runtime_error("failed to materialize AOT artifact " +
+                                 output_path.string());
+      }
+      output.write(reinterpret_cast<const char *>(data),
+                   flatbuffers_uint8_vec_len(data));
+      if (!output) {
+        throw std::runtime_error("failed to write AOT artifact " +
+                                 output_path.string());
+      }
+    }
+
+    std::string root_string = root.string();
+    char *root_data = nullptr;
+    iree_status_t status =
+        iree_allocator_malloc(host_allocator, root_string.size(),
+                              reinterpret_cast<void **>(&root_data));
+    if (!iree_status_is_ok(status)) {
+      std::error_code ec;
+      std::filesystem::remove_all(root, ec);
+      return status;
+    }
+    memcpy(root_data, root_string.data(), root_string.size());
+    *out_root = iree_make_string_view(root_data, root_string.size());
+    return iree_ok_status();
+  } catch (const std::exception &e) {
+    if (!root.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(root, ec);
+    }
+    return iree_make_status(IREE_STATUS_INTERNAL,
+                            "failed to cache TTEX AOT artifacts: %s", e.what());
+  }
+}
+
+static iree_status_t iree_hal_tt_validate_tensor_desc(
+    ttex_ns(TensorDesc_table_t) fb_tensor, uint16_t binding_count,
+    uint16_t constant_count,
+    const char *dispatch_label, const char *tensor_label) {
+  if (!fb_tensor) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX %s %s descriptor is missing", dispatch_label,
+                            tensor_label);
+  }
+  uint8_t rank = ttex_ns(TensorDesc_rank(fb_tensor));
+  if (rank == 0 || rank > TT_IREE_TTEX_MAX_TENSOR_RANK) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX %s %s rank %u is outside supported range [1, %u]", dispatch_label,
+        tensor_label, rank, TT_IREE_TTEX_MAX_TENSOR_RANK);
+  }
+  uint16_t binding = ttex_ns(TensorDesc_binding(fb_tensor));
+  if (binding >= binding_count) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX %s %s binding %u is outside binding count %u",
+                            dispatch_label, tensor_label, binding,
+                            binding_count);
+  }
+  if (ttex_ns(TensorDesc_element_type(fb_tensor)) !=
+      TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX %s %s must use F32 elements", dispatch_label,
+                            tensor_label);
+  }
+
+  const uint32_t shape[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+      ttex_ns(TensorDesc_shape_0(fb_tensor)),
+      ttex_ns(TensorDesc_shape_1(fb_tensor)),
+      ttex_ns(TensorDesc_shape_2(fb_tensor)),
+      ttex_ns(TensorDesc_shape_3(fb_tensor)),
+  };
+  const uint32_t storage_shape[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+      ttex_ns(TensorDesc_storage_shape_0(fb_tensor)),
+      ttex_ns(TensorDesc_storage_shape_1(fb_tensor)),
+      ttex_ns(TensorDesc_storage_shape_2(fb_tensor)),
+      ttex_ns(TensorDesc_storage_shape_3(fb_tensor)),
+  };
+  const uint32_t offset[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+      ttex_ns(TensorDesc_offset_0(fb_tensor)),
+      ttex_ns(TensorDesc_offset_1(fb_tensor)),
+      ttex_ns(TensorDesc_offset_2(fb_tensor)),
+      ttex_ns(TensorDesc_offset_3(fb_tensor)),
+  };
+  const uint32_t stride[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+      std::max(1u, ttex_ns(TensorDesc_stride_0(fb_tensor))),
+      std::max(1u, ttex_ns(TensorDesc_stride_1(fb_tensor))),
+      std::max(1u, ttex_ns(TensorDesc_stride_2(fb_tensor))),
+      std::max(1u, ttex_ns(TensorDesc_stride_3(fb_tensor))),
+  };
+  uint64_t storage_element_count = 1;
+  for (uint8_t i = 0; i < rank; ++i) {
+    uint64_t last_index =
+        static_cast<uint64_t>(offset[i]) +
+        static_cast<uint64_t>(shape[i] ? shape[i] - 1 : 0) * stride[i];
+    if (shape[i] == 0 || storage_shape[i] == 0 ||
+        last_index >= storage_shape[i]) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX %s %s dimension %u has invalid shape/storage/offset/stride "
+          "%u/%u/%u/%u",
+          dispatch_label, tensor_label, i, shape[i], storage_shape[i],
+          offset[i], stride[i]);
+    }
+    if (storage_element_count >
+        std::numeric_limits<uint64_t>::max() / storage_shape[i]) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX %s %s storage element count overflows uint64", dispatch_label,
+          tensor_label);
+    }
+    storage_element_count *= storage_shape[i];
+  }
+  uint64_t byte_offset = ttex_ns(TensorDesc_byte_offset(fb_tensor));
+  uint16_t byte_offset_constant =
+      ttex_ns(TensorDesc_byte_offset_constant(fb_tensor));
+  if (byte_offset_constant > constant_count) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX %s %s byte-offset constant %u exceeds constant count %u",
+        dispatch_label, tensor_label, byte_offset_constant - 1,
+        constant_count);
+  }
+  if (byte_offset % sizeof(float) != 0 ||
+      storage_element_count >
+          std::numeric_limits<uint64_t>::max() / sizeof(float) ||
+      byte_offset > std::numeric_limits<uint64_t>::max() -
+                        storage_element_count * sizeof(float)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX %s %s has invalid byte offset/storage range",
+                            dispatch_label, tensor_label);
+  }
+  return iree_ok_status();
+}
+
+static uint64_t
+iree_hal_tt_tensor_storage_byte_length(ttex_ns(TensorDesc_table_t) tensor) {
+  const uint32_t storage_shape[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+      ttex_ns(TensorDesc_storage_shape_0(tensor)),
+      ttex_ns(TensorDesc_storage_shape_1(tensor)),
+      ttex_ns(TensorDesc_storage_shape_2(tensor)),
+      ttex_ns(TensorDesc_storage_shape_3(tensor)),
+  };
+  uint64_t length = sizeof(float);
+  for (uint8_t i = 0; i < ttex_ns(TensorDesc_rank(tensor)); ++i) {
+    length *= storage_shape[i];
+  }
+  return length;
+}
+
+static bool
+iree_hal_tt_tensor_storage_ranges_overlap(ttex_ns(TensorDesc_table_t) lhs,
+                                          ttex_ns(TensorDesc_table_t) rhs) {
+  if (ttex_ns(TensorDesc_binding(lhs)) != ttex_ns(TensorDesc_binding(rhs)))
+    return false;
+  uint64_t lhs_begin = ttex_ns(TensorDesc_byte_offset(lhs));
+  uint64_t rhs_begin = ttex_ns(TensorDesc_byte_offset(rhs));
+  uint64_t lhs_end = lhs_begin + iree_hal_tt_tensor_storage_byte_length(lhs);
+  uint64_t rhs_end = rhs_begin + iree_hal_tt_tensor_storage_byte_length(rhs);
+  return lhs_begin < rhs_end && rhs_begin < lhs_end;
+}
+
+static iree_status_t iree_hal_tt_validate_channel_vector_desc(
+    ttex_ns(TensorDesc_table_t) tensor, uint16_t binding_count,
+    uint16_t constant_count, uint32_t channel_count,
+    const char *dispatch_label, const char *tensor_label) {
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      tensor, binding_count, constant_count, dispatch_label, tensor_label));
+  if (ttex_ns(TensorDesc_rank(tensor)) != 1 ||
+      ttex_ns(TensorDesc_layout(tensor)) !=
+          TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR ||
+      ttex_ns(TensorDesc_shape_0(tensor)) != channel_count) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX %s %s must be a rank-1 F32 vector with %u channels",
+        dispatch_label, tensor_label, channel_count);
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_matmul_like_desc(ttex_ns(EntryPointDef_table_t) fb_ep,
+                                      uint32_t version) {
+  ttex_ns(MatmulLikeDef_table_t) fb_desc =
+      ttex_ns(EntryPointDef_matmul_like(fb_ep));
+  if (!fb_desc) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX matmul-like descriptor is missing");
+  }
+  if (ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like dispatch must select F32_MATMUL_LIKE builtin");
+  }
+
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  ttex_ns(TensorDesc_table_t) lhs = ttex_ns(MatmulLikeDef_lhs(fb_desc));
+  ttex_ns(TensorDesc_table_t) rhs = ttex_ns(MatmulLikeDef_rhs(fb_desc));
+  ttex_ns(TensorDesc_table_t) output = ttex_ns(MatmulLikeDef_output(fb_desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(lhs, binding_count,
+                                                        constant_count,
+                                                        "matmul-like", "lhs"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(rhs, binding_count,
+                                                        constant_count,
+                                                        "matmul-like", "rhs"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      output, binding_count, constant_count, "matmul-like", "output"));
+
+  bool is_spatial =
+      ttex_ns(TensorDesc_rank(lhs)) == 3 &&
+      ttex_ns(TensorDesc_layout(lhs)) == TT_IREE_TTEX_TENSOR_LAYOUT_CHW &&
+      ttex_ns(TensorDesc_rank(output)) == 3 &&
+      ttex_ns(TensorDesc_layout(output)) == TT_IREE_TTEX_TENSOR_LAYOUT_CHW;
+  bool is_flattened = ttex_ns(TensorDesc_rank(lhs)) == 2 &&
+                      ttex_ns(TensorDesc_layout(lhs)) ==
+                          TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR &&
+                      ttex_ns(TensorDesc_rank(output)) == 2 &&
+                      ttex_ns(TensorDesc_layout(output)) ==
+                          TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR;
+  if ((!is_spatial && !is_flattened) || ttex_ns(TensorDesc_rank(rhs)) != 2 ||
+      ttex_ns(TensorDesc_layout(rhs)) != TT_IREE_TTEX_TENSOR_LAYOUT_OI ||
+      ttex_ns(TensorDesc_rank(lhs)) != ttex_ns(TensorDesc_rank(output))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 matmul-like layout must be CHW or channel-major x OI");
+  }
+
+  uint32_t m = ttex_ns(MatmulLikeDef_m(fb_desc));
+  uint32_t n = ttex_ns(MatmulLikeDef_n(fb_desc));
+  uint32_t k = ttex_ns(MatmulLikeDef_k(fb_desc));
+  uint32_t expected_m = ttex_ns(TensorDesc_shape_1(lhs));
+  bool spatial_size_overflows = false;
+  if (is_spatial) {
+    uint32_t w = ttex_ns(TensorDesc_shape_2(lhs));
+    spatial_size_overflows =
+        w != 0 && expected_m > std::numeric_limits<uint32_t>::max() / w;
+    if (!spatial_size_overflows)
+      expected_m *= w;
+  }
+  bool output_shape_matches =
+      ttex_ns(TensorDesc_shape_0(output)) == n &&
+      ttex_ns(TensorDesc_shape_1(output)) == ttex_ns(TensorDesc_shape_1(lhs)) &&
+      (!is_spatial ||
+       ttex_ns(TensorDesc_shape_2(output)) == ttex_ns(TensorDesc_shape_2(lhs)));
+  if (m == 0 || n == 0 || k == 0 || spatial_size_overflows || m != expected_m ||
+      ttex_ns(TensorDesc_shape_0(lhs)) != k ||
+      ttex_ns(TensorDesc_shape_0(rhs)) != n ||
+      ttex_ns(TensorDesc_shape_1(rhs)) != k || !output_shape_matches) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like M/N/K does not match tensor shapes");
+  }
+  uint16_t lhsBinding = ttex_ns(TensorDesc_binding(lhs));
+  uint16_t rhsBinding = ttex_ns(TensorDesc_binding(rhs));
+  uint16_t outputBinding = ttex_ns(TensorDesc_binding(output));
+  if (lhsBinding == rhsBinding || lhsBinding == outputBinding ||
+      rhsBinding == outputBinding) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 matmul-like requires distinct lhs/rhs/output bindings");
+  }
+
+  uint32_t epilogue_flags = ttex_ns(MatmulLikeDef_epilogue_flags(fb_desc));
+  constexpr uint32_t kSupportedEpilogues =
+      TT_IREE_TTEX_EPILOGUE_AFFINE | TT_IREE_TTEX_EPILOGUE_RELU |
+      TT_IREE_TTEX_EPILOGUE_RESIDUAL | TT_IREE_TTEX_EPILOGUE_PER_CHANNEL |
+      TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE |
+      TT_IREE_TTEX_EPILOGUE_RESIDUAL_PER_CHANNEL;
+  if (epilogue_flags & ~kSupportedEpilogues) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like has unsupported epilogue flags 0x%08x",
+        epilogue_flags);
+  }
+  if (!std::isfinite(ttex_ns(MatmulLikeDef_epilogue_scale(fb_desc))) ||
+      !std::isfinite(ttex_ns(MatmulLikeDef_epilogue_bias(fb_desc)))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like epilogue scale and bias must be finite");
+  }
+  ttex_ns(TensorDesc_table_t) residual =
+      ttex_ns(MatmulLikeDef_residual(fb_desc));
+  bool has_residual = epilogue_flags & TT_IREE_TTEX_EPILOGUE_RESIDUAL;
+  flatbuffers_float_vec_t scales =
+      ttex_ns(MatmulLikeDef_epilogue_scales(fb_desc));
+  flatbuffers_float_vec_t biases =
+      ttex_ns(MatmulLikeDef_epilogue_biases(fb_desc));
+  size_t scale_count = flatbuffers_float_vec_len(scales);
+  size_t bias_count = flatbuffers_float_vec_len(biases);
+  bool has_per_channel = epilogue_flags & TT_IREE_TTEX_EPILOGUE_PER_CHANNEL;
+  bool has_runtime_affine =
+      epilogue_flags & TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+  bool has_residual_per_channel =
+      epilogue_flags & TT_IREE_TTEX_EPILOGUE_RESIDUAL_PER_CHANNEL;
+  if (has_per_channel) {
+    if (has_runtime_affine) {
+      if (version < TT_IREE_TTEX_VERSION_8 ||
+          !(epilogue_flags & TT_IREE_TTEX_EPILOGUE_AFFINE) ||
+          scale_count != 0 || bias_count != 0 ||
+          !std::isfinite(
+              ttex_ns(MatmulLikeDef_epilogue_common_scale(fb_desc)))) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX runtime matmul affine requires version 8, affine and "
+            "per-channel flags, finite common scale, and no embedded vectors");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_epilogue_mean(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "epilogue mean"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_epilogue_channel_scale(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "epilogue channel scale"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_epilogue_channel_bias(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "epilogue channel bias"));
+    } else if (version < TT_IREE_TTEX_VERSION_7 ||
+               !(epilogue_flags & TT_IREE_TTEX_EPILOGUE_AFFINE) ||
+               has_residual || scale_count != n || bias_count != n) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX per-channel matmul-like epilogue requires version 7, the "
+          "affine flag, no residual, and %u scale/bias values (got %zu/%zu)",
+          n, scale_count, bias_count);
+    }
+    for (size_t i = 0; !has_runtime_affine && i < scale_count; ++i) {
+      if (!std::isfinite(flatbuffers_float_vec_at(scales, i)) ||
+          !std::isfinite(flatbuffers_float_vec_at(biases, i))) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX per-channel matmul-like epilogue values must be finite");
+      }
+    }
+  } else if (has_runtime_affine || scale_count != 0 || bias_count != 0) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like epilogue vectors require the per-channel flag");
+  }
+  if (has_residual) {
+    IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+        residual, binding_count, constant_count, "matmul-like", "residual"));
+    if (!(epilogue_flags & TT_IREE_TTEX_EPILOGUE_AFFINE) ||
+        !(epilogue_flags & TT_IREE_TTEX_EPILOGUE_RELU) ||
+        ttex_ns(TensorDesc_rank(residual)) !=
+            ttex_ns(TensorDesc_rank(output)) ||
+        ttex_ns(TensorDesc_layout(residual)) !=
+            ttex_ns(TensorDesc_layout(output))) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX M1 residual matmul-like requires affine, ReLU, and an output-"
+          "compatible residual layout");
+    }
+    for (uint8_t i = 0; i < ttex_ns(TensorDesc_rank(output)); ++i) {
+      const uint32_t residual_shape[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+          ttex_ns(TensorDesc_shape_0(residual)),
+          ttex_ns(TensorDesc_shape_1(residual)),
+          ttex_ns(TensorDesc_shape_2(residual)),
+          ttex_ns(TensorDesc_shape_3(residual)),
+      };
+      const uint32_t output_shape[TT_IREE_TTEX_MAX_TENSOR_RANK] = {
+          ttex_ns(TensorDesc_shape_0(output)),
+          ttex_ns(TensorDesc_shape_1(output)),
+          ttex_ns(TensorDesc_shape_2(output)),
+          ttex_ns(TensorDesc_shape_3(output)),
+      };
+      if (residual_shape[i] != output_shape[i]) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX matmul-like residual shape must match output shape");
+      }
+    }
+    if (!std::isfinite(ttex_ns(MatmulLikeDef_residual_scale(fb_desc))) ||
+        !std::isfinite(ttex_ns(MatmulLikeDef_residual_bias(fb_desc)))) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX matmul-like residual scale and bias must be finite");
+    }
+    if (has_residual_per_channel) {
+      if (!has_runtime_affine || version < TT_IREE_TTEX_VERSION_8 ||
+          !std::isfinite(
+              ttex_ns(MatmulLikeDef_residual_common_scale(fb_desc)))) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX per-channel residual requires version 8 runtime affine");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_residual_mean(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "residual mean"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_residual_channel_scale(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "residual channel scale"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(MatmulLikeDef_residual_channel_bias(fb_desc)), binding_count,
+          constant_count, n, "matmul-like", "residual channel bias"));
+    }
+    if (iree_hal_tt_tensor_storage_ranges_overlap(residual, lhs) ||
+        iree_hal_tt_tensor_storage_ranges_overlap(residual, rhs) ||
+        iree_hal_tt_tensor_storage_ranges_overlap(residual, output)) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX matmul-like residual storage must not overlap other tensors");
+    }
+  } else if (residual || has_residual_per_channel) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX matmul-like residual descriptor requires the residual flag");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_conv2d_desc(ttex_ns(EntryPointDef_table_t) fb_ep,
+                                 uint32_t version) {
+  ttex_ns(Conv2DDef_table_t) fb_desc = ttex_ns(EntryPointDef_conv2d(fb_ep));
+  if (!fb_desc) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX convolution descriptor is missing");
+  }
+  if (ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX convolution dispatch must select F32_CONV2D builtin");
+  }
+
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  ttex_ns(TensorDesc_table_t) input = ttex_ns(Conv2DDef_input(fb_desc));
+  ttex_ns(TensorDesc_table_t) filter = ttex_ns(Conv2DDef_filter(fb_desc));
+  ttex_ns(TensorDesc_table_t) output = ttex_ns(Conv2DDef_output(fb_desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      input, binding_count, constant_count, "convolution", "input"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      filter, binding_count, constant_count, "convolution", "filter"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      output, binding_count, constant_count, "convolution", "output"));
+
+  if (ttex_ns(TensorDesc_rank(input)) != 3 ||
+      ttex_ns(TensorDesc_layout(input)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW ||
+      ttex_ns(TensorDesc_rank(filter)) != 4 ||
+      ttex_ns(TensorDesc_layout(filter)) != TT_IREE_TTEX_TENSOR_LAYOUT_OIHW ||
+      ttex_ns(TensorDesc_rank(output)) != 3 ||
+      ttex_ns(TensorDesc_layout(output)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 convolution layout must be CHW x OIHW -> CHW");
+  }
+
+  uint16_t input_binding = ttex_ns(TensorDesc_binding(input));
+  uint16_t filter_binding = ttex_ns(TensorDesc_binding(filter));
+  uint16_t output_binding = ttex_ns(TensorDesc_binding(output));
+  if (input_binding == filter_binding || input_binding == output_binding ||
+      filter_binding == output_binding) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 convolution requires distinct input/filter/output bindings");
+  }
+
+  uint32_t kernel_h = ttex_ns(Conv2DDef_kernel_h(fb_desc));
+  uint32_t kernel_w = ttex_ns(Conv2DDef_kernel_w(fb_desc));
+  uint32_t stride_h = ttex_ns(Conv2DDef_stride_h(fb_desc));
+  uint32_t stride_w = ttex_ns(Conv2DDef_stride_w(fb_desc));
+  uint32_t dilation_h = ttex_ns(Conv2DDef_dilation_h(fb_desc));
+  uint32_t dilation_w = ttex_ns(Conv2DDef_dilation_w(fb_desc));
+  uint32_t groups = ttex_ns(Conv2DDef_groups(fb_desc));
+  bool is_3x3_stride_1 =
+      kernel_h == 3 && kernel_w == 3 && stride_h == 1 && stride_w == 1;
+  bool is_3x3_stride_2 =
+      kernel_h == 3 && kernel_w == 3 && stride_h == 2 && stride_w == 2;
+  bool is_7x7_stride_2 =
+      kernel_h == 7 && kernel_w == 7 && stride_h == 2 && stride_w == 2;
+  if ((!is_3x3_stride_1 && !is_3x3_stride_2 && !is_7x7_stride_2) ||
+      dilation_h != 1 ||
+      dilation_w != 1 || groups != 1 ||
+      ttex_ns(Conv2DDef_padding_top(fb_desc)) != 0 ||
+      ttex_ns(Conv2DDef_padding_bottom(fb_desc)) != 0 ||
+      ttex_ns(Conv2DDef_padding_left(fb_desc)) != 0 ||
+      ttex_ns(Conv2DDef_padding_right(fb_desc)) != 0) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "TTEX M1 convolution only supports 3x3 stride-1/2 or 7x7 stride-2, "
+        "dilation 1, no implicit padding, and groups=1");
+  }
+
+  uint32_t input_c = ttex_ns(TensorDesc_shape_0(input));
+  uint32_t input_h = ttex_ns(TensorDesc_shape_1(input));
+  uint32_t input_w = ttex_ns(TensorDesc_shape_2(input));
+  uint32_t filter_o = ttex_ns(TensorDesc_shape_0(filter));
+  uint32_t filter_i = ttex_ns(TensorDesc_shape_1(filter));
+  uint32_t filter_h = ttex_ns(TensorDesc_shape_2(filter));
+  uint32_t filter_w = ttex_ns(TensorDesc_shape_3(filter));
+  uint32_t output_o = ttex_ns(TensorDesc_shape_0(output));
+  uint32_t output_h = ttex_ns(TensorDesc_shape_1(output));
+  uint32_t output_w = ttex_ns(TensorDesc_shape_2(output));
+  uint64_t effective_h = (static_cast<uint64_t>(kernel_h) - 1) * dilation_h + 1;
+  uint64_t effective_w = (static_cast<uint64_t>(kernel_w) - 1) * dilation_w + 1;
+  if (kernel_h != filter_h || kernel_w != filter_w || input_c != filter_i ||
+      output_o != filter_o || input_h < effective_h || input_w < effective_w ||
+      output_h != (input_h - effective_h) / stride_h + 1 ||
+      output_w != (input_w - effective_w) / stride_w + 1) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX convolution parameters do not match CHW/OIHW tensor shapes");
+  }
+
+  uint32_t epilogue_flags = ttex_ns(Conv2DDef_epilogue_flags(fb_desc));
+  constexpr uint32_t kSupportedEpilogues = TT_IREE_TTEX_EPILOGUE_AFFINE |
+                                           TT_IREE_TTEX_EPILOGUE_RELU |
+                                           TT_IREE_TTEX_EPILOGUE_PER_CHANNEL |
+                                           TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+  if (epilogue_flags & ~kSupportedEpilogues) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX convolution has unsupported epilogue flags 0x%08x",
+        epilogue_flags);
+  }
+  if (!std::isfinite(ttex_ns(Conv2DDef_epilogue_scale(fb_desc))) ||
+      !std::isfinite(ttex_ns(Conv2DDef_epilogue_bias(fb_desc)))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX convolution epilogue scale and bias must be finite");
+  }
+
+  flatbuffers_float_vec_t scales = ttex_ns(Conv2DDef_epilogue_scales(fb_desc));
+  flatbuffers_float_vec_t biases = ttex_ns(Conv2DDef_epilogue_biases(fb_desc));
+  size_t scale_count = flatbuffers_float_vec_len(scales);
+  size_t bias_count = flatbuffers_float_vec_len(biases);
+  bool has_per_channel = epilogue_flags & TT_IREE_TTEX_EPILOGUE_PER_CHANNEL;
+  bool has_runtime_affine =
+      epilogue_flags & TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+  if (has_per_channel) {
+    if (has_runtime_affine) {
+      if (version < TT_IREE_TTEX_VERSION_8 ||
+          !(epilogue_flags & TT_IREE_TTEX_EPILOGUE_AFFINE) ||
+          scale_count != 0 || bias_count != 0 ||
+          !std::isfinite(
+              ttex_ns(Conv2DDef_epilogue_common_scale(fb_desc)))) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX runtime convolution affine requires version 8, affine and "
+            "per-channel flags, finite common scale, and no embedded vectors");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(Conv2DDef_epilogue_mean(fb_desc)), binding_count,
+          constant_count, output_o, "convolution", "epilogue mean"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(Conv2DDef_epilogue_channel_scale(fb_desc)), binding_count,
+          constant_count, output_o, "convolution", "epilogue channel scale"));
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_channel_vector_desc(
+          ttex_ns(Conv2DDef_epilogue_channel_bias(fb_desc)), binding_count,
+          constant_count, output_o, "convolution", "epilogue channel bias"));
+    } else if (version < TT_IREE_TTEX_VERSION_5 ||
+        !(epilogue_flags & TT_IREE_TTEX_EPILOGUE_AFFINE) ||
+        scale_count != output_o || bias_count != output_o) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX per-channel convolution epilogue requires version 5, the "
+          "affine flag, and %u scale/bias values (got %zu/%zu)",
+          output_o, scale_count, bias_count);
+    }
+    for (size_t i = 0; !has_runtime_affine && i < scale_count; ++i) {
+      if (!std::isfinite(flatbuffers_float_vec_at(scales, i)) ||
+          !std::isfinite(flatbuffers_float_vec_at(biases, i))) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX per-channel convolution epilogue values must be finite");
+      }
+    }
+  } else if (has_runtime_affine || scale_count != 0 || bias_count != 0) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX convolution epilogue vectors require the per-channel flag");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_padded_copy_desc(ttex_ns(EntryPointDef_table_t) fb_ep) {
+  ttex_ns(PaddedCopyDef_table_t) fb_desc =
+      ttex_ns(EntryPointDef_padded_copy(fb_ep));
+  if (!fb_desc) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX padded-copy descriptor is missing");
+  }
+  if (ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX padded-copy dispatch must select F32_PADDED_COPY builtin");
+  }
+
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  if (binding_count != 2) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX M1 padded copy requires two bindings");
+  }
+  ttex_ns(TensorDesc_table_t) source = ttex_ns(PaddedCopyDef_source(fb_desc));
+  ttex_ns(TensorDesc_table_t) destination =
+      ttex_ns(PaddedCopyDef_destination(fb_desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      source, binding_count, constant_count, "padded-copy", "source"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      destination, binding_count, constant_count, "padded-copy",
+      "destination"));
+
+  if (ttex_ns(TensorDesc_rank(source)) != 3 ||
+      ttex_ns(TensorDesc_layout(source)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW ||
+      ttex_ns(TensorDesc_rank(destination)) != 3 ||
+      ttex_ns(TensorDesc_layout(destination)) !=
+          TT_IREE_TTEX_TENSOR_LAYOUT_CHW) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX M1 padded copy requires rank-3 CHW tensors");
+  }
+  if (ttex_ns(TensorDesc_binding(source)) ==
+      ttex_ns(TensorDesc_binding(destination))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 padded copy requires distinct source/destination bindings");
+  }
+
+  const uint32_t source_shape[3] = {
+      ttex_ns(TensorDesc_shape_0(source)),
+      ttex_ns(TensorDesc_shape_1(source)),
+      ttex_ns(TensorDesc_shape_2(source)),
+  };
+  const uint32_t destination_shape[3] = {
+      ttex_ns(TensorDesc_shape_0(destination)),
+      ttex_ns(TensorDesc_shape_1(destination)),
+      ttex_ns(TensorDesc_shape_2(destination)),
+  };
+  bool has_padding = false;
+  for (size_t i = 0; i < 3; ++i) {
+    if (source_shape[i] != destination_shape[i]) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX padded-copy source and destination logical shapes differ");
+    }
+    const uint32_t destination_storage_shape[3] = {
+        ttex_ns(TensorDesc_storage_shape_0(destination)),
+        ttex_ns(TensorDesc_storage_shape_1(destination)),
+        ttex_ns(TensorDesc_storage_shape_2(destination)),
+    };
+    const uint32_t destination_offset[3] = {
+        ttex_ns(TensorDesc_offset_0(destination)),
+        ttex_ns(TensorDesc_offset_1(destination)),
+        ttex_ns(TensorDesc_offset_2(destination)),
+    };
+    has_padding |= destination_storage_shape[i] != destination_shape[i] ||
+                   destination_offset[i] != 0;
+  }
+  if (!has_padding) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX padded copy destination is not padded");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_max_pool_desc(ttex_ns(EntryPointDef_table_t) fb_ep) {
+  ttex_ns(MaxPool2DDef_table_t) fb_desc =
+      ttex_ns(EntryPointDef_max_pool(fb_ep));
+  if (!fb_desc) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX max-pool descriptor is missing");
+  }
+  if (ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX max-pool dispatch must select F32_MAX_POOL_2D builtin");
+  }
+
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  if (binding_count != 2) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX M1 max-pool requires two bindings");
+  }
+  ttex_ns(TensorDesc_table_t) input = ttex_ns(MaxPool2DDef_input(fb_desc));
+  ttex_ns(TensorDesc_table_t) output = ttex_ns(MaxPool2DDef_output(fb_desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      input, binding_count, constant_count, "max-pool", "input"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      output, binding_count, constant_count, "max-pool", "output"));
+  if (ttex_ns(TensorDesc_rank(input)) != 3 ||
+      ttex_ns(TensorDesc_layout(input)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW ||
+      ttex_ns(TensorDesc_rank(output)) != 3 ||
+      ttex_ns(TensorDesc_layout(output)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX M1 max-pool requires rank-3 CHW tensors");
+  }
+  if (ttex_ns(TensorDesc_binding(input)) ==
+      ttex_ns(TensorDesc_binding(output))) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX M1 max-pool requires distinct input/output bindings");
+  }
+  if (ttex_ns(MaxPool2DDef_kernel_h(fb_desc)) != 3 ||
+      ttex_ns(MaxPool2DDef_kernel_w(fb_desc)) != 3 ||
+      ttex_ns(MaxPool2DDef_stride_h(fb_desc)) != 2 ||
+      ttex_ns(MaxPool2DDef_stride_w(fb_desc)) != 2 ||
+      ttex_ns(MaxPool2DDef_dilation_h(fb_desc)) != 1 ||
+      ttex_ns(MaxPool2DDef_dilation_w(fb_desc)) != 1 ||
+      ttex_ns(MaxPool2DDef_padding_top(fb_desc)) != 0 ||
+      ttex_ns(MaxPool2DDef_padding_bottom(fb_desc)) != 0 ||
+      ttex_ns(MaxPool2DDef_padding_left(fb_desc)) != 0 ||
+      ttex_ns(MaxPool2DDef_padding_right(fb_desc)) != 0) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "TTEX M1 max-pool only supports 3x3 stride-2, dilation-1, valid "
+        "pooling");
+  }
+
+  uint32_t input_c = ttex_ns(TensorDesc_shape_0(input));
+  uint32_t input_h = ttex_ns(TensorDesc_shape_1(input));
+  uint32_t input_w = ttex_ns(TensorDesc_shape_2(input));
+  uint32_t output_c = ttex_ns(TensorDesc_shape_0(output));
+  uint32_t output_h = ttex_ns(TensorDesc_shape_1(output));
+  uint32_t output_w = ttex_ns(TensorDesc_shape_2(output));
+  if (input_h < 3 || input_w < 3 || output_c != input_c ||
+      output_h != (input_h - 3) / 2 + 1 || output_w != (input_w - 3) / 2 + 1) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX max-pool parameters do not match CHW tensor shapes");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_global_sum_desc(ttex_ns(EntryPointDef_table_t) fb_ep) {
+  ttex_ns(GlobalSumDef_table_t) desc =
+      ttex_ns(EntryPointDef_global_sum(fb_ep));
+  if (!desc || ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX global-sum descriptor/builtin mismatch");
+  }
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  ttex_ns(TensorDesc_table_t) input = ttex_ns(GlobalSumDef_input(desc));
+  ttex_ns(TensorDesc_table_t) sum = ttex_ns(GlobalSumDef_sum(desc));
+  ttex_ns(TensorDesc_table_t) divisor = ttex_ns(GlobalSumDef_divisor(desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      input, binding_count, constant_count, "global-sum", "input"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      sum, binding_count, constant_count, "global-sum", "sum"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      divisor, binding_count, constant_count, "global-sum", "divisor"));
+  uint32_t reduce_h = ttex_ns(GlobalSumDef_reduce_h(desc));
+  uint32_t reduce_w = ttex_ns(GlobalSumDef_reduce_w(desc));
+  float divisor_value = ttex_ns(GlobalSumDef_divisor_value(desc));
+  if (ttex_ns(TensorDesc_rank(input)) != 3 ||
+      ttex_ns(TensorDesc_layout(input)) != TT_IREE_TTEX_TENSOR_LAYOUT_CHW ||
+      ttex_ns(TensorDesc_rank(sum)) != 1 ||
+      ttex_ns(TensorDesc_layout(sum)) !=
+          TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR ||
+      ttex_ns(TensorDesc_rank(divisor)) != 1 ||
+      ttex_ns(TensorDesc_shape_0(divisor)) != 1 ||
+      ttex_ns(TensorDesc_shape_0(sum)) != ttex_ns(TensorDesc_shape_0(input)) ||
+      reduce_h == 0 || reduce_w == 0 ||
+      reduce_h > ttex_ns(TensorDesc_shape_1(input)) ||
+      reduce_w > ttex_ns(TensorDesc_shape_2(input)) ||
+      !std::isfinite(divisor_value) ||
+      divisor_value != static_cast<float>(reduce_h * reduce_w)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX global-sum requires CHW input, channel vector output, and a "
+        "matching positive reduction divisor");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_scalar_div_desc(ttex_ns(EntryPointDef_table_t) fb_ep) {
+  ttex_ns(ScalarDivDef_table_t) desc =
+      ttex_ns(EntryPointDef_scalar_div(fb_ep));
+  if (!desc || ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX scalar-div descriptor/builtin mismatch");
+  }
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  ttex_ns(TensorDesc_table_t) input = ttex_ns(ScalarDivDef_input(desc));
+  ttex_ns(TensorDesc_table_t) divisor = ttex_ns(ScalarDivDef_divisor(desc));
+  ttex_ns(TensorDesc_table_t) output = ttex_ns(ScalarDivDef_output(desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      input, binding_count, constant_count, "scalar-div", "input"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      divisor, binding_count, constant_count, "scalar-div", "divisor"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      output, binding_count, constant_count, "scalar-div", "output"));
+  if (ttex_ns(TensorDesc_rank(input)) != 1 ||
+      ttex_ns(TensorDesc_rank(output)) != 1 ||
+      ttex_ns(TensorDesc_shape_0(input)) !=
+          ttex_ns(TensorDesc_shape_0(output)) ||
+      ttex_ns(TensorDesc_rank(divisor)) != 1 ||
+      ttex_ns(TensorDesc_shape_0(divisor)) != 1) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX scalar-div requires matching vectors and a one-element divisor");
+  }
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_tt_validate_linear_desc(ttex_ns(EntryPointDef_table_t) fb_ep) {
+  ttex_ns(LinearDef_table_t) desc = ttex_ns(EntryPointDef_linear(fb_ep));
+  if (!desc || ttex_ns(EntryPointDef_builtin(fb_ep)) !=
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "TTEX linear descriptor/builtin mismatch");
+  }
+  uint16_t binding_count = ttex_ns(EntryPointDef_binding_count(fb_ep));
+  uint16_t constant_count = ttex_ns(EntryPointDef_constant_count(fb_ep));
+  ttex_ns(TensorDesc_table_t) input = ttex_ns(LinearDef_input(desc));
+  ttex_ns(TensorDesc_table_t) weights = ttex_ns(LinearDef_weights(desc));
+  ttex_ns(TensorDesc_table_t) bias = ttex_ns(LinearDef_bias(desc));
+  ttex_ns(TensorDesc_table_t) output = ttex_ns(LinearDef_output(desc));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      input, binding_count, constant_count, "linear", "input"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      weights, binding_count, constant_count, "linear", "weights"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      bias, binding_count, constant_count, "linear", "bias"));
+  IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
+      output, binding_count, constant_count, "linear", "output"));
+  uint32_t m = ttex_ns(LinearDef_m(desc));
+  uint32_t n = ttex_ns(LinearDef_n(desc));
+  uint32_t k = ttex_ns(LinearDef_k(desc));
+  if (!m || !n || !k || ttex_ns(TensorDesc_rank(input)) != 2 ||
+      ttex_ns(TensorDesc_layout(input)) !=
+          TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR ||
+      ttex_ns(TensorDesc_rank(weights)) != 2 ||
+      ttex_ns(TensorDesc_layout(weights)) != TT_IREE_TTEX_TENSOR_LAYOUT_OI ||
+      ttex_ns(TensorDesc_rank(bias)) != 2 ||
+      ttex_ns(TensorDesc_rank(output)) != 2 ||
+      ttex_ns(TensorDesc_shape_0(input)) != m ||
+      ttex_ns(TensorDesc_shape_1(input)) != k ||
+      ttex_ns(TensorDesc_shape_0(weights)) != n ||
+      ttex_ns(TensorDesc_shape_1(weights)) != k ||
+      ttex_ns(TensorDesc_shape_0(bias)) != m ||
+      ttex_ns(TensorDesc_shape_1(bias)) != n ||
+      ttex_ns(TensorDesc_shape_0(output)) != m ||
+      ttex_ns(TensorDesc_shape_1(output)) != n) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "TTEX linear M/N/K or row-major/OI tensor layouts do not match");
+  }
+  return iree_ok_status();
+}
+
+static void iree_hal_tt_copy_tensor_desc(ttex_ns(TensorDesc_table_t) source,
+                                         tt_iree_ttex_tensor_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  target->binding = ttex_ns(TensorDesc_binding(source));
+  target->element_type = ttex_ns(TensorDesc_element_type(source));
+  target->layout = ttex_ns(TensorDesc_layout(source));
+  target->rank = ttex_ns(TensorDesc_rank(source));
+  target->shape[0] = ttex_ns(TensorDesc_shape_0(source));
+  target->shape[1] = ttex_ns(TensorDesc_shape_1(source));
+  target->shape[2] = ttex_ns(TensorDesc_shape_2(source));
+  target->shape[3] = ttex_ns(TensorDesc_shape_3(source));
+  target->storage_shape[0] = ttex_ns(TensorDesc_storage_shape_0(source));
+  target->storage_shape[1] = ttex_ns(TensorDesc_storage_shape_1(source));
+  target->storage_shape[2] = ttex_ns(TensorDesc_storage_shape_2(source));
+  target->storage_shape[3] = ttex_ns(TensorDesc_storage_shape_3(source));
+  target->offset[0] = ttex_ns(TensorDesc_offset_0(source));
+  target->offset[1] = ttex_ns(TensorDesc_offset_1(source));
+  target->offset[2] = ttex_ns(TensorDesc_offset_2(source));
+  target->offset[3] = ttex_ns(TensorDesc_offset_3(source));
+  target->byte_offset = ttex_ns(TensorDesc_byte_offset(source));
+  target->stride[0] = std::max(1u, ttex_ns(TensorDesc_stride_0(source)));
+  target->stride[1] = std::max(1u, ttex_ns(TensorDesc_stride_1(source)));
+  target->stride[2] = std::max(1u, ttex_ns(TensorDesc_stride_2(source)));
+  target->stride[3] = std::max(1u, ttex_ns(TensorDesc_stride_3(source)));
+  target->byte_offset_constant =
+      ttex_ns(TensorDesc_byte_offset_constant(source));
+}
+
+static void
+iree_hal_tt_copy_matmul_like_desc(ttex_ns(MatmulLikeDef_table_t) source,
+                                  tt_iree_ttex_matmul_like_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_lhs(source)),
+                               &target->lhs);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_rhs(source)),
+                               &target->rhs);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_output(source)),
+                               &target->output);
+  target->m = ttex_ns(MatmulLikeDef_m(source));
+  target->n = ttex_ns(MatmulLikeDef_n(source));
+  target->k = ttex_ns(MatmulLikeDef_k(source));
+  target->epilogue_flags = ttex_ns(MatmulLikeDef_epilogue_flags(source));
+  target->epilogue_scale = ttex_ns(MatmulLikeDef_epilogue_scale(source));
+  target->epilogue_bias = ttex_ns(MatmulLikeDef_epilogue_bias(source));
+  if (ttex_ns(MatmulLikeDef_residual(source))) {
+    iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_residual(source)),
+                                 &target->residual);
+  }
+  target->residual_scale = ttex_ns(MatmulLikeDef_residual_scale(source));
+  target->residual_bias = ttex_ns(MatmulLikeDef_residual_bias(source));
+  flatbuffers_float_vec_t scales =
+      ttex_ns(MatmulLikeDef_epilogue_scales(source));
+  flatbuffers_float_vec_t biases =
+      ttex_ns(MatmulLikeDef_epilogue_biases(source));
+  target->epilogue_channel_count = flatbuffers_float_vec_len(scales);
+  target->epilogue_scales = scales;
+  target->epilogue_biases = biases;
+  if (ttex_ns(MatmulLikeDef_epilogue_mean(source))) {
+    iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_epilogue_mean(source)),
+                                 &target->epilogue_mean);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(MatmulLikeDef_epilogue_channel_scale(source)),
+        &target->epilogue_channel_scale);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(MatmulLikeDef_epilogue_channel_bias(source)),
+        &target->epilogue_channel_bias);
+  }
+  target->epilogue_common_scale =
+      ttex_ns(MatmulLikeDef_epilogue_common_scale(source));
+  if (ttex_ns(MatmulLikeDef_residual_mean(source))) {
+    iree_hal_tt_copy_tensor_desc(ttex_ns(MatmulLikeDef_residual_mean(source)),
+                                 &target->residual_mean);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(MatmulLikeDef_residual_channel_scale(source)),
+        &target->residual_channel_scale);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(MatmulLikeDef_residual_channel_bias(source)),
+        &target->residual_channel_bias);
+  }
+  target->residual_common_scale =
+      ttex_ns(MatmulLikeDef_residual_common_scale(source));
+}
+
+static void iree_hal_tt_copy_conv2d_desc(ttex_ns(Conv2DDef_table_t) source,
+                                         tt_iree_ttex_conv2d_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(Conv2DDef_input(source)),
+                               &target->input);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(Conv2DDef_filter(source)),
+                               &target->filter);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(Conv2DDef_output(source)),
+                               &target->output);
+  target->kernel_h = ttex_ns(Conv2DDef_kernel_h(source));
+  target->kernel_w = ttex_ns(Conv2DDef_kernel_w(source));
+  target->stride_h = ttex_ns(Conv2DDef_stride_h(source));
+  target->stride_w = ttex_ns(Conv2DDef_stride_w(source));
+  target->dilation_h = ttex_ns(Conv2DDef_dilation_h(source));
+  target->dilation_w = ttex_ns(Conv2DDef_dilation_w(source));
+  target->padding_top = ttex_ns(Conv2DDef_padding_top(source));
+  target->padding_bottom = ttex_ns(Conv2DDef_padding_bottom(source));
+  target->padding_left = ttex_ns(Conv2DDef_padding_left(source));
+  target->padding_right = ttex_ns(Conv2DDef_padding_right(source));
+  target->groups = ttex_ns(Conv2DDef_groups(source));
+  target->epilogue_flags = ttex_ns(Conv2DDef_epilogue_flags(source));
+  target->epilogue_scale = ttex_ns(Conv2DDef_epilogue_scale(source));
+  target->epilogue_bias = ttex_ns(Conv2DDef_epilogue_bias(source));
+  flatbuffers_float_vec_t scales = ttex_ns(Conv2DDef_epilogue_scales(source));
+  flatbuffers_float_vec_t biases = ttex_ns(Conv2DDef_epilogue_biases(source));
+  target->epilogue_channel_count = flatbuffers_float_vec_len(scales);
+  target->epilogue_scales = scales;
+  target->epilogue_biases = biases;
+  if (ttex_ns(Conv2DDef_epilogue_mean(source))) {
+    iree_hal_tt_copy_tensor_desc(ttex_ns(Conv2DDef_epilogue_mean(source)),
+                                 &target->epilogue_mean);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(Conv2DDef_epilogue_channel_scale(source)),
+        &target->epilogue_channel_scale);
+    iree_hal_tt_copy_tensor_desc(
+        ttex_ns(Conv2DDef_epilogue_channel_bias(source)),
+        &target->epilogue_channel_bias);
+  }
+  target->epilogue_common_scale =
+      ttex_ns(Conv2DDef_epilogue_common_scale(source));
+}
+
+static void
+iree_hal_tt_copy_padded_copy_desc(ttex_ns(PaddedCopyDef_table_t) source,
+                                  tt_iree_ttex_padded_copy_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(PaddedCopyDef_source(source)),
+                               &target->source);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(PaddedCopyDef_destination(source)),
+                               &target->destination);
+}
+
+static void
+iree_hal_tt_copy_max_pool_desc(ttex_ns(MaxPool2DDef_table_t) source,
+                               tt_iree_ttex_max_pool_2d_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(MaxPool2DDef_input(source)),
+                               &target->input);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(MaxPool2DDef_output(source)),
+                               &target->output);
+  target->kernel_h = ttex_ns(MaxPool2DDef_kernel_h(source));
+  target->kernel_w = ttex_ns(MaxPool2DDef_kernel_w(source));
+  target->stride_h = ttex_ns(MaxPool2DDef_stride_h(source));
+  target->stride_w = ttex_ns(MaxPool2DDef_stride_w(source));
+  target->dilation_h = ttex_ns(MaxPool2DDef_dilation_h(source));
+  target->dilation_w = ttex_ns(MaxPool2DDef_dilation_w(source));
+  target->padding_top = ttex_ns(MaxPool2DDef_padding_top(source));
+  target->padding_bottom = ttex_ns(MaxPool2DDef_padding_bottom(source));
+  target->padding_left = ttex_ns(MaxPool2DDef_padding_left(source));
+  target->padding_right = ttex_ns(MaxPool2DDef_padding_right(source));
+}
+
+static void
+iree_hal_tt_copy_global_sum_desc(ttex_ns(GlobalSumDef_table_t) source,
+                                 tt_iree_ttex_global_sum_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(GlobalSumDef_input(source)),
+                               &target->input);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(GlobalSumDef_sum(source)), &target->sum);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(GlobalSumDef_divisor(source)),
+                               &target->divisor);
+  target->reduce_h = ttex_ns(GlobalSumDef_reduce_h(source));
+  target->reduce_w = ttex_ns(GlobalSumDef_reduce_w(source));
+  target->divisor_value = ttex_ns(GlobalSumDef_divisor_value(source));
+}
+
+static void
+iree_hal_tt_copy_scalar_div_desc(ttex_ns(ScalarDivDef_table_t) source,
+                                 tt_iree_ttex_scalar_div_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(ScalarDivDef_input(source)),
+                               &target->input);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(ScalarDivDef_divisor(source)),
+                               &target->divisor);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(ScalarDivDef_output(source)),
+                               &target->output);
+}
+
+static void iree_hal_tt_copy_linear_desc(ttex_ns(LinearDef_table_t) source,
+                                         tt_iree_ttex_linear_desc_t *target) {
+  memset(target, 0, sizeof(*target));
+  iree_hal_tt_copy_tensor_desc(ttex_ns(LinearDef_input(source)),
+                               &target->input);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(LinearDef_weights(source)),
+                               &target->weights);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(LinearDef_bias(source)), &target->bias);
+  iree_hal_tt_copy_tensor_desc(ttex_ns(LinearDef_output(source)),
+                               &target->output);
+  target->m = ttex_ns(LinearDef_m(source));
+  target->n = ttex_ns(LinearDef_n(source));
+  target->k = ttex_ns(LinearDef_k(source));
+}
+
+#ifndef TT_IREE_ENABLE_MOCK
+static std::string iree_hal_tt_find_aot_kernel_source(
+    ttex_ns(TTMetalKernelBundleDef_table_t) bundle, uint8_t role) {
+  ttex_ns(KernelSourceDef_vec_t) kernels =
+      ttex_ns(TTMetalKernelBundleDef_kernels(bundle));
+  size_t kernel_count = ttex_ns(KernelSourceDef_vec_len(kernels));
+  for (size_t i = 0; i < kernel_count; ++i) {
+    ttex_ns(KernelSourceDef_table_t) kernel =
+        ttex_ns(KernelSourceDef_vec_at(kernels, i));
+    if (ttex_ns(KernelSourceDef_role(kernel)) != role)
+      continue;
+    flatbuffers_string_t source = ttex_ns(KernelSourceDef_source(kernel));
+    return std::string(source, flatbuffers_string_len(source));
+  }
+  throw std::runtime_error("AOT kernel role is missing");
+}
+
+template <typename CoreSpec, typename KernelConfig>
+static tt::tt_metal::KernelHandle
+iree_hal_tt_create_kernel_from_embedded_precompiled(
+    tt::tt_metal::Program &program, const std::string &source,
+    const CoreSpec &core_spec, const KernelConfig &config,
+    const std::string &artifact_root) {
+  tt::tt_metal::KernelHandle kernel =
+      tt::tt_metal::CreateKernelFromString(program, source, core_spec, config);
+  program.impl().get_kernel(kernel)->set_precompiled_config(
+      tt::tt_metal::experimental::PrecompiledKernelConfig{
+          .precompiled_dir = artifact_root,
+          .fallback_policy = tt::tt_metal::experimental::
+              PrecompiledKernelConfig::FallbackPolicy::Error,
+      });
+  return kernel;
+}
+
+static std::string iree_hal_tt_require_aot_artifact_root(
+    const iree_hal_tt_kernel_params_t *params) {
+  if (iree_string_view_is_empty(params->aot_artifact_root)) {
+    throw std::runtime_error("AOT artifact cache is missing");
+  }
+  return std::string(params->aot_artifact_root.data,
+                     params->aot_artifact_root.size);
+}
+#endif
 #endif
 
 static bool iree_hal_tt_is_supported_builtin(uint32_t builtin_program) {
   switch (builtin_program) {
-    case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
-    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
-    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
-      return true;
-    default:
-      return false;
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV:
+  case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR:
+    return true;
+  default:
+    return false;
   }
+}
+
+static void
+iree_hal_tt_cleanup_aot_artifacts(iree_allocator_t host_allocator,
+                                  iree_hal_tt_kernel_params_t *params) {
+  if (iree_string_view_is_empty(params->aot_artifact_root))
+    return;
+  std::filesystem::path root(std::string(params->aot_artifact_root.data,
+                                         params->aot_artifact_root.size));
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  iree_allocator_free(host_allocator,
+                      const_cast<char *>(params->aot_artifact_root.data));
+  params->aot_artifact_root = iree_string_view_empty();
 }
 
 //===----------------------------------------------------------------------===//
@@ -47,12 +1294,12 @@ static bool iree_hal_tt_is_supported_builtin(uint32_t builtin_program) {
 typedef struct iree_hal_tt_executable_t {
   iree_hal_resource_t resource;
   iree_allocator_t host_allocator;
-  iree_hal_device_t* device;
+  iree_hal_device_t *device;
 
   // Owned copy of executable_data (TTEX FlatBuffer).
   // Entry point name pointers reference into this buffer, so it must
   // outlive the executable.  NULL for legacy path.
-  uint8_t* owned_data;
+  uint8_t *owned_data;
   iree_host_size_t owned_data_length;
 
   iree_host_size_t entry_point_count;
@@ -64,22 +1311,27 @@ typedef struct iree_hal_tt_executable_t {
 // Forward declare vtable
 extern const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable;
 
-static iree_hal_tt_executable_t* iree_hal_tt_executable_cast(
-    iree_hal_executable_t* base) {
+static iree_hal_tt_executable_t *
+iree_hal_tt_executable_cast(iree_hal_executable_t *base) {
   IREE_HAL_ASSERT_TYPE(base, &iree_hal_tt_executable_vtable);
-  return (iree_hal_tt_executable_t*)base;
+  return (iree_hal_tt_executable_t *)base;
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: Create TT-Metal Program from Source (JIT) — unchanged from existing
+// Helper: Create fixed-builtin programs from compiler-generated AOT bundles
 //===----------------------------------------------------------------------===//
 
 #ifndef TT_IREE_ENABLE_MOCK
 static iree_status_t iree_hal_tt_create_program_for_custom_sfpi_add(
-    iree_hal_tt_kernel_params_t* params) {
+    iree_hal_tt_kernel_params_t *params) {
+#ifndef TT_IREE_ENABLE_TTEX
+  (void)params;
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "AOT kernels require TTEX support");
+#else
   params->program = new tt::tt_metal::Program();
-  tt::tt_metal::Program& program =
-      *static_cast<tt::tt_metal::Program*>(params->program);
+  tt::tt_metal::Program &program =
+      *static_cast<tt::tt_metal::Program *>(params->program);
 
   tt::tt_metal::CoreCoord core_coord = {0, 0};
   tt::tt_metal::CoreRange core(core_coord);
@@ -88,7 +1340,7 @@ static iree_status_t iree_hal_tt_create_program_for_custom_sfpi_add(
 
   // Circular Buffers (3 CBs for elementwise binary ops)
   constexpr uint32_t tiles_per_cb = 2;
-  constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16
+  constexpr uint32_t tile_size_bytes = 32 * 32 * 2; // bfloat16
 
   tt::CBIndex src0_cb_index = tt::CBIndex::c_0;
   tt::tt_metal::CreateCircularBuffer(
@@ -130,47 +1382,59 @@ static iree_status_t iree_hal_tt_create_program_for_custom_sfpi_add(
       writer_compile_args);
   writer_compile_args.back() = tile_size_bytes;
 
-  params->reader_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
-      "read_tiles.cpp",
-      core,
-      tt::tt_metal::DataMovementConfig{
-          .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-          .noc = tt::tt_metal::NOC::RISCV_0_default,
-          .compile_args = reader_compile_args});
+  tt::tt_metal::DataMovementConfig reader_config{
+      .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+      .noc = tt::tt_metal::NOC::RISCV_0_default,
+      .compile_args = reader_compile_args};
+  tt::tt_metal::DataMovementConfig writer_config{
+      .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+      .noc = tt::tt_metal::NOC::RISCV_1_default,
+      .compile_args = writer_compile_args};
+  tt::tt_metal::ComputeConfig compute_config{};
 
-  params->writer_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tt_metal/programming_examples/custom_sfpi_add/kernels/dataflow/"
-      "write_tile.cpp",
-      core,
-      tt::tt_metal::DataMovementConfig{
-          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-          .noc = tt::tt_metal::NOC::RISCV_1_default,
-          .compile_args = writer_compile_args});
-
-  params->compute_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tt_metal/programming_examples/custom_sfpi_add/kernels/compute/"
-      "tiles_add.cpp",
-      core, tt::tt_metal::ComputeConfig{});
+  auto aot_bundle = static_cast<ttex_ns(TTMetalKernelBundleDef_table_t)>(
+      params->aot_kernel_bundle);
+  std::string artifact_root = iree_hal_tt_require_aot_artifact_root(params);
+  params->reader_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_READER),
+          core, reader_config, artifact_root);
+  params->writer_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_WRITER),
+          core, writer_config, artifact_root);
+  params->compute_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_COMPUTE),
+          core, compute_config, artifact_root);
 
   return iree_ok_status();
+#endif // TT_IREE_ENABLE_TTEX
 }
 
 static iree_status_t iree_hal_tt_create_program_for_bf16_matmul_32x32x32(
-    iree_hal_tt_kernel_params_t* params) {
+    iree_hal_tt_kernel_params_t *params) {
+#ifndef TT_IREE_ENABLE_TTEX
+  (void)params;
+  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                          "AOT kernels require TTEX support");
+#else
   params->program = new tt::tt_metal::Program();
-  tt::tt_metal::Program& program =
-      *static_cast<tt::tt_metal::Program*>(params->program);
+  tt::tt_metal::Program &program =
+      *static_cast<tt::tt_metal::Program *>(params->program);
 
   tt::tt_metal::CoreCoord core_coord = {0, 0};
   tt::tt_metal::CoreRange core(core_coord);
   params->core_range_x = 1;
   params->core_range_y = 1;
 
-  constexpr uint32_t tile_size_bytes = 32 * 32 * 2;  // bfloat16
+  constexpr uint32_t tile_size_bytes = 32 * 32 * 2; // bfloat16
 
   tt::tt_metal::CreateCircularBuffer(
       program, core,
@@ -187,63 +1451,87 @@ static iree_status_t iree_hal_tt_create_program_for_bf16_matmul_32x32x32(
       tt::tt_metal::CircularBufferConfig(
           tile_size_bytes, {{tt::CBIndex::c_16, tt::DataFormat::Float16_b}})
           .set_page_size(tt::CBIndex::c_16, tile_size_bytes));
+  tt::tt_metal::CreateCircularBuffer(
+      program, core,
+      tt::tt_metal::CircularBufferConfig(
+          tile_size_bytes, {{tt::CBIndex::c_24, tt::DataFormat::Float16_b}})
+          .set_page_size(tt::CBIndex::c_24, tile_size_bytes));
 
-  params->reader_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_blocked.cpp",
-      core,
-      tt::tt_metal::DataMovementConfig{
-          .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
-          .noc = tt::tt_metal::NOC::RISCV_1_default});
+  tt::tt_metal::DataMovementConfig reader_config{
+      .processor = tt::tt_metal::DataMovementProcessor::RISCV_1,
+      .noc = tt::tt_metal::NOC::RISCV_1_default};
+  tt::tt_metal::DataMovementConfig writer_config{
+      .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+      .noc = tt::tt_metal::NOC::RISCV_0_default};
 
-  params->writer_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_unary.cpp",
-      core,
-      tt::tt_metal::DataMovementConfig{
-          .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
-          .noc = tt::tt_metal::NOC::RISCV_0_default});
-
-  std::vector<uint32_t> compute_kernel_args = {
-      1,  // block_tile_dim
-      1,  // dst_tile_rows
-      1,  // dst_tile_cols
-      1,  // block_cnt
-      1,  // in0_block_tile_cnt
-      1,  // in1_block_tile_cnt
-      1,  // out_block_tile_cnt
-  };
-  params->compute_kernel_id = tt::tt_metal::CreateKernel(
-      program,
-      "tests/tt_metal/tt_metal/test_kernels/compute/matmul.cpp",
-      core, tt::tt_metal::ComputeConfig{.compile_args = compute_kernel_args});
+  auto aot_bundle = static_cast<ttex_ns(TTMetalKernelBundleDef_table_t)>(
+      params->aot_kernel_bundle);
+  std::string artifact_root = iree_hal_tt_require_aot_artifact_root(params);
+  params->reader_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_READER),
+          core, reader_config, artifact_root);
+  params->writer_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_WRITER),
+          core, writer_config, artifact_root);
+  params->compute_kernel_id =
+      iree_hal_tt_create_kernel_from_embedded_precompiled(
+          program,
+          iree_hal_tt_find_aot_kernel_source(aot_bundle,
+                                             TT_IREE_TTEX_KERNEL_ROLE_COMPUTE),
+          core, tt::tt_metal::ComputeConfig{}, artifact_root);
 
   return iree_ok_status();
+#endif // TT_IREE_ENABLE_TTEX
 }
 
-static iree_status_t iree_hal_tt_create_program_for_builtin(
-    iree_hal_device_t* device,
-    uint32_t builtin_program,
-    iree_hal_tt_kernel_params_t* params) {
+static iree_status_t
+iree_hal_tt_create_program_for_builtin(iree_hal_device_t *device,
+                                       uint32_t builtin_program,
+                                       iree_hal_tt_kernel_params_t *params) {
   try {
     (void)device;
     params->builtin_program = builtin_program;
     switch (builtin_program) {
-      case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
-        return iree_hal_tt_create_program_for_custom_sfpi_add(params);
-      case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
-        return iree_hal_tt_create_program_for_bf16_matmul_32x32x32(params);
-      case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
-        // The tiled matmul path builds a program at dispatch time because
-        // shape and core-grid selection may depend on runtime constants.
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD:
+      if (!params->aot_kernel_bundle) {
         params->program = nullptr;
         return iree_ok_status();
-      default:
-        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "unsupported TTEX builtin program %u",
-                                builtin_program);
+      }
+      return iree_hal_tt_create_program_for_custom_sfpi_add(params);
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
+      if (!params->aot_kernel_bundle) {
+        params->program = nullptr;
+        return iree_ok_status();
+      }
+      return iree_hal_tt_create_program_for_bf16_matmul_32x32x32(params);
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED:
+      // The tiled matmul path builds a program at dispatch time because
+      // shape and core-grid selection may depend on runtime constants.
+      params->program = nullptr;
+      return iree_ok_status();
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV:
+    case TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR:
+      // Descriptor parsing is supported before device execution so compiler
+      // and runtime ABI work can advance independently of the kernel.
+      params->program = nullptr;
+      return iree_ok_status();
+    default:
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "unsupported TTEX builtin program %u",
+                              builtin_program);
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     return iree_make_status(IREE_STATUS_INTERNAL,
                             "Failed to create TT-Metal program: %s", e.what());
   }
@@ -254,9 +1542,9 @@ static iree_status_t iree_hal_tt_create_program_for_builtin(
 // Vtable: export_count
 //===----------------------------------------------------------------------===//
 
-static iree_host_size_t iree_hal_tt_executable_export_count(
-    iree_hal_executable_t* base_executable) {
-  iree_hal_tt_executable_t* executable =
+static iree_host_size_t
+iree_hal_tt_executable_export_count(iree_hal_executable_t *base_executable) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
   return executable->entry_point_count;
 }
@@ -266,10 +1554,10 @@ static iree_host_size_t iree_hal_tt_executable_export_count(
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_tt_executable_export_info(
-    iree_hal_executable_t* base_executable,
+    iree_hal_executable_t *base_executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
-    iree_hal_executable_export_info_t* out_info) {
-  iree_hal_tt_executable_t* executable =
+    iree_hal_executable_export_info_t *out_info) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
   if (!out_info) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "out_info is null");
@@ -280,7 +1568,7 @@ static iree_status_t iree_hal_tt_executable_export_info(
                             export_ordinal, executable->entry_point_count);
   }
 
-  const iree_hal_tt_entry_point_t* ep =
+  const iree_hal_tt_entry_point_t *ep =
       &executable->entry_points[export_ordinal];
   memset(out_info, 0, sizeof(*out_info));
   out_info->name = ep->name;
@@ -298,11 +1586,11 @@ static iree_status_t iree_hal_tt_executable_export_info(
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_tt_executable_export_parameters(
-    iree_hal_executable_t* base_executable,
+    iree_hal_executable_t *base_executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     iree_host_size_t capacity,
-    iree_hal_executable_export_parameter_t* out_parameters) {
-  iree_hal_tt_executable_t* executable =
+    iree_hal_executable_export_parameter_t *out_parameters) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
   if (export_ordinal >= executable->entry_point_count) {
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
@@ -322,10 +1610,9 @@ static iree_status_t iree_hal_tt_executable_export_parameters(
 //===----------------------------------------------------------------------===//
 
 static iree_status_t iree_hal_tt_executable_lookup_export_by_name(
-    iree_hal_executable_t* base_executable,
-    iree_string_view_t name,
-    iree_hal_executable_export_ordinal_t* out_export_ordinal) {
-  iree_hal_tt_executable_t* executable =
+    iree_hal_executable_t *base_executable, iree_string_view_t name,
+    iree_hal_executable_export_ordinal_t *out_export_ordinal) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
   if (!out_export_ordinal) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
@@ -338,30 +1625,34 @@ static iree_status_t iree_hal_tt_executable_lookup_export_by_name(
       return iree_ok_status();
     }
   }
-  return iree_make_status(IREE_STATUS_NOT_FOUND,
-                           "export '%.*s' not found",
-                           (int)name.size, name.data);
+  return iree_make_status(IREE_STATUS_NOT_FOUND, "export '%.*s' not found",
+                          (int)name.size, name.data);
 }
 
 //===----------------------------------------------------------------------===//
 // Destroy
 //===----------------------------------------------------------------------===//
 
-static void iree_hal_tt_executable_destroy(
-    iree_hal_executable_t* base_executable) {
-  iree_hal_tt_executable_t* executable =
+static void
+iree_hal_tt_executable_destroy(iree_hal_executable_t *base_executable) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
 
 #ifndef TT_IREE_ENABLE_MOCK
   for (iree_host_size_t i = 0; i < executable->entry_point_count; ++i) {
-    iree_hal_tt_kernel_params_t* kp =
+    iree_hal_tt_kernel_params_t *kp =
         &executable->entry_points[i].kernel_params;
     if (kp->program) {
-      delete static_cast<tt::tt_metal::Program*>(kp->program);
+      delete static_cast<tt::tt_metal::Program *>(kp->program);
       kp->program = NULL;
     }
   }
 #endif
+
+  for (iree_host_size_t i = 0; i < executable->entry_point_count; ++i) {
+    iree_hal_tt_cleanup_aot_artifacts(
+        executable->host_allocator, &executable->entry_points[i].kernel_params);
+  }
 
   // Free owned FlatBuffer copy
   if (executable->owned_data) {
@@ -389,71 +1680,14 @@ const iree_hal_executable_vtable_t iree_hal_tt_executable_vtable = {
 };
 
 //===----------------------------------------------------------------------===//
-// Creation: Legacy path (no FlatBuffer, hardcoded single entry point)
-//===----------------------------------------------------------------------===//
-
-static iree_status_t iree_hal_tt_executable_create_legacy(
-    iree_hal_device_t* device,
-    const iree_hal_executable_params_t* params,
-    iree_allocator_t host_allocator,
-    iree_hal_executable_t** out_executable) {
-  // Allocate with 1 entry point
-  iree_host_size_t entry_point_count = 1;
-  iree_host_size_t total_size =
-      sizeof(iree_hal_tt_executable_t) +
-      entry_point_count * sizeof(iree_hal_tt_entry_point_t);
-
-  iree_hal_tt_executable_t* executable = NULL;
-  IREE_RETURN_IF_ERROR(
-      iree_allocator_malloc(host_allocator, total_size, (void**)&executable));
-  memset(executable, 0, total_size);
-
-  iree_hal_resource_initialize(&iree_hal_tt_executable_vtable,
-                               &executable->resource);
-  executable->host_allocator = host_allocator;
-  executable->device = device;
-  executable->owned_data = NULL;
-  executable->owned_data_length = 0;
-  executable->entry_point_count = entry_point_count;
-
-  // Populate the single entry point with PoC defaults
-  iree_hal_tt_entry_point_t* ep = &executable->entry_points[0];
-  ep->name = iree_make_cstring_view("legacy_dispatch_0");
-  ep->constant_count = 0;
-  ep->binding_count = 3;  // in0, in1, out
-  ep->flags = 0;
-  ep->workgroup_size[0] = 1;
-  ep->workgroup_size[1] = 1;
-  ep->workgroup_size[2] = 1;
-  ep->builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
-  ep->builtin_m_tiles = 0;
-  ep->builtin_n_tiles = 0;
-  ep->builtin_k_tiles = 0;
-
-#ifndef TT_IREE_ENABLE_MOCK
-  iree_status_t status = iree_hal_tt_create_program_for_builtin(
-      device, ep->builtin_program, &ep->kernel_params);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_executable_destroy((iree_hal_executable_t*)executable);
-    return status;
-  }
-#endif
-
-  *out_executable = (iree_hal_executable_t*)executable;
-  return iree_ok_status();
-}
-
-//===----------------------------------------------------------------------===//
 // Creation: TTEX FlatBuffer path
 //===----------------------------------------------------------------------===//
 
 #ifdef TT_IREE_ENABLE_TTEX
 static iree_status_t iree_hal_tt_executable_create_ttex(
-    iree_hal_device_t* device,
-    const iree_hal_executable_params_t* params,
-    iree_allocator_t host_allocator,
-    iree_hal_executable_t** out_executable) {
-  const uint8_t* fb_data = params->executable_data.data;
+    iree_hal_device_t *device, const iree_hal_executable_params_t *params,
+    iree_allocator_t host_allocator, iree_hal_executable_t **out_executable) {
+  const uint8_t *fb_data = params->executable_data.data;
   iree_host_size_t fb_size = params->executable_data.data_length;
 
   // 1) Verify TTEX FlatBuffer
@@ -466,18 +1700,19 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
 
   // 2) Validate the wire-format version and entry point metadata before any
   // allocations or TT-Metal program creation.
-  ttex_ns(ExecutableDef_table_t) def =
-      ttex_ns(ExecutableDef_as_root(fb_data));
+  ttex_ns(ExecutableDef_table_t) def = ttex_ns(ExecutableDef_as_root(fb_data));
   uint32_t version = ttex_ns(ExecutableDef_version(def));
-  if (version != TT_IREE_TTEX_CURRENT_VERSION) {
+  if (version != TT_IREE_TTEX_VERSION_1 && version != TT_IREE_TTEX_VERSION_2 &&
+      version != TT_IREE_TTEX_VERSION_3 && version != TT_IREE_TTEX_VERSION_4 &&
+      version != TT_IREE_TTEX_VERSION_5 && version != TT_IREE_TTEX_VERSION_6 &&
+      version != TT_IREE_TTEX_VERSION_7 && version != TT_IREE_TTEX_VERSION_8) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
-        "unsupported TTEX version %u (runtime supports version %u)", version,
-        TT_IREE_TTEX_CURRENT_VERSION);
+        "unsupported TTEX version %u (runtime supports versions %u-%u)",
+        version, TT_IREE_TTEX_VERSION_1, TT_IREE_TTEX_CURRENT_VERSION);
   }
 
-  ttex_ns(EntryPointDef_vec_t) eps =
-      ttex_ns(ExecutableDef_entry_points(def));
+  ttex_ns(EntryPointDef_vec_t) eps = ttex_ns(ExecutableDef_entry_points(def));
   iree_host_size_t ep_count = ttex_ns(EntryPointDef_vec_len(eps));
   if (ep_count == 0) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
@@ -493,16 +1728,117 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
                               "program %u",
                               i, builtin_program);
     }
+    uint8_t dispatch_kind = ttex_ns(EntryPointDef_dispatch_kind(fb_ep));
+    if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BUILTIN) {
+      if (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV ||
+          builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX entry point %zu selects descriptor-driven builtin %u "
+            "without a descriptor",
+            i, builtin_program);
+      }
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE) {
+      if (version < TT_IREE_TTEX_VERSION_2) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX v1 entry point %zu cannot contain a matmul-like descriptor",
+            i);
+      }
+      IREE_RETURN_IF_ERROR(
+          iree_hal_tt_validate_matmul_like_desc(fb_ep, version));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION) {
+      if (version < TT_IREE_TTEX_VERSION_2) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX v1 entry point %zu cannot contain a convolution descriptor",
+            i);
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_conv2d_desc(fb_ep, version));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {
+      if (version < TT_IREE_TTEX_VERSION_4) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX version %u entry point %zu cannot contain a padded-copy "
+            "descriptor",
+            version, i);
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_padded_copy_desc(fb_ep));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) {
+      if (version < TT_IREE_TTEX_VERSION_6) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX version %u entry point %zu cannot contain a max-pool "
+            "descriptor",
+            version, i);
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_max_pool_desc(fb_ep));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM) {
+      if (version < TT_IREE_TTEX_VERSION_8) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "TTEX global-sum requires version 8");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_global_sum_desc(fb_ep));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
+      if (version < TT_IREE_TTEX_VERSION_8) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "TTEX scalar-div requires version 8");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_scalar_div_desc(fb_ep));
+    } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
+      if (version < TT_IREE_TTEX_VERSION_8) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "TTEX linear requires version 8");
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_linear_desc(fb_ep));
+    } else {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX entry point %zu has unknown dispatch kind %u", i,
+          dispatch_kind);
+    }
+
+    ttex_ns(TTMetalKernelBundleDef_table_t) aot_bundle =
+        ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep));
+    if (aot_bundle) {
+      if (version < TT_IREE_TTEX_VERSION_3) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX version %u entry point %zu cannot contain an AOT bundle",
+            version, i);
+      }
+      bool is_aot_builtin =
+          dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BUILTIN &&
+          (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD ||
+           builtin_program ==
+               TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32 ||
+           builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED);
+      if (dispatch_kind != TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE &&
+          dispatch_kind != TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION &&
+          dispatch_kind != TT_IREE_TTEX_DISPATCH_KIND_LINEAR &&
+          !is_aot_builtin) {
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "TTEX AOT bundle is unsupported for builtin %u and dispatch kind "
+            "%u",
+            builtin_program, dispatch_kind);
+      }
+      IREE_RETURN_IF_ERROR(iree_hal_tt_validate_aot_kernel_bundle(aot_bundle));
+    }
   }
 
   // 3) Allocate executable + flexible array
-  iree_host_size_t total_size =
-      sizeof(iree_hal_tt_executable_t) +
-      ep_count * sizeof(iree_hal_tt_entry_point_t);
+  iree_host_size_t total_size = sizeof(iree_hal_tt_executable_t) +
+                                ep_count * sizeof(iree_hal_tt_entry_point_t);
 
-  iree_hal_tt_executable_t* executable = NULL;
+  iree_hal_tt_executable_t *executable = NULL;
   IREE_RETURN_IF_ERROR(
-      iree_allocator_malloc(host_allocator, total_size, (void**)&executable));
+      iree_allocator_malloc(host_allocator, total_size, (void **)&executable));
   memset(executable, 0, total_size);
 
   iree_hal_resource_initialize(&iree_hal_tt_executable_vtable,
@@ -513,7 +1849,7 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
 
   // 4) Copy executable_data (string pointers from reader reference this buffer)
   iree_status_t status = iree_allocator_malloc(
-      host_allocator, fb_size, (void**)&executable->owned_data);
+      host_allocator, fb_size, (void **)&executable->owned_data);
   if (!iree_status_is_ok(status)) {
     iree_allocator_free(host_allocator, executable);
     return status;
@@ -528,10 +1864,10 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
   for (iree_host_size_t i = 0; i < ep_count; ++i) {
     ttex_ns(EntryPointDef_table_t) fb_ep =
         ttex_ns(EntryPointDef_vec_at(eps, i));
-    iree_hal_tt_entry_point_t* ep = &executable->entry_points[i];
+    iree_hal_tt_entry_point_t *ep = &executable->entry_points[i];
 
     // Name: points into owned_data
-    const char* name_cstr = ttex_ns(EntryPointDef_name(fb_ep));
+    const char *name_cstr = ttex_ns(EntryPointDef_name(fb_ep));
     ep->name = iree_make_cstring_view(name_cstr ? name_cstr : "");
 
     // HAL metadata
@@ -545,52 +1881,91 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
     ep->workgroup_size[2] = ttex_ns(EntryPointDef_workgroup_size_z(fb_ep));
     // Defensive: ensure non-zero (flatcc returns 0 for absent defaults
     // depending on version; our schema says default=1 but belt-and-suspenders)
-    if (ep->workgroup_size[0] == 0) ep->workgroup_size[0] = 1;
-    if (ep->workgroup_size[1] == 0) ep->workgroup_size[1] = 1;
-    if (ep->workgroup_size[2] == 0) ep->workgroup_size[2] = 1;
+    if (ep->workgroup_size[0] == 0)
+      ep->workgroup_size[0] = 1;
+    if (ep->workgroup_size[1] == 0)
+      ep->workgroup_size[1] = 1;
+    if (ep->workgroup_size[2] == 0)
+      ep->workgroup_size[2] = 1;
 
     // Dispatch routing
     ep->builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
     ep->builtin_m_tiles = ttex_ns(EntryPointDef_builtin_m_tiles(fb_ep));
     ep->builtin_n_tiles = ttex_ns(EntryPointDef_builtin_n_tiles(fb_ep));
     ep->builtin_k_tiles = ttex_ns(EntryPointDef_builtin_k_tiles(fb_ep));
+    ep->dispatch_kind = ttex_ns(EntryPointDef_dispatch_kind(fb_ep));
+    ep->kernel_params.builtin_program = ep->builtin_program;
     ep->kernel_params.builtin_m_tiles = ep->builtin_m_tiles;
     ep->kernel_params.builtin_n_tiles = ep->builtin_n_tiles;
     ep->kernel_params.builtin_k_tiles = ep->builtin_k_tiles;
+    ep->kernel_params.dispatch_kind = ep->dispatch_kind;
+    ep->kernel_params.aot_kernel_bundle =
+        ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep));
+    if (ep->kernel_params.aot_kernel_bundle) {
+      ep->kernel_params.aot_target_arch =
+          ttex_ns(TTMetalKernelBundleDef_target_arch(
+              ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep))));
+      status = iree_hal_tt_materialize_aot_artifacts(
+          static_cast<ttex_ns(TTMetalKernelBundleDef_table_t)>(
+              ep->kernel_params.aot_kernel_bundle),
+          host_allocator, &ep->kernel_params.aot_artifact_root);
+      if (!iree_status_is_ok(status)) {
+        iree_hal_tt_executable_destroy(
+            reinterpret_cast<iree_hal_executable_t *>(executable));
+        return status;
+      }
+    }
+    if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE) {
+      iree_hal_tt_copy_matmul_like_desc(
+          ttex_ns(EntryPointDef_matmul_like(fb_ep)),
+          &ep->kernel_params.matmul_like);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION) {
+      iree_hal_tt_copy_conv2d_desc(ttex_ns(EntryPointDef_conv2d(fb_ep)),
+                                   &ep->kernel_params.conv2d);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {
+      iree_hal_tt_copy_padded_copy_desc(
+          ttex_ns(EntryPointDef_padded_copy(fb_ep)),
+          &ep->kernel_params.padded_copy);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) {
+      iree_hal_tt_copy_max_pool_desc(ttex_ns(EntryPointDef_max_pool(fb_ep)),
+                                     &ep->kernel_params.max_pool);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM) {
+      iree_hal_tt_copy_global_sum_desc(
+          ttex_ns(EntryPointDef_global_sum(fb_ep)),
+          &ep->kernel_params.global_sum);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
+      iree_hal_tt_copy_scalar_div_desc(
+          ttex_ns(EntryPointDef_scalar_div(fb_ep)),
+          &ep->kernel_params.scalar_div);
+    } else if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
+      iree_hal_tt_copy_linear_desc(ttex_ns(EntryPointDef_linear(fb_ep)),
+                                   &ep->kernel_params.linear);
+    }
 
     // Create TT-Metal program for this builtin
 #ifndef TT_IREE_ENABLE_MOCK
-    status = iree_hal_tt_create_program_for_builtin(
-        device, ep->builtin_program, &ep->kernel_params);
+    status = iree_hal_tt_create_program_for_builtin(device, ep->builtin_program,
+                                                    &ep->kernel_params);
     if (!iree_status_is_ok(status)) {
-      // Cleanup already-created programs
-      for (iree_host_size_t j = 0; j < i; ++j) {
-        if (executable->entry_points[j].kernel_params.program) {
-          delete static_cast<tt::tt_metal::Program*>(
-              executable->entry_points[j].kernel_params.program);
-        }
-      }
-      iree_allocator_free(host_allocator, executable->owned_data);
-      iree_allocator_free(host_allocator, executable);
+      iree_hal_tt_executable_destroy(
+          reinterpret_cast<iree_hal_executable_t *>(executable));
       return status;
     }
 #endif
   }
 
-  *out_executable = (iree_hal_executable_t*)executable;
+  *out_executable = (iree_hal_executable_t *)executable;
   return iree_ok_status();
 }
-#endif  // TT_IREE_ENABLE_TTEX
+#endif // TT_IREE_ENABLE_TTEX
 
 //===----------------------------------------------------------------------===//
 // Creation: entry point — dispatches by executable_format
 //===----------------------------------------------------------------------===//
 
 iree_status_t iree_hal_tt_executable_create(
-    iree_hal_device_t* device,
-    const iree_hal_executable_params_t* params,
-    iree_allocator_t host_allocator,
-    iree_hal_executable_t** out_executable) {
+    iree_hal_device_t *device, const iree_hal_executable_params_t *params,
+    iree_allocator_t host_allocator, iree_hal_executable_t **out_executable) {
   IREE_ASSERT_ARGUMENT(device);
   IREE_ASSERT_ARGUMENT(params);
   IREE_ASSERT_ARGUMENT(out_executable);
@@ -608,31 +1983,27 @@ iree_status_t iree_hal_tt_executable_create(
           "executable_format is '%s' but executable_data is empty",
           IREE_HAL_TT_EXECUTABLE_FORMAT);
     }
-    return iree_hal_tt_executable_create_ttex(
-        device, params, host_allocator, out_executable);
+    return iree_hal_tt_executable_create_ttex(device, params, host_allocator,
+                                              out_executable);
 #else
     return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                             "TTEX support is not enabled in this build");
 #endif
   }
 
-  // Keep the add-first PoC available only through its explicit legacy format.
+  // Recognize the old format so users get an actionable migration error.
   if (iree_string_view_equal(
           params->executable_format,
           iree_make_cstring_view(IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT))) {
-    if (params->executable_data.data_length != 0) {
-      return iree_make_status(
-          IREE_STATUS_INVALID_ARGUMENT,
-          "legacy executable format '%s' does not accept executable data",
-          IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT);
-    }
-    return iree_hal_tt_executable_create_legacy(
-        device, params, host_allocator, out_executable);
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "legacy executable format '%s' was removed; compile to '%s' with "
+        "compiler-generated AOT kernels",
+        IREE_HAL_TT_LEGACY_EXECUTABLE_FORMAT, IREE_HAL_TT_EXECUTABLE_FORMAT);
   }
 
-  const char* format_data = params->executable_format.data
-                                ? params->executable_format.data
-                                : "";
+  const char *format_data =
+      params->executable_format.data ? params->executable_format.data : "";
   return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                           "unsupported Tenstorrent executable format '%.*s'",
                           (int)params->executable_format.size, format_data);
@@ -643,10 +2014,9 @@ iree_status_t iree_hal_tt_executable_create(
 //===----------------------------------------------------------------------===//
 
 iree_status_t iree_hal_tt_executable_lookup_kernel_params(
-    iree_hal_executable_t* base_executable,
-    int32_t entry_point,
-    const iree_hal_tt_kernel_params_t** out_params) {
-  iree_hal_tt_executable_t* executable =
+    iree_hal_executable_t *base_executable, int32_t entry_point,
+    const iree_hal_tt_kernel_params_t **out_params) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
 
   if (entry_point < 0 ||
@@ -661,10 +2031,9 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params(
 }
 
 iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
-    iree_hal_executable_t* base_executable,
-    int32_t entry_point,
-    iree_hal_tt_kernel_params_t** out_params) {
-  iree_hal_tt_executable_t* executable =
+    iree_hal_executable_t *base_executable, int32_t entry_point,
+    iree_hal_tt_kernel_params_t **out_params) {
+  iree_hal_tt_executable_t *executable =
       iree_hal_tt_executable_cast(base_executable);
 
   if (entry_point < 0 ||

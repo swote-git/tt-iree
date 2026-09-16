@@ -29,17 +29,16 @@ struct TenstorrentOptions {
     binder.opt<std::string>(
         "iree-tenstorrent-device-id", deviceId,
         llvm::cl::cat(category),
-        llvm::cl::desc("Target Tenstorrent device (e.g., 'p100a')"),
-        llvm::cl::init(""));
+        llvm::cl::desc("Target Tenstorrent device ('p100a', 'blackhole', "
+                       "'wormhole', 'n150', or 'n300')"));
 
     binder.opt<bool>(
         "iree-tenstorrent-dump-ttex", dumpTTEX,
         llvm::cl::cat(category),
-        llvm::cl::desc("Dump TTEX FlatBuffer binary for debugging"),
-        llvm::cl::init(false));
+        llvm::cl::desc("Dump TTEX FlatBuffer binary for debugging"));
   }
 
-  std::string deviceId;
+  std::string deviceId = "p100a";
   bool dumpTTEX = false;
 };
 
@@ -60,28 +59,22 @@ struct TenstorrentSession
 
   void populateHALTargetDevices(
       IREE::HAL::TargetDeviceList &targets) override {
-    IREE::HAL::TenstorrentTargetOptions opts;
-    opts.deviceId = options.deviceId;
-    opts.dumpTTEX = options.dumpTTEX;
-
-    targets.add("tenstorrent",
-                [=]() {
-                  return std::make_shared<IREE::HAL::TenstorrentTargetDevice>(
-                      opts);
-                });
+    targets.add("tenstorrent", [&]() {
+      IREE::HAL::TenstorrentTargetOptions opts;
+      opts.deviceId = options.deviceId;
+      opts.dumpTTEX = options.dumpTTEX;
+      return std::make_shared<IREE::HAL::TenstorrentTargetDevice>(opts);
+    });
   }
 
   void populateHALTargetBackends(
       IREE::HAL::TargetBackendList &targets) override {
-    IREE::HAL::TenstorrentTargetOptions opts;
-    opts.deviceId = options.deviceId;
-    opts.dumpTTEX = options.dumpTTEX;
-
-    targets.add("tenstorrent",
-                [=]() {
-                  return std::make_shared<IREE::HAL::TenstorrentTargetBackend>(
-                      opts);
-                });
+    targets.add("tenstorrent", [&]() {
+      IREE::HAL::TenstorrentTargetOptions opts;
+      opts.deviceId = options.deviceId;
+      opts.dumpTTEX = options.dumpTTEX;
+      return std::make_shared<IREE::HAL::TenstorrentTargetBackend>(opts);
+    });
   }
 };
 

@@ -3,8 +3,9 @@
 //
 // Tenstorrent HAL target backend for the IREE compiler.
 //
-// PoC: All dispatches map to hardcoded builtins (CUSTOM_SFPI_ADD).
-// Future: Generate TT-Metal kernels from linalg ops.
+// Dispatch semantics are classified from executable-source IR and serialized
+// as TTEX. Supported static matmul-like dispatches carry compiler-generated,
+// offline-compiled TT-Metal kernels.
 
 #ifndef TT_IREE_COMPILER_PLUGINS_TARGET_TENSTORRENT_TARGET_H_
 #define TT_IREE_COMPILER_PLUGINS_TARGET_TENSTORRENT_TARGET_H_
@@ -21,7 +22,7 @@ namespace mlir::iree_compiler::IREE::HAL {
 //===----------------------------------------------------------------------===//
 
 struct TenstorrentTargetOptions {
-  std::string deviceId;    // e.g. "p100a"
+  std::string deviceId = "p100a";
   bool dumpTTEX = false;   // dump TTEX binary for debugging
 };
 

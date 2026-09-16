@@ -11,8 +11,8 @@
 // The file_identifier is "TTEX" (checked by flatcc verify_as_root).
 //
 // Extension roadmap:
-//   Phase A (current): BuiltinProgram enum selects hardcoded PoC programs
-//   Phase B: Add ttmetal_kernel_bundle table (kernel source / CB config / core range)
+//   Phase A: BuiltinProgram enum selects hardcoded PoC programs
+//   Phase B (current): Embed compiler-generated kernel sources and AOT artifacts
 //   Phase C: Add ttnn_op_desc table (op name + attrs + tensor layout)
 //   Phase D: Add binary cache hash, profile/trace metadata
 
@@ -41,6 +41,256 @@ enum BuiltinProgram : uint32 {
   // Correctness-first tiled bf16 matmul path. Static shapes may be encoded
   // in EntryPointDef, and dynamic shapes are supplied via dispatch constants.
   BF16_MATMUL_TILED = 3,
+
+  // Descriptor-driven F32 matmul-like dispatch. Program creation is deferred
+  // until the runtime implementation can consume MatmulLikeDef safely.
+  F32_MATMUL_LIKE = 4,
+
+  // Descriptor-driven F32 NCHW convolution expressed without a batch
+  // dimension. M1 accepts one static CHW x OIHW 3x3 convolution.
+  F32_CONV2D = 5,
+
+  // Correctness-first host-mediated copy of one static F32 CHW slice into a
+  // larger destination tensor. This is the first ResNet50 padding dispatch.
+  F32_PADDED_COPY = 6,
+
+  // Correctness-first static F32 CHW max-pool. M1 recognizes the ResNet50
+  // stem's 3x3, stride-2, valid pooling operation.
+  F32_MAX_POOL_2D = 7,
+
+  // Narrow ResNet50 tail operations (v8).
+  F32_GLOBAL_SUM = 8,
+  F32_SCALAR_DIV = 9,
+  F32_LINEAR = 10,
+}
+
+enum DispatchKind : uint8 {
+  BUILTIN = 0,
+  MATMUL_LIKE = 1,
+  CONVOLUTION = 2,
+  PADDED_COPY = 3,
+  MAX_POOL = 4,
+  GLOBAL_SUM = 5,
+  SCALAR_DIV = 6,
+  LINEAR = 7,
+}
+
+enum TensorElementType : uint8 {
+  UNKNOWN = 0,
+  BF16 = 1,
+  F32 = 2,
+}
+
+enum TensorLayout : uint8 {
+  UNKNOWN = 0,
+  ROW_MAJOR = 1,
+  CHW = 2,
+  OI = 3,
+  OIHW = 4,
+  CHANNEL_MAJOR = 5,
+}
+
+// ---------------------------------------------------------------------------
+// TT-Metal AOT kernel bundle (v3)
+// ---------------------------------------------------------------------------
+
+enum KernelRole : uint8 {
+  UNKNOWN = 0,
+  READER = 1,
+  WRITER = 2,
+  COMPUTE = 3,
+}
+
+enum TargetArch : uint8 {
+  UNKNOWN = 0,
+  WORMHOLE_B0 = 1,
+  BLACKHOLE = 2,
+}
+
+// Source content is retained as the stable kernel identity required by
+// tt-metal's precompiled loader. Runtime execution must never JIT this source.
+table KernelSourceDef {
+  role:KernelRole = UNKNOWN;
+  source:string;
+}
+
+// One file in tt-metal's offline artifact tree. Paths are relative to the
+// bundle root and are validated before materialization by the runtime.
+table ArtifactFileDef {
+  path:string;
+  data:[ubyte];
+}
+
+table TTMetalKernelBundleDef {
+  target_arch:TargetArch = UNKNOWN;
+  kernels:[KernelSourceDef];
+  artifacts:[ArtifactFileDef];
+}
+
+// Static M1 tensor metadata. Logical shape describes the operation result;
+// storage_shape and offset describe its location in the HAL binding.
+table TensorDesc {
+  binding:uint16 = 0;
+  element_type:TensorElementType = UNKNOWN;
+  layout:TensorLayout = UNKNOWN;
+  rank:uint8 = 0;
+  shape_0:uint32 = 0;
+  shape_1:uint32 = 0;
+  shape_2:uint32 = 0;
+  shape_3:uint32 = 0;
+  storage_shape_0:uint32 = 0;
+  storage_shape_1:uint32 = 0;
+  storage_shape_2:uint32 = 0;
+  storage_shape_3:uint32 = 0;
+  offset_0:uint32 = 0;
+  offset_1:uint32 = 0;
+  offset_2:uint32 = 0;
+  offset_3:uint32 = 0;
+
+  // Static byte offset applied to the HAL binding before tensor indexing.
+  // This is distinct from the element offsets above.
+  byte_offset:uint64 = 0;
+
+  // Static slice strides (v8). A zero value is interpreted as one for
+  // compatibility with descriptors produced before these fields existed.
+  stride_0:uint32 = 0;
+  stride_1:uint32 = 0;
+  stride_2:uint32 = 0;
+  stride_3:uint32 = 0;
+
+  // One plus the HAL dispatch-constant ordinal supplying an additional byte
+  // offset (v8). Zero means the byte offset is entirely static.
+  byte_offset_constant:uint16 = 0;
+}
+
+table MatmulLikeDef {
+  lhs:TensorDesc;
+  rhs:TensorDesc;
+  output:TensorDesc;
+  m:uint32 = 0;
+  n:uint32 = 0;
+  k:uint32 = 0;
+
+  // Bit 0: scalar affine (output = output * scale + bias).
+  // Bit 1: ReLU after all other epilogues.
+  epilogue_flags:uint32 = 0;
+  epilogue_scale:float = 1.0;
+  epilogue_bias:float = 0.0;
+
+  // Optional residual input selected by epilogue flag bit 2. M1 applies the
+  // residual affine before adding it to the main affine result, then applies
+  // ReLU when requested.
+  residual:TensorDesc;
+  residual_scale:float = 1.0;
+  residual_bias:float = 0.0;
+
+  // Optional per-output-channel affine parameters (v7). These fields are
+  // appended to preserve all pre-v7 MatmulLikeDef field ordinals.
+  epilogue_scales:[float];
+  epilogue_biases:[float];
+
+  // Runtime-bound per-channel affine operands (v8). These preserve the
+  // unfused batch-normalization inputs when constants are passed through HAL
+  // bindings instead of being embedded in executable-source IR.
+  epilogue_mean:TensorDesc;
+  epilogue_channel_scale:TensorDesc;
+  epilogue_channel_bias:TensorDesc;
+  epilogue_common_scale:float = 1.0;
+
+  // Optional per-channel affine for the residual branch (v8).
+  residual_mean:TensorDesc;
+  residual_channel_scale:TensorDesc;
+  residual_channel_bias:TensorDesc;
+  residual_common_scale:float = 1.0;
+}
+
+table Conv2DDef {
+  input:TensorDesc;
+  filter:TensorDesc;
+  output:TensorDesc;
+  kernel_h:uint32 = 0;
+  kernel_w:uint32 = 0;
+  stride_h:uint32 = 1;
+  stride_w:uint32 = 1;
+  dilation_h:uint32 = 1;
+  dilation_w:uint32 = 1;
+  padding_top:uint32 = 0;
+  padding_bottom:uint32 = 0;
+  padding_left:uint32 = 0;
+  padding_right:uint32 = 0;
+  groups:uint32 = 1;
+
+  // Uses the same bit definitions as MatmulLikeDef.
+  epilogue_flags:uint32 = 0;
+  epilogue_scale:float = 1.0;
+  epilogue_bias:float = 0.0;
+
+  // Optional per-output-channel affine parameters (v5). When epilogue flag
+  // bit 3 is set, both vectors have output-channel length and replace the
+  // scalar scale/bias above.
+  epilogue_scales:[float];
+  epilogue_biases:[float];
+
+  // Runtime-bound per-channel affine operands (v8).
+  epilogue_mean:TensorDesc;
+  epilogue_channel_scale:TensorDesc;
+  epilogue_channel_bias:TensorDesc;
+  epilogue_common_scale:float = 1.0;
+}
+
+// Static rank-3 F32 slice copy (v4). The logical shapes must match; storage
+// shapes and offsets describe where the slice lives in each HAL binding.
+table PaddedCopyDef {
+  source:TensorDesc;
+  destination:TensorDesc;
+}
+
+// Static rank-3 F32 max-pool (v6). The initial value is intentionally not
+// serialized: M1 requires the source IR to initialize the reduction to -inf.
+table MaxPool2DDef {
+  input:TensorDesc;
+  output:TensorDesc;
+  kernel_h:uint32 = 0;
+  kernel_w:uint32 = 0;
+  stride_h:uint32 = 1;
+  stride_w:uint32 = 1;
+  dilation_h:uint32 = 1;
+  dilation_w:uint32 = 1;
+  padding_top:uint32 = 0;
+  padding_bottom:uint32 = 0;
+  padding_left:uint32 = 0;
+  padding_right:uint32 = 0;
+}
+
+// Exact ResNet50 tail reduction (v8). The input is CHW storage, but only the
+// leading reduce_h x reduce_w spatial region is reduced for each channel. The
+// second output materializes divisor_value for the following scalar divide.
+table GlobalSumDef {
+  input:TensorDesc;
+  sum:TensorDesc;
+  divisor:TensorDesc;
+  reduce_h:uint32 = 0;
+  reduce_w:uint32 = 0;
+  divisor_value:float = 0.0;
+}
+
+// Exact vector/scalar division used after global sum (v8).
+table ScalarDivDef {
+  input:TensorDesc;
+  divisor:TensorDesc;
+  output:TensorDesc;
+}
+
+// Row-major F32 classifier matmul with a runtime bias tensor (v8). Weights use
+// OI storage so output[m,n] = sum_k input[m,k] * weights[n,k] + bias[m,n].
+table LinearDef {
+  input:TensorDesc;
+  weights:TensorDesc;
+  bias:TensorDesc;
+  output:TensorDesc;
+  m:uint32 = 0;
+  n:uint32 = 0;
+  k:uint32 = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,8 +331,27 @@ table EntryPointDef {
   builtin_n_tiles:uint32 = 0;
   builtin_k_tiles:uint32 = 0;
 
-  // --- Phase B extension point (TT-Metal JIT) ---
-  // ttmetal_kernel:TTMetalKernelBundle;  // kernel source + CB config + core range
+  // --- Descriptor-driven dispatch routing (v2) ---
+
+  dispatch_kind:DispatchKind = BUILTIN;
+  matmul_like:MatmulLikeDef;
+  conv2d:Conv2DDef;
+
+  // --- Static F32 padded copy (v4) ---
+  padded_copy:PaddedCopyDef;
+
+  // --- Static F32 max-pool (v6) ---
+  max_pool:MaxPool2DDef;
+
+  // --- TT-Metal AOT executable payload (v3) ---
+  // M1 uses one reader, writer, and compute source plus the variants emitted
+  // for one target architecture. It is absent on legacy builtins.
+  aot_kernel_bundle:TTMetalKernelBundleDef;
+
+  // --- Exact ResNet50 tail operations (v8) ---
+  global_sum:GlobalSumDef;
+  scalar_div:ScalarDivDef;
+  linear:LinearDef;
 
   // --- Phase C extension point (TTNN high-level op) ---
   // ttnn_op:TTNNOpDesc;  // op_type + input/output tensor descs + attrs
@@ -94,7 +363,8 @@ table EntryPointDef {
 
 table ExecutableDef {
   // Schema version. Keep the default at 0 forever so old blobs with an absent
-  // field remain distinguishable. Current serializers explicitly emit v1.
+  // field remain distinguishable. Current serializers explicitly emit v8;
+  // the runtime also accepts v1-v7 blobs.
   version:uint32 = 0;
 
   // One entry per HAL export ordinal.
