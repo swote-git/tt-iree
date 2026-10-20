@@ -175,8 +175,8 @@ project documentation.
 | Phase | Goal | Status |
 |-------|------|--------|
 | **PoC** | Single-operation compiler/HAL bring-up | Complete |
-| **MVP** | MNIST MLP inference on P100A, static B1 BF16 | [Complete: 100-image hardware verification](reports/2026-10-20/mnist-mlp.md) |
-| **Alpha** | ResNet50 E2E inference and multi-core device-native dispatch, static B1 BF16 | [Complete: 112-image hardware verification](reports/2026-10-15/resnet50-dataset-evaluation-ko.md) |
+| **MVP** | MNIST MLP inference on P100A, static B1 BF16 | Complete |
+| **Alpha** | ResNet50 E2E inference and multi-core device-native dispatch, static B1 BF16 | Complete |
 | **Beta** | LLM inference (GPT-2 scale) | Planned |
 | **v1.0** | Production release | Planned |
 
