@@ -38,6 +38,8 @@ extern "C" {
 typedef struct iree_hal_tt_kernel_params_t {
   tt_metal_program_ptr_t program;
   uint32_t builtin_program;
+  // Executable wire version selects operation-specific kernel argument ABIs.
+  uint32_t ttex_version;
 
   // Kernel handles (set during program creation)
   tt_metal_kernel_id_t reader_kernel_id;
@@ -63,6 +65,7 @@ typedef struct iree_hal_tt_kernel_params_t {
   tt_iree_ttex_global_sum_desc_t global_sum;
   tt_iree_ttex_scalar_div_desc_t scalar_div;
   tt_iree_ttex_linear_desc_t linear;
+  tt_iree_ttex_bf16_native_desc_t bf16_native;
 
   // Points into the executable-owned TTEX buffer when a v3 AOT bundle exists.
   // The concrete FlatBuffer table type remains private to the runtime.
@@ -117,6 +120,12 @@ iree_status_t iree_hal_tt_executable_create(
     const iree_hal_executable_params_t *executable_params,
     iree_allocator_t host_allocator, iree_hal_executable_t **out_executable);
 
+// Returns true when |executable_data| exactly matches the executable-owned
+// TTEX payload. Used by the cache to resolve hash collisions without retaining
+// a second copy of large VMFB payloads.
+bool iree_hal_tt_executable_matches_data(
+    iree_hal_executable_t *executable, iree_const_byte_span_t executable_data);
+
 // Looks up kernel params for a given entry point ordinal.
 // Used by queue_execute to get the TT-Metal Program for dispatch.
 // This is our internal fast-path; the vtable export_info path is
@@ -132,6 +141,18 @@ iree_status_t iree_hal_tt_executable_lookup_kernel_params_mutable(
 
 #ifdef __cplusplus
 }
+
+namespace iree::hal::tenstorrent {
+struct RuntimePreparationRecord;
+}
+
+// Cache-owned timing avoids double-counting executable creation as a second
+// preparation event. Direct descriptor-only C API calls are not profiled.
+iree_status_t iree_hal_tt_executable_create_with_profile(
+    iree_hal_device_t *device,
+    const iree_hal_executable_params_t *executable_params,
+    iree_allocator_t host_allocator, iree_hal_executable_t **out_executable,
+    iree::hal::tenstorrent::RuntimePreparationRecord *profile);
 #endif
 
 #endif // IREE_HAL_DRIVERS_TENSTORRENT_TT_EXECUTABLE_H_

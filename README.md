@@ -23,18 +23,25 @@ result = runtime.invoke(compiled, inputs)
 
 ## Status
 
-**Early Development (PoC Phase)**
+**Alpha Milestone Complete (Functional Bring-Up on P100A/Blackhole)**
 
-WIP & Planned:
-- Compiler backend registration
-- HAL driver implementation
-- Mock mode execution
-- AOT elementwise add and static/dynamic tile-aligned BF16 matmul smoke paths
-- Multicore tiled matmul execution with runtime shape arguments
-- ResNet50 compiler/TTEX coverage for all 37 fused exports; full runtime
-  validation remains in progress
-- TTNN integration
-- Hardware execution
+Implemented and validated:
+- Compiler backend registration, TTEX serialization, and generated AOT kernels
+- Custom IREE HAL driver and execution on real P100A hardware
+- Elementwise add and static/dynamic tile-aligned BF16 matmul smoke paths
+- Multicore tiled dispatch with runtime shape arguments
+- [MNIST MLP inference](reports/2026-10-20/mnist-mlp.md): static batch 1, BF16,
+  100 held-out test images, 99/100 correct and 100/100 Top-1 agreement with PyTorch
+- [ResNet50 E2E inference](reports/2026-10-15/resnet50-dataset-evaluation-ko.md):
+  static batch 1, BF16, 112 ImageNet validation images and 112/112 Top-1 agreement
+  with PyTorch BF16; all numerical dispatches execute device-native
+- [Tensix matrix execution](reports/2026-10-15/resnet50-bf16-tensix-ko.md) for
+  ResNet50 contractions, with device RISC-V execution for the remaining operations
+
+Completion refers to functional bring-up of these verified workloads, not
+general model support, bitwise numerical equivalence, or production readiness.
+Performance optimization, broader model coverage, and dynamic model batching
+remain in progress. TTNN is used as a comparison baseline, not as a model fallback.
 
 ## Version Compatibility
 
@@ -56,6 +63,7 @@ tt-iree/
 │   ├── iree/              # IREE v3.11.0 (submodule)
 │   └── tt-metal/          # tt-metal v0.75.0 (submodule)
 ├── docs/                  # Documentation
+├── reports/               # Dated AI-assisted reports and investigations
 ├── test/                  # Tests
 └── examples/              # Example programs
 ```
@@ -123,7 +131,7 @@ Extends IREE's compiler to generate code for Tenstorrent's tile-based architectu
 
 - Converts IREE's HAL dialect to Tenstorrent-specific representation
 - Handles 32x32 tile layout transformation
-- Maps workloads to 8x8 Tensix core grid
+- Maps output tiles to compiler-selected multi-core grids
 - Generates TT-Metal kernel code
 
 ### Runtime Driver
@@ -158,16 +166,23 @@ PyTorch/JAX/TensorFlow
 ```
 
 For detailed architecture documentation, see [docs/](docs/).
+AI-assisted implementation snapshots and experiment reports are indexed in
+[reports/](reports/README.md), organized by date rather than maintained as
+project documentation.
 
 ## Roadmap
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| **PoC** | Single operation, mock execution | WIP |
-| **MVP** | MNIST inference on P100A | Planned |
-| **Alpha** | ResNet-18, multi-core dispatch | Planned |
+| **PoC** | Single-operation compiler/HAL bring-up | Complete |
+| **MVP** | MNIST MLP inference on P100A, static B1 BF16 | [Complete: 100-image hardware verification](reports/2026-10-20/mnist-mlp.md) |
+| **Alpha** | ResNet50 E2E inference and multi-core device-native dispatch, static B1 BF16 | [Complete: 112-image hardware verification](reports/2026-10-15/resnet50-dataset-evaluation-ko.md) |
 | **Beta** | LLM inference (GPT-2 scale) | Planned |
 | **v1.0** | Production release | Planned |
+
+Alpha was validated with ResNet50 rather than the originally planned ResNet-18;
+ResNet-18 has not been separately validated. The sample counts above describe
+the tested scope, not full-dataset accuracy certification.
 
 ## Related Projects
 

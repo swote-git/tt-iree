@@ -36,13 +36,24 @@ using DispatchTest = TenstorrentTestBase;
 
 #ifdef TT_IREE_ENABLE_AOT_TESTS
 struct SerializedAOTTestBundle {
-  explicit SerializedAOTTestBundle(bool is_add) {
+  explicit SerializedAOTTestBundle(uint32_t builtin_program,
+                                   bool device_native_f32_matmul = false) {
     using namespace mlir::iree_compiler::IREE::HAL;
-    bool compiled = is_add
-                        ? compileAddAOT(TenstorrentAOTTargetArch::Blackhole,
-                                        bundle, error_message)
-                        : compileMatmulAOT(TenstorrentAOTTargetArch::Blackhole,
-                                           bundle, error_message);
+    bool compiled = false;
+    if (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD) {
+      compiled = compileAddAOT(TenstorrentAOTTargetArch::Blackhole, bundle,
+                               error_message);
+    } else if (builtin_program ==
+               TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY) {
+      compiled = compilePaddedCopyAOT(TenstorrentAOTTargetArch::Blackhole,
+                                      bundle, error_message);
+    } else if (device_native_f32_matmul) {
+      compiled = compileF32MatmulAOT(TenstorrentAOTTargetArch::Blackhole,
+                                     bundle, error_message);
+    } else {
+      compiled = compileMatmulAOT(TenstorrentAOTTargetArch::Blackhole, bundle,
+                                  error_message);
+    }
     if (!compiled)
       return;
 
@@ -72,23 +83,36 @@ struct SerializedAOTTestBundle {
 // TT-Metal's offline compiler uses a mock MetalContext. Build both fixtures
 // before the test suite opens a physical device; mock and physical contexts
 // cannot coexist in one process.
-static SerializedAOTTestBundle g_add_aot_bundle(/*is_add=*/true);
-static SerializedAOTTestBundle g_matmul_aot_bundle(/*is_add=*/false);
+static SerializedAOTTestBundle
+    g_add_aot_bundle(TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD);
+static SerializedAOTTestBundle
+    g_matmul_aot_bundle(TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED);
+static SerializedAOTTestBundle
+    g_native_f32_matmul_aot_bundle(TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE,
+                                   /*device_native_f32_matmul=*/true);
+static SerializedAOTTestBundle
+    g_padded_copy_aot_bundle(TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY);
 
 static iree_status_t
 GetAOTTestBundle(uint32_t builtin_program,
-                 const tt_iree_ttex_aot_kernel_bundle_desc_t **out_bundle) {
+                 const tt_iree_ttex_aot_kernel_bundle_desc_t **out_bundle,
+                 bool device_native_f32_matmul = false) {
   IREE_ASSERT_ARGUMENT(out_bundle);
   *out_bundle = nullptr;
-  bool is_add = builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
-  SerializedAOTTestBundle &bundle =
-      is_add ? g_add_aot_bundle : g_matmul_aot_bundle;
-  if (!bundle.error_message.empty()) {
+  SerializedAOTTestBundle *bundle = &g_matmul_aot_bundle;
+  if (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD) {
+    bundle = &g_add_aot_bundle;
+  } else if (device_native_f32_matmul) {
+    bundle = &g_native_f32_matmul_aot_bundle;
+  } else if (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY) {
+    bundle = &g_padded_copy_aot_bundle;
+  }
+  if (!bundle->error_message.empty()) {
     return iree_make_status(IREE_STATUS_UNAVAILABLE,
                             "AOT test fixture compilation failed: %s",
-                            bundle.error_message.c_str());
+                            bundle->error_message.c_str());
   }
-  *out_bundle = &bundle.desc;
+  *out_bundle = &bundle->desc;
   return iree_ok_status();
 }
 #endif
@@ -123,7 +147,8 @@ static iree_status_t CreateBuiltinTtexExecutable(
 
   iree_byte_span_t data = {0};
   IREE_RETURN_IF_ERROR(
-      tt_iree_build_ttex_executable_def(host_allocator, 1, &ep, &data));
+      tt_iree_build_ttex_executable_def_with_version(
+          host_allocator, TT_IREE_TTEX_VERSION_12, 1, &ep, &data));
 
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);
@@ -182,6 +207,77 @@ static tt_iree_ttex_entry_point_desc_t MakeMatmulLikeEntry() {
   return ep;
 }
 
+static tt_iree_ttex_entry_point_desc_t MakeDeviceNativeMatmulLikeEntry() {
+  tt_iree_ttex_entry_point_desc_t ep = MakeMatmulLikeEntry();
+  ep.name = "device_native_f32_projection";
+  ep.matmul_like.epilogue_flags = 0;
+  ep.matmul_like.epilogue_scale = 1.0f;
+  ep.matmul_like.epilogue_bias = 0.0f;
+  return ep;
+}
+
+static tt_iree_ttex_entry_point_desc_t MakeDeviceNativeMatmulLikeMTailEntry() {
+  tt_iree_ttex_entry_point_desc_t ep = MakeDeviceNativeMatmulLikeEntry();
+  ep.name = "device_native_f32_projection_m_tail";
+  ep.matmul_like.lhs.layout = TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR;
+  ep.matmul_like.lhs.rank = 2;
+  ep.matmul_like.lhs.shape[0] = 64;
+  ep.matmul_like.lhs.shape[1] = 49;
+  ep.matmul_like.lhs.shape[2] = 0;
+  ep.matmul_like.lhs.storage_shape[0] = 64;
+  ep.matmul_like.lhs.storage_shape[1] = 49;
+  ep.matmul_like.lhs.storage_shape[2] = 0;
+  ep.matmul_like.output.layout = TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR;
+  ep.matmul_like.output.rank = 2;
+  ep.matmul_like.output.shape[0] = 64;
+  ep.matmul_like.output.shape[1] = 49;
+  ep.matmul_like.output.shape[2] = 0;
+  ep.matmul_like.output.storage_shape[0] = 64;
+  ep.matmul_like.output.storage_shape[1] = 53;
+  ep.matmul_like.output.storage_shape[2] = 0;
+  ep.matmul_like.output.offset[0] = 0;
+  ep.matmul_like.output.offset[1] = 2;
+  ep.matmul_like.output.offset[2] = 0;
+  ep.matmul_like.m = 49;
+  return ep;
+}
+
+static tt_iree_ttex_entry_point_desc_t
+MakeRuntimePerChannelDeviceNativeMatmulLikeEntry() {
+  tt_iree_ttex_entry_point_desc_t ep = MakeDeviceNativeMatmulLikeMTailEntry();
+  ep.name = "device_native_f32_runtime_per_channel_projection";
+  ep.binding_count = 6;
+  ep.matmul_like.epilogue_flags =
+      TT_IREE_TTEX_EPILOGUE_AFFINE | TT_IREE_TTEX_EPILOGUE_RELU |
+      TT_IREE_TTEX_EPILOGUE_PER_CHANNEL | TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+  ep.matmul_like.epilogue_mean = {
+      .binding = 3,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 1,
+      .shape = {64, 0, 0, 0},
+      .storage_shape = {64, 0, 0, 0},
+  };
+  ep.matmul_like.epilogue_channel_scale = {
+      .binding = 4,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 1,
+      .shape = {64, 0, 0, 0},
+      .storage_shape = {64, 0, 0, 0},
+  };
+  ep.matmul_like.epilogue_channel_bias = {
+      .binding = 5,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 1,
+      .shape = {64, 0, 0, 0},
+      .storage_shape = {64, 0, 0, 0},
+  };
+  ep.matmul_like.epilogue_common_scale = 0.5f;
+  return ep;
+}
+
 static tt_iree_ttex_entry_point_desc_t MakePerChannelMatmulLikeEntry() {
   static const std::array<float, 64> kScales = [] {
     std::array<float, 64> values = {};
@@ -204,6 +300,53 @@ static tt_iree_ttex_entry_point_desc_t MakePerChannelMatmulLikeEntry() {
   ep.matmul_like.epilogue_channel_count = kScales.size();
   ep.matmul_like.epilogue_scales = kScales.data();
   ep.matmul_like.epilogue_biases = kBiases.data();
+  return ep;
+}
+
+static tt_iree_ttex_entry_point_desc_t MakeResNet50LinearEntry() {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.name = "resnet50_classifier";
+  ep.binding_count = 4;
+  ep.workgroup_size[0] = 1;
+  ep.workgroup_size[1] = 1;
+  ep.workgroup_size[2] = 1;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR;
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_LINEAR;
+  ep.linear.input = {
+      .binding = 0,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 2,
+      .shape = {1, 2048, 0, 0},
+      .storage_shape = {1, 2048, 0, 0},
+  };
+  ep.linear.weights = {
+      .binding = 1,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_OI,
+      .rank = 2,
+      .shape = {1000, 2048, 0, 0},
+      .storage_shape = {1000, 2048, 0, 0},
+  };
+  ep.linear.bias = {
+      .binding = 2,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 2,
+      .shape = {1, 1000, 0, 0},
+      .storage_shape = {1, 1000, 0, 0},
+  };
+  ep.linear.output = {
+      .binding = 3,
+      .element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32,
+      .layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+      .rank = 2,
+      .shape = {1, 1000, 0, 0},
+      .storage_shape = {1, 1000, 0, 0},
+  };
+  ep.linear.m = 1;
+  ep.linear.n = 1000;
+  ep.linear.k = 2048;
   return ep;
 }
 
@@ -408,8 +551,18 @@ static iree_status_t CreateDescriptorTtexExecutable(
     bool include_aot = false) {
   if (include_aot) {
 #ifdef TT_IREE_ENABLE_AOT_TESTS
-    IREE_RETURN_IF_ERROR(
-        GetAOTTestBundle(ep.builtin_program, &ep.aot_kernel_bundle));
+    constexpr uint32_t kRuntimePerChannelAffineRelu =
+        TT_IREE_TTEX_EPILOGUE_AFFINE | TT_IREE_TTEX_EPILOGUE_RELU |
+        TT_IREE_TTEX_EPILOGUE_PER_CHANNEL |
+        TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+    const bool device_native_f32_matmul =
+        ep.builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE &&
+        (ep.matmul_like.epilogue_flags == 0 ||
+         ep.matmul_like.epilogue_flags == kRuntimePerChannelAffineRelu) &&
+        ep.matmul_like.m != 0 && ep.matmul_like.n % 32 == 0 &&
+        ep.matmul_like.k % 32 == 0;
+    IREE_RETURN_IF_ERROR(GetAOTTestBundle(
+        ep.builtin_program, &ep.aot_kernel_bundle, device_native_f32_matmul));
 #else
     return iree_make_status(IREE_STATUS_UNAVAILABLE,
                             "AOT test fixture is unavailable in this build");
@@ -418,7 +571,8 @@ static iree_status_t CreateDescriptorTtexExecutable(
 
   iree_byte_span_t data = {0};
   IREE_RETURN_IF_ERROR(
-      tt_iree_build_ttex_executable_def(host_allocator, 1, &ep, &data));
+      tt_iree_build_ttex_executable_def_with_version(
+          host_allocator, TT_IREE_TTEX_VERSION_12, 1, &ep, &data));
 
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);
@@ -560,6 +714,8 @@ TEST_F(DispatchTest, PreservesMatmulLikeDescriptorMetadata) {
   IREE_ASSERT_OK(iree_hal_tt_executable_lookup_kernel_params(
       executable.get(), /*entry_point=*/0, &params));
   ASSERT_NE(params, nullptr);
+  EXPECT_EQ(std::string(params->kernel_name.data, params->kernel_name.size),
+            "resnet50_projection");
   EXPECT_EQ(params->dispatch_kind, TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE);
   EXPECT_EQ(params->matmul_like.m, 64u);
   EXPECT_EQ(params->matmul_like.n, 64u);
@@ -568,6 +724,96 @@ TEST_F(DispatchTest, PreservesMatmulLikeDescriptorMetadata) {
   EXPECT_EQ(params->matmul_like.output.offset[1], 1u);
   EXPECT_FLOAT_EQ(params->matmul_like.epilogue_scale, 0.5f);
   EXPECT_FLOAT_EQ(params->matmul_like.epilogue_bias, 0.1875f);
+}
+
+TEST(DispatchContractTest, Bf16NativeDescriptorsFailClosed) {
+  auto ep = MakeMatmulLikeEntry();
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE;
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+  auto &d = ep.bf16_native;
+  d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  d.m = d.n = d.k = 64;
+  d.tensors[0] = ep.matmul_like.lhs;
+  d.tensors[1] = ep.matmul_like.rhs;
+  d.tensors[2] = ep.matmul_like.output;
+  for (unsigned i = 0; i < 3; ++i)
+    d.tensors[i].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  tt_iree_ttex_kernel_source_desc_t source = {TT_IREE_TTEX_KERNEL_ROLE_READER, "void kernel_main() {}"};
+  const uint8_t elf[] = {0x7f, 'E', 'L', 'F'};
+  tt_iree_ttex_artifact_file_desc_t artifact = {"Kernel_Source_Code/bf16/brisc/brisc.elf", elf, sizeof(elf)};
+  tt_iree_ttex_aot_kernel_bundle_desc_t bundle = {
+      .target_arch = TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE,
+      .kernel_count = 1, .kernels = &source, .artifact_count = 1, .artifacts = &artifact};
+  ep.aot_kernel_bundle = &bundle;
+  auto check = [&](const tt_iree_ttex_entry_point_desc_t &entry, bool valid,
+                   uint32_t version = TT_IREE_TTEX_VERSION_17) {
+    iree_byte_span_t data = {};
+    IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+        iree_allocator_system(), version, 1, &entry, &data));
+    iree_hal_executable_params_t params;
+    iree_hal_executable_params_initialize(&params);
+    params.executable_format = iree_make_cstring_view(IREE_HAL_TT_EXECUTABLE_FORMAT);
+    params.executable_data = iree_make_const_byte_span(data.data, data.data_length);
+    iree_hal_executable_t *executable = nullptr;
+    auto status = iree_hal_tt_executable_create(nullptr, &params, iree_allocator_system(), &executable);
+    if (valid) {
+      IREE_EXPECT_OK(status);
+      const iree_hal_tt_kernel_params_t *kernel = nullptr;
+      IREE_ASSERT_OK(iree_hal_tt_executable_lookup_kernel_params(executable, 0, &kernel));
+      EXPECT_EQ(kernel->bf16_native.m, 64u);
+      EXPECT_EQ(kernel->bf16_native.tensors[0].element_type, TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16);
+      EXPECT_EQ(kernel->bf16_native.tensors[13].rank, 0);
+    } else {
+      EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+      iree_status_ignore(status);
+    }
+    iree_hal_executable_release(executable);
+    iree_allocator_free(iree_allocator_system(), data.data);
+  };
+  check(ep, true);
+  auto invalid = ep;
+  invalid.aot_kernel_bundle = nullptr;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.tensors[0].rank = 0;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.tensors[0].byte_offset = 1;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.tensors[1].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_UNKNOWN;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.m = 63;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.k = 63;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL;
+  invalid.bf16_native.m = invalid.bf16_native.n = invalid.bf16_native.k = 0;
+  invalid.bf16_native.tensors[0].rank = 0;
+  check(invalid, false);
+  invalid = ep;
+  invalid.bf16_native.operation_kind = 99;
+  check(invalid, false);
+  tt_iree_ttex_kernel_source_desc_t tensix_sources[] = {
+      {TT_IREE_TTEX_KERNEL_ROLE_READER, "void kernel_main() {}"},
+      {TT_IREE_TTEX_KERNEL_ROLE_WRITER, "void kernel_main() {}"},
+      {TT_IREE_TTEX_KERNEL_ROLE_COMPUTE, "void kernel_main() {}"}};
+  auto tensix_bundle = bundle;
+  tensix_bundle.kernel_count = 3;
+  tensix_bundle.kernels = tensix_sources;
+  auto tensix = ep;
+  tensix.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+  tensix.aot_kernel_bundle = &tensix_bundle;
+  check(tensix, true, TT_IREE_TTEX_VERSION_18);
+  invalid = tensix;
+  invalid.aot_kernel_bundle = nullptr;
+  check(invalid, false, TT_IREE_TTEX_VERSION_18);
+  invalid = tensix;
+  invalid.bf16_native.tensors[1].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+  check(invalid, false, TT_IREE_TTEX_VERSION_18);
 }
 
 TEST(DispatchContractTest, PreservesAotKernelBundleMetadata) {
@@ -746,6 +992,89 @@ TEST(DispatchContractTest, PreservesResNet50TailDescriptors) {
   }
 }
 
+TEST_F(DispatchTest, ExecutesResNet50F32LinearClassifier) {
+  tt_iree_ttex_entry_point_desc_t ep = MakeResNet50LinearEntry();
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t *executable_ptr = nullptr;
+  iree_status_t exec_status = CreateDescriptorTtexExecutable(
+      device_, host_allocator(), ep, &executable_ptr, /*include_aot=*/true);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "linear AOT test fixture is unavailable";
+  }
+  executable.assign(executable_ptr);
+
+  constexpr uint32_t kInputElements = 2048;
+  constexpr uint32_t kOutputElements = 1000;
+  constexpr iree_device_size_t kInputBytes = kInputElements * sizeof(float);
+  constexpr iree_device_size_t kWeightBytes =
+      kOutputElements * kInputElements * sizeof(float);
+  constexpr iree_device_size_t kBiasBytes = kOutputElements * sizeof(float);
+  constexpr iree_device_size_t kOutputBytes = kOutputElements * sizeof(float);
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+  iree::vm::ref<iree_hal_buffer_t> input_buffer;
+  iree::vm::ref<iree_hal_buffer_t> weight_buffer;
+  iree::vm::ref<iree_hal_buffer_t> bias_buffer;
+  iree::vm::ref<iree_hal_buffer_t> output_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kInputBytes, &input_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kWeightBytes, &weight_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kBiasBytes, &bias_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kOutputBytes, &output_buffer));
+
+  std::vector<float> input(kInputElements, 1.0f);
+  std::vector<float> weights(kOutputElements * kInputElements,
+                             1.0f / kInputElements);
+  std::vector<float> bias(kOutputElements, 0.25f);
+  std::vector<float> output(kOutputElements, -1.0f);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(input_buffer.get(), 0, input.data(),
+                                           kInputBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(weight_buffer.get(), 0,
+                                           weights.data(), kWeightBytes));
+  IREE_ASSERT_OK(
+      iree_hal_buffer_map_write(bias_buffer.get(), 0, bias.data(), kBiasBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(output_buffer.get(), 0,
+                                           output.data(), kOutputBytes));
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/4, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  iree_hal_buffer_ref_t refs[4] = {
+      iree_hal_make_buffer_ref(input_buffer.get(), 0, kInputBytes),
+      iree_hal_make_buffer_ref(weight_buffer.get(), 0, kWeightBytes),
+      iree_hal_make_buffer_ref(bias_buffer.get(), 0, kBiasBytes),
+      iree_hal_make_buffer_ref(output_buffer.get(), 0, kOutputBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {8, 1, 1}};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {4, refs}, IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  iree_hal_buffer_binding_table_t no_binding_table = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      cmd_buffer.get(), no_binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(output_buffer.get(), 0, output.data(),
+                                          kOutputBytes));
+  for (uint32_t i = 0; i < kOutputElements; ++i) {
+    ASSERT_NEAR(output[i], 1.25f, 0.05f) << "classifier mismatch at " << i;
+  }
+}
+
 TEST_F(DispatchTest, RejectsOutOfBoundsMatmulLikeOutput) {
   tt_iree_ttex_entry_point_desc_t ep = MakeMatmulLikeEntry();
   ep.matmul_like.output.offset[1] = 9;
@@ -877,6 +1206,293 @@ TEST_F(DispatchTest, ExecutesF32MatmulLikeProjection) {
   }
 }
 
+TEST_F(DispatchTest, ExecutesDeviceNativeF32MatmulLikeProjection) {
+  tt_iree_ttex_entry_point_desc_t ep = MakeDeviceNativeMatmulLikeEntry();
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t *executable_ptr = nullptr;
+#ifdef TT_IREE_ENABLE_MOCK
+  constexpr bool kIncludeAot = false;
+#else
+  constexpr bool kIncludeAot = true;
+#endif
+  iree_status_t exec_status = CreateDescriptorTtexExecutable(
+      device_, host_allocator(), ep, &executable_ptr, kIncludeAot);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "device-native F32 matmul AOT fixture is unavailable";
+  }
+  executable.assign(executable_ptr);
+
+  constexpr uint32_t kChannels = 64;
+  constexpr uint32_t kHeight = 8;
+  constexpr uint32_t kWidth = 8;
+  constexpr uint32_t kStorageHeight = 10;
+  constexpr uint32_t kStorageWidth = 10;
+  constexpr iree_device_size_t kActivationBytes =
+      kChannels * kHeight * kWidth * sizeof(float);
+  constexpr iree_device_size_t kWeightBytes =
+      kChannels * kChannels * sizeof(float);
+  constexpr iree_device_size_t kOutputBytes =
+      kChannels * kStorageHeight * kStorageWidth * sizeof(float);
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+  iree::vm::ref<iree_hal_buffer_t> activation_buffer;
+  iree::vm::ref<iree_hal_buffer_t> weight_buffer;
+  iree::vm::ref<iree_hal_buffer_t> output_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kActivationBytes, &activation_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kWeightBytes, &weight_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kOutputBytes, &output_buffer));
+
+  std::vector<float> activation(kChannels * kHeight * kWidth, 1.0f);
+  std::vector<float> weight(kChannels * kChannels, 0.015625f);
+  std::vector<float> output(kChannels * kStorageHeight * kStorageWidth, -3.0f);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      activation_buffer.get(), 0, activation.data(), kActivationBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(weight_buffer.get(), 0,
+                                           weight.data(), kWeightBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(output_buffer.get(), 0,
+                                           output.data(), kOutputBytes));
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  iree_hal_buffer_ref_t refs[3] = {
+      iree_hal_make_buffer_ref(activation_buffer.get(), 0, kActivationBytes),
+      iree_hal_make_buffer_ref(weight_buffer.get(), 0, kWeightBytes),
+      iree_hal_make_buffer_ref(output_buffer.get(), 0, kOutputBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {2, 2, 1}};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {3, refs}, IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  iree_hal_buffer_binding_table_t no_binding_table = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      cmd_buffer.get(), no_binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(output_buffer.get(), 0, output.data(),
+                                          kOutputBytes));
+  for (uint32_t c = 0; c < kChannels; ++c) {
+    for (uint32_t h = 0; h < kStorageHeight; ++h) {
+      for (uint32_t w = 0; w < kStorageWidth; ++w) {
+        const bool is_logical_output = h >= 1 && h <= 8 && w >= 1 && w <= 8;
+        const float expected = is_logical_output ? 1.0f : -3.0f;
+        const uint32_t index = (c * kStorageHeight + h) * kStorageWidth + w;
+        ASSERT_NEAR(output[index], expected, 0.01f)
+            << "native projection mismatch at [" << c << ", " << h << ", " << w
+            << "]";
+      }
+    }
+  }
+}
+
+TEST_F(DispatchTest, ExecutesDeviceNativeF32MatmulLikeMTail) {
+  tt_iree_ttex_entry_point_desc_t ep = MakeDeviceNativeMatmulLikeMTailEntry();
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t *executable_ptr = nullptr;
+#ifdef TT_IREE_ENABLE_MOCK
+  constexpr bool kIncludeAot = false;
+#else
+  constexpr bool kIncludeAot = true;
+#endif
+  iree_status_t exec_status = CreateDescriptorTtexExecutable(
+      device_, host_allocator(), ep, &executable_ptr, kIncludeAot);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "device-native F32 matmul AOT fixture is unavailable";
+  }
+  executable.assign(executable_ptr);
+
+  constexpr uint32_t kM = 49;
+  constexpr uint32_t kN = 64;
+  constexpr uint32_t kK = 64;
+  constexpr uint32_t kOutputStorageM = 53;
+  constexpr uint32_t kOutputMOffset = 2;
+  constexpr iree_device_size_t kActivationBytes = kK * kM * sizeof(float);
+  constexpr iree_device_size_t kWeightBytes = kN * kK * sizeof(float);
+  constexpr iree_device_size_t kOutputBytes =
+      kN * kOutputStorageM * sizeof(float);
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+  iree::vm::ref<iree_hal_buffer_t> activation_buffer;
+  iree::vm::ref<iree_hal_buffer_t> weight_buffer;
+  iree::vm::ref<iree_hal_buffer_t> output_buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kActivationBytes, &activation_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kWeightBytes, &weight_buffer));
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), buffer_params, kOutputBytes, &output_buffer));
+
+  std::vector<float> activation(kK * kM, 1.0f);
+  std::vector<float> weight(kN * kK, 0.015625f);
+  std::vector<float> output(kN * kOutputStorageM, -3.0f);
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(
+      activation_buffer.get(), 0, activation.data(), kActivationBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(weight_buffer.get(), 0,
+                                           weight.data(), kWeightBytes));
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(output_buffer.get(), 0,
+                                           output.data(), kOutputBytes));
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/3, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  iree_hal_buffer_ref_t refs[3] = {
+      iree_hal_make_buffer_ref(activation_buffer.get(), 0, kActivationBytes),
+      iree_hal_make_buffer_ref(weight_buffer.get(), 0, kWeightBytes),
+      iree_hal_make_buffer_ref(output_buffer.get(), 0, kOutputBytes),
+  };
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {2, 2, 1}};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {3, refs}, IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  iree_hal_buffer_binding_table_t no_binding_table = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      cmd_buffer.get(), no_binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(output_buffer.get(), 0, output.data(),
+                                          kOutputBytes));
+  for (uint32_t n = 0; n < kN; ++n) {
+    for (uint32_t m = 0; m < kOutputStorageM; ++m) {
+      const bool is_logical_output =
+          m >= kOutputMOffset && m < kOutputMOffset + kM;
+      const float expected = is_logical_output ? 1.0f : -3.0f;
+      const uint32_t index = n * kOutputStorageM + m;
+      ASSERT_NEAR(output[index], expected, 0.01f)
+          << "native M-tail mismatch at [" << n << ", " << m << "]";
+    }
+  }
+}
+
+TEST_F(DispatchTest,
+       ExecutesDeviceNativeF32RuntimePerChannelMatmulLikeProjection) {
+  tt_iree_ttex_entry_point_desc_t ep =
+      MakeRuntimePerChannelDeviceNativeMatmulLikeEntry();
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t *executable_ptr = nullptr;
+#ifdef TT_IREE_ENABLE_MOCK
+  constexpr bool kIncludeAot = false;
+#else
+  constexpr bool kIncludeAot = true;
+#endif
+  iree_status_t exec_status = CreateDescriptorTtexExecutable(
+      device_, host_allocator(), ep, &executable_ptr, kIncludeAot);
+  if (!iree_status_is_ok(exec_status)) {
+    iree_status_ignore(exec_status);
+    GTEST_SKIP() << "device-native F32 matmul AOT fixture is unavailable";
+  }
+  executable.assign(executable_ptr);
+
+  constexpr uint32_t kM = 49;
+  constexpr uint32_t kN = 64;
+  constexpr uint32_t kK = 64;
+  constexpr uint32_t kOutputStorageM = 53;
+  constexpr uint32_t kOutputMOffset = 2;
+  constexpr iree_device_size_t kActivationBytes = kK * kM * sizeof(float);
+  constexpr iree_device_size_t kWeightBytes = kN * kK * sizeof(float);
+  constexpr iree_device_size_t kOutputBytes =
+      kN * kOutputStorageM * sizeof(float);
+  constexpr iree_device_size_t kChannelBytes = kN * sizeof(float);
+  iree_hal_buffer_params_t buffer_params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+  std::array<iree::vm::ref<iree_hal_buffer_t>, 6> buffers;
+  const std::array<iree_device_size_t, 6> buffer_sizes = {
+      kActivationBytes, kWeightBytes,  kOutputBytes,
+      kChannelBytes,    kChannelBytes, kChannelBytes,
+  };
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+        device_allocator(), buffer_params, buffer_sizes[i], &buffers[i]));
+  }
+
+  std::vector<float> activation(kK * kM, 1.0f);
+  std::vector<float> weight(kN * kK, 0.015625f);
+  std::vector<float> output(kN * kOutputStorageM, -3.0f);
+  std::vector<float> mean(kN);
+  std::vector<float> channel_scale(kN);
+  std::vector<float> channel_bias(kN);
+  for (uint32_t n = 0; n < kN; ++n) {
+    const bool even = n % 2 == 0;
+    mean[n] = even ? 1.0f : 2.0f;
+    channel_scale[n] = even ? 0.5f : 0.25f;
+    channel_bias[n] = even ? 0.25f : -0.25f;
+  }
+  const std::array<const void *, 6> data = {
+      activation.data(), weight.data(),        output.data(),
+      mean.data(),       channel_scale.data(), channel_bias.data(),
+  };
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    IREE_ASSERT_OK(iree_hal_buffer_map_write(buffers[i].get(), 0, data[i],
+                                             buffer_sizes[i]));
+  }
+
+  iree::vm::ref<iree_hal_command_buffer_t> cmd_buffer;
+  IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+      device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+      IREE_HAL_COMMAND_CATEGORY_DISPATCH, /*queue_affinity=*/0,
+      /*binding_capacity=*/6, &cmd_buffer));
+  IREE_ASSERT_OK(iree_hal_command_buffer_begin(cmd_buffer.get()));
+  std::array<iree_hal_buffer_ref_t, 6> refs;
+  for (size_t i = 0; i < refs.size(); ++i) {
+    refs[i] = iree_hal_make_buffer_ref(buffers[i].get(), 0, buffer_sizes[i]);
+  }
+  iree_hal_dispatch_config_t config = {{0, 0, 0}, {2, 2, 1}};
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+      cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
+      iree_const_byte_span_empty(), {refs.size(), refs.data()},
+      IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
+
+  iree_hal_semaphore_list_t no_semaphores = {0};
+  iree_hal_buffer_binding_table_t no_binding_table = {0};
+  IREE_ASSERT_OK(iree_hal_device_queue_execute(
+      device_, /*queue_affinity=*/0, no_semaphores, no_semaphores,
+      cmd_buffer.get(), no_binding_table, IREE_HAL_EXECUTE_FLAG_NONE));
+
+  IREE_ASSERT_OK(iree_hal_buffer_map_read(buffers[2].get(), 0, output.data(),
+                                          kOutputBytes));
+  for (uint32_t n = 0; n < kN; ++n) {
+    for (uint32_t m = 0; m < kOutputStorageM; ++m) {
+      const bool is_logical_output =
+          m >= kOutputMOffset && m < kOutputMOffset + kM;
+      const float expected =
+          is_logical_output ? (n % 2 == 0 ? 0.25f : 0.0f) : -3.0f;
+      const uint32_t index = n * kOutputStorageM + m;
+      ASSERT_NEAR(output[index], expected, 0.01f)
+          << "runtime per-channel native mismatch at [" << n << ", " << m
+          << "]";
+    }
+  }
+}
+
 TEST_F(DispatchTest, ExecutesPerChannelF32MatmulLikeProjection) {
   tt_iree_ttex_entry_point_desc_t ep = MakePerChannelMatmulLikeEntry();
   iree::vm::ref<iree_hal_executable_t> executable;
@@ -999,19 +1615,27 @@ TEST_F(DispatchTest, PreservesResidualMatmulLikeDescriptorMetadata) {
   EXPECT_FLOAT_EQ(params->matmul_like.residual_bias, 0.125f);
 }
 
-TEST_F(DispatchTest, RejectsOverlappingResidualMatmulLikeStorage) {
+TEST_F(DispatchTest, AcceptsAliasedResidualMatmulLikeStorage) {
   tt_iree_ttex_entry_point_desc_t ep = MakeResidualMatmulLikeEntry();
   ep.matmul_like.residual.byte_offset = ep.matmul_like.lhs.byte_offset;
 
-  iree_hal_executable_t *executable = nullptr;
-  iree_status_t status = CreateDescriptorTtexExecutable(
-      device_, host_allocator(), ep, &executable);
-  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
-  iree_status_ignore(status);
-  EXPECT_EQ(executable, nullptr);
+  iree::vm::ref<iree_hal_executable_t> executable;
+  iree_hal_executable_t *executable_ptr = nullptr;
+  IREE_ASSERT_OK(CreateDescriptorTtexExecutable(device_, host_allocator(), ep,
+                                                &executable_ptr));
+  executable.assign(executable_ptr);
+
+  const iree_hal_tt_kernel_params_t *params = nullptr;
+  IREE_ASSERT_OK(iree_hal_tt_executable_lookup_kernel_params(
+      executable.get(), /*entry_point=*/0, &params));
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->matmul_like.residual.binding,
+            params->matmul_like.lhs.binding);
+  EXPECT_EQ(params->matmul_like.residual.byte_offset,
+            params->matmul_like.lhs.byte_offset);
 }
 
-TEST_F(DispatchTest, RejectsUnimplementedResidualMatmulLikeExecution) {
+TEST_F(DispatchTest, AcceptsResidualMatmulLikeDispatch) {
   tt_iree_ttex_entry_point_desc_t ep = MakeResidualMatmulLikeEntry();
   iree::vm::ref<iree_hal_executable_t> executable;
   iree_hal_executable_t *executable_ptr = nullptr;
@@ -1032,11 +1656,11 @@ TEST_F(DispatchTest, RejectsUnimplementedResidualMatmulLikeExecution) {
       iree_hal_make_indirect_buffer_ref(2, 0, 65536),
   };
   iree_hal_dispatch_config_t config = {{0, 0, 0}, {1, 1, 1}};
-  iree_status_t status = iree_hal_command_buffer_dispatch(
+  IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
       cmd_buffer.get(), executable.get(), /*export_ordinal=*/0, config,
-      iree_const_byte_span_empty(), {3, bindings}, IREE_HAL_DISPATCH_FLAG_NONE);
-  EXPECT_EQ(iree_status_code(status), IREE_STATUS_UNIMPLEMENTED);
-  iree_status_ignore(status);
+      iree_const_byte_span_empty(), {3, bindings},
+      IREE_HAL_DISPATCH_FLAG_NONE));
+  IREE_ASSERT_OK(iree_hal_command_buffer_end(cmd_buffer.get()));
 }
 
 TEST_F(DispatchTest, RejectsUndersizedResidualMatmulLikeBinding) {
@@ -1094,7 +1718,13 @@ TEST_F(DispatchTest, ExecutesF32PaddedCopyAndPreservesBorder) {
   iree::vm::ref<iree_hal_executable_t> executable;
   iree_hal_executable_t *executable_ptr = nullptr;
   IREE_ASSERT_OK(CreateDescriptorTtexExecutable(device_, host_allocator(), ep,
-                                                &executable_ptr));
+                                                &executable_ptr,
+#ifdef TT_IREE_ENABLE_AOT_TESTS
+                                                /*include_aot=*/true
+#else
+                                                /*include_aot=*/false
+#endif
+                                                ));
   executable.assign(executable_ptr);
 
   const iree_hal_tt_kernel_params_t *params = nullptr;

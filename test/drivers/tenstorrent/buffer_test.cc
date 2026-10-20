@@ -16,6 +16,41 @@ namespace {
 
 using BufferTest = TenstorrentTestBase;
 
+TEST_F(BufferTest, OddTensorSizePreservesLogicalMappingLength) {
+  constexpr iree_device_size_t kBufferSize = 35 * 49 * sizeof(float);
+  iree_hal_buffer_params_t params = {
+      .usage = IREE_HAL_BUFFER_USAGE_DISPATCH_STORAGE |
+               IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+  };
+  iree_device_size_t compatible_size = 0;
+  auto compatibility = iree_hal_allocator_query_buffer_compatibility(
+      device_allocator(), params, kBufferSize, nullptr, &compatible_size);
+  EXPECT_TRUE(compatibility & IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE);
+  EXPECT_EQ(compatible_size, kBufferSize);
+
+  iree_hal_buffer_t* buffer = nullptr;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), params, kBufferSize, &buffer));
+  EXPECT_EQ(iree_hal_buffer_byte_length(buffer), kBufferSize);
+  std::vector<uint8_t> expected(kBufferSize);
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<uint8_t>(i * 37 + 11);
+  }
+  IREE_ASSERT_OK(iree_hal_buffer_map_write(buffer, 0, expected.data(),
+                                        expected.size()));
+  iree_hal_buffer_mapping_t mapping = {};
+  IREE_ASSERT_OK(iree_hal_buffer_map_range(
+      buffer, IREE_HAL_MAPPING_MODE_SCOPED, IREE_HAL_MEMORY_ACCESS_READ, 0,
+      IREE_HAL_WHOLE_BUFFER, &mapping));
+  EXPECT_EQ(mapping.contents.data_length, kBufferSize);
+  EXPECT_EQ(std::memcmp(mapping.contents.data, expected.data(), expected.size()),
+            0);
+  IREE_ASSERT_OK(iree_hal_buffer_unmap_range(&mapping));
+  iree_hal_buffer_release(buffer);
+}
+
 TEST_F(BufferTest, AllocateSingleTile) {
   // 32x32 float = 4096 bytes = 1 tile.
   constexpr iree_device_size_t kBufferSize = 32 * 32 * sizeof(float);

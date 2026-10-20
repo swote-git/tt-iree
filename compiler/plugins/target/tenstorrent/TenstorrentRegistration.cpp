@@ -36,10 +36,22 @@ struct TenstorrentOptions {
         "iree-tenstorrent-dump-ttex", dumpTTEX,
         llvm::cl::cat(category),
         llvm::cl::desc("Dump TTEX FlatBuffer binary for debugging"));
+    binder.opt<bool>(
+        "iree-tenstorrent-native-bf16-use-tensix", nativeBF16UseTensix,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Use v18 BF16 HiFi4 Tensix contractions instead of "
+                       "v17 device-RISC-V FP32; preserve IR epilogue rounding"));
+    binder.opt<bool>(
+        "iree-tenstorrent-native-f32-use-tensix", nativeF32UseTensix,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Use experimental v16 INT8-digit Tensix math instead "
+                       "of the v15 device FP32 correctness path"));
   }
 
   std::string deviceId = "p100a";
   bool dumpTTEX = false;
+  bool nativeF32UseTensix = false;
+  bool nativeBF16UseTensix = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -63,6 +75,8 @@ struct TenstorrentSession
       IREE::HAL::TenstorrentTargetOptions opts;
       opts.deviceId = options.deviceId;
       opts.dumpTTEX = options.dumpTTEX;
+      opts.nativeF32UseTensix = options.nativeF32UseTensix;
+      opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
       return std::make_shared<IREE::HAL::TenstorrentTargetDevice>(opts);
     });
   }
@@ -73,6 +87,8 @@ struct TenstorrentSession
       IREE::HAL::TenstorrentTargetOptions opts;
       opts.deviceId = options.deviceId;
       opts.dumpTTEX = options.dumpTTEX;
+      opts.nativeF32UseTensix = options.nativeF32UseTensix;
+      opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
       return std::make_shared<IREE::HAL::TenstorrentTargetBackend>(opts);
     });
   }

@@ -93,9 +93,9 @@ endif()
 # Project Tests and Tools
 #-------------------------------------------------------------------------------
 
+add_subdirectory(tools)
+
 if(TT_IREE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(test)
 endif()
-
-add_subdirectory(tools)

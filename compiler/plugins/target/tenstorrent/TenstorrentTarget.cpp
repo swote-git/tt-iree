@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "TenstorrentTarget.h"
+#include "TenstorrentPreprocessingPass.h"
 #ifdef TT_IREE_ENABLE_AOT
 #include "TenstorrentAOTCompiler.h"
+#include "TenstorrentNativeKernels.h"
 #endif
 
 #include <algorithm>
@@ -11,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 #include "iree/compiler/Codegen/Common/Passes.h"
@@ -23,13 +26,17 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/DenseMap.h"
 
 // TTEX builder — shared between compiler and runtime tests.
 // This header is from runtime/src/iree/schema/ and is available
 // after the schema CMake target is built.
 #include "iree/schema/tt_executable_builder_util.h"
+#include "iree/schema/tt_native_dispatch.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
 
@@ -74,25 +81,6 @@ inferExecutableTargetArch(IREE::HAL::ExecutableTargetAttr targetAttr,
   return inferTargetArch(fallbackDeviceId);
 }
 
-static bool isStaticBf16TensorOfShape(Type type, ArrayRef<int64_t> shape) {
-  auto rankedType = dyn_cast<RankedTensorType>(type);
-  if (!rankedType || !rankedType.hasStaticShape() ||
-      rankedType.getElementType().isBF16() == false) {
-    return false;
-  }
-  return rankedType.getShape() == shape;
-}
-
-static bool isRank2Bf16Tensor(Type type) {
-  auto rankedType = dyn_cast<RankedTensorType>(type);
-  return rankedType && rankedType.getRank() == 2 &&
-         rankedType.getElementType().isBF16();
-}
-
-static bool isDynamicDimOrTileAligned(int64_t dim) {
-  return ShapedType::isDynamic(dim) || (dim > 0 && dim % 32 == 0);
-}
-
 struct BuiltinSelection {
   uint32_t program = 0;
   uint32_t mTiles = 0;
@@ -110,6 +98,11 @@ struct BuiltinSelection {
   std::vector<float> matmulEpilogueBiases;
   std::vector<float> convEpilogueScales;
   std::vector<float> convEpilogueBiases;
+  tt_iree_ttex_bf16_native_desc_t bf16Native = {};
+  std::string bf16Source;
+#ifdef TT_IREE_ENABLE_AOT
+  TenstorrentNativeSources bf16Sources;
+#endif
 };
 
 #ifdef TT_IREE_ENABLE_AOT
@@ -352,23 +345,24 @@ copyStaticStrides(ArrayRef<OpFoldResult> mixedStrides, uint8_t rank,
   return success();
 }
 
-static LogicalResult populateTensorDesc(RankedTensorType logicalType,
-                                        ArrayRef<int64_t> storageShape,
-                                        ArrayRef<OpFoldResult> mixedOffsets,
-                                        ArrayRef<OpFoldResult> mixedStrides,
-                                        uint16_t binding,
-                                        InferredByteOffset byteOffset,
-                                        uint8_t layout,
-                                        tt_iree_ttex_tensor_desc_t &desc) {
+static LogicalResult
+populateTensorDesc(RankedTensorType logicalType, ArrayRef<int64_t> storageShape,
+                   ArrayRef<OpFoldResult> mixedOffsets,
+                   ArrayRef<OpFoldResult> mixedStrides, uint16_t binding,
+                   InferredByteOffset byteOffset, uint8_t layout,
+                   tt_iree_ttex_tensor_desc_t &desc) {
   if (!logicalType || !logicalType.hasStaticShape() ||
-      !logicalType.getElementType().isF32() || logicalType.getRank() == 0 ||
+      (!logicalType.getElementType().isF32() &&
+       !logicalType.getElementType().isBF16()) || logicalType.getRank() == 0 ||
       logicalType.getRank() > TT_IREE_TTEX_MAX_TENSOR_RANK ||
       storageShape.size() != static_cast<size_t>(logicalType.getRank())) {
     return failure();
   }
 
   desc.binding = binding;
-  desc.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+  desc.element_type = logicalType.getElementType().isBF16()
+                          ? TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16
+                          : TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
   desc.layout = layout;
   desc.rank = static_cast<uint8_t>(logicalType.getRank());
   desc.byte_offset = byteOffset.staticOffset;
@@ -391,9 +385,9 @@ static LogicalResult populateTensorDesc(RankedTensorType logicalType,
   return copyStaticStrides(mixedStrides, desc.rank, desc.stride);
 }
 
-static void populateScalarTensorDesc(
-    uint16_t binding, InferredByteOffset byteOffset,
-    tt_iree_ttex_tensor_desc_t &desc) {
+static void populateScalarTensorDesc(uint16_t binding,
+                                     InferredByteOffset byteOffset,
+                                     tt_iree_ttex_tensor_desc_t &desc) {
   desc.binding = binding;
   desc.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
   desc.layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR;
@@ -463,12 +457,12 @@ inferF32PaddedCopyProgram(func::FuncOp funcOp) {
   if (failed(populateTensorDesc(
           logicalType, sourceLoad.getSourceType().getShape(),
           sourceLoad.getMixedOffsets(), sourceLoad.getMixedStrides(),
-          *sourceBinding, *sourceByteOffset,
-          TT_IREE_TTEX_TENSOR_LAYOUT_CHW, selection.paddedCopy.source)) ||
+          *sourceBinding, *sourceByteOffset, TT_IREE_TTEX_TENSOR_LAYOUT_CHW,
+          selection.paddedCopy.source)) ||
       failed(populateTensorDesc(
           logicalType, destinationStore.getTargetType().getShape(),
-          destinationStore.getMixedOffsets(), destinationStore.getMixedStrides(),
-          destinationBinding,
+          destinationStore.getMixedOffsets(),
+          destinationStore.getMixedStrides(), destinationBinding,
           *destinationByteOffset, TT_IREE_TTEX_TENSOR_LAYOUT_CHW,
           selection.paddedCopy.destination))) {
     return failure();
@@ -606,8 +600,8 @@ inferF32MaxPool2DProgram(func::FuncOp funcOp) {
   if (failed(populateTensorDesc(
           inputType, inputLoad.getSourceType().getShape(),
           inputLoad.getMixedOffsets(), inputLoad.getMixedStrides(),
-          *inputBinding, *inputByteOffset,
-          TT_IREE_TTEX_TENSOR_LAYOUT_CHW, selection.maxPool.input)) ||
+          *inputBinding, *inputByteOffset, TT_IREE_TTEX_TENSOR_LAYOUT_CHW,
+          selection.maxPool.input)) ||
       failed(populateTensorDesc(
           outputType, outputStore.getTargetType().getShape(),
           outputStore.getMixedOffsets(), outputStore.getMixedStrides(),
@@ -817,7 +811,8 @@ inferPerChannelAffineRelu(func::FuncOp funcOp, size_t channelCount) {
   AffineExpr d0 = getAffineDimExpr(0, context);
   AffineExpr d1 = getAffineDimExpr(1, context);
   AffineExpr d2 = getAffineDimExpr(2, context);
-  unsigned rank = cast<RankedTensorType>(relu->op.getResult(0).getType()).getRank();
+  unsigned rank =
+      cast<RankedTensorType>(relu->op.getResult(0).getType()).getRank();
   SmallVector<AffineExpr, 3> identityResults = {d0, d1, d2};
   identityResults.resize(rank);
   SmallVector<AffineMap, 5> expectedMaps;
@@ -915,15 +910,16 @@ inferPerChannelAffineRelu(func::FuncOp funcOp, size_t channelCount) {
   };
 }
 
-static LogicalResult populateRuntimeVectorDesc(
-    Value value, size_t expectedSize, tt_iree_ttex_tensor_desc_t &desc) {
+static LogicalResult
+populateRuntimeVectorDesc(Value value, size_t expectedSize,
+                          tt_iree_ttex_tensor_desc_t &desc) {
   IREE::TensorExt::DispatchTensorLoadOp loadOp;
   FailureOr<uint16_t> binding = inferLoadBinding(value, loadOp);
   auto type = dyn_cast<RankedTensorType>(value.getType());
-  auto subspan = loadOp ? loadOp.getSource()
-                              .getDefiningOp<
-                                  IREE::HAL::InterfaceBindingSubspanOp>()
-                        : IREE::HAL::InterfaceBindingSubspanOp{};
+  auto subspan =
+      loadOp ? loadOp.getSource()
+                   .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>()
+             : IREE::HAL::InterfaceBindingSubspanOp{};
   FailureOr<InferredByteOffset> byteOffset = inferByteOffset(subspan);
   if (failed(binding) || !type || !type.hasStaticShape() ||
       type.getRank() != 1 || !type.getElementType().isF32() ||
@@ -931,10 +927,10 @@ static LogicalResult populateRuntimeVectorDesc(
       failed(byteOffset)) {
     return failure();
   }
-  return populateTensorDesc(
-      type, loadOp.getSourceType().getShape(), loadOp.getMixedOffsets(),
-      loadOp.getMixedStrides(), *binding, *byteOffset,
-      TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, desc);
+  return populateTensorDesc(type, loadOp.getSourceType().getShape(),
+                            loadOp.getMixedOffsets(), loadOp.getMixedStrides(),
+                            *binding, *byteOffset,
+                            TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, desc);
 }
 
 struct ResidualAffineRelu {
@@ -1014,9 +1010,10 @@ struct RuntimePerChannelResidualAffineRelu {
   bool hasResidualAffine = false;
 };
 
-static FailureOr<float> matchRuntimeChannelAffine(
-    Value value, Value activation, Value mean, Value channelScale,
-    Value channelBias) {
+static FailureOr<float> matchRuntimeChannelAffine(Value value, Value activation,
+                                                  Value mean,
+                                                  Value channelScale,
+                                                  Value channelBias) {
   auto shiftedOp = value.getDefiningOp<arith::AddFOp>();
   if (!shiftedOp)
     return failure();
@@ -1067,24 +1064,23 @@ inferRuntimePerChannelResidualAffineRelu(func::FuncOp funcOp,
                                          linalg::GenericOp contractionOp) {
   FailureOr<ReluEpilogue> relu = inferSingleRelu(funcOp);
   if (failed(relu) || relu->op.getNumDpsInits() != 1 ||
-      (relu->op.getNumDpsInputs() != 5 &&
-       relu->op.getNumDpsInputs() != 8) ||
+      (relu->op.getNumDpsInputs() != 5 && relu->op.getNumDpsInputs() != 8) ||
       relu->op.getDpsInputs()[0] != contractionOp.getResult(0)) {
     return failure();
   }
 
-  unsigned rank = cast<RankedTensorType>(relu->op.getResult(0).getType()).getRank();
+  unsigned rank =
+      cast<RankedTensorType>(relu->op.getResult(0).getType()).getRank();
   if (rank != 2 && rank != 3)
     return failure();
   MLIRContext *context = relu->op.getContext();
-  SmallVector<AffineExpr, 3> identityResults = {
-      getAffineDimExpr(0, context), getAffineDimExpr(1, context),
-      getAffineDimExpr(2, context)};
+  SmallVector<AffineExpr, 3> identityResults = {getAffineDimExpr(0, context),
+                                                getAffineDimExpr(1, context),
+                                                getAffineDimExpr(2, context)};
   identityResults.resize(rank);
-  AffineMap identityMap =
-      AffineMap::get(rank, 0, identityResults, context);
-  AffineMap channelMap = AffineMap::get(
-      rank, 0, {getAffineDimExpr(0, context)}, context);
+  AffineMap identityMap = AffineMap::get(rank, 0, identityResults, context);
+  AffineMap channelMap =
+      AffineMap::get(rank, 0, {getAffineDimExpr(0, context)}, context);
   SmallVector<AffineMap> expectedMaps = {identityMap, channelMap, channelMap,
                                          channelMap, identityMap};
   if (relu->op.getNumDpsInputs() == 8) {
@@ -1259,10 +1255,8 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
                                             TT_IREE_TTEX_EPILOGUE_RELU |
                                             TT_IREE_TTEX_EPILOGUE_PER_CHANNEL;
       if (!perChannelEpilogue->scales.empty()) {
-        selection.matmulEpilogueScales =
-            std::move(perChannelEpilogue->scales);
-        selection.matmulEpilogueBiases =
-            std::move(perChannelEpilogue->biases);
+        selection.matmulEpilogueScales = std::move(perChannelEpilogue->scales);
+        selection.matmulEpilogueBiases = std::move(perChannelEpilogue->biases);
       } else {
         selection.matmulLike.epilogue_flags |=
             TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
@@ -1292,10 +1286,8 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
           return failure();
         residualBinding = *inferredResidualBinding;
         selection.matmulLike.epilogue_flags =
-            TT_IREE_TTEX_EPILOGUE_AFFINE |
-            TT_IREE_TTEX_EPILOGUE_RESIDUAL |
-            TT_IREE_TTEX_EPILOGUE_RELU |
-            TT_IREE_TTEX_EPILOGUE_PER_CHANNEL |
+            TT_IREE_TTEX_EPILOGUE_AFFINE | TT_IREE_TTEX_EPILOGUE_RESIDUAL |
+            TT_IREE_TTEX_EPILOGUE_RELU | TT_IREE_TTEX_EPILOGUE_PER_CHANNEL |
             TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
         selection.matmulLike.epilogue_common_scale =
             runtimeResidualEpilogue->mainCommonScale;
@@ -1316,16 +1308,14 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
           selection.matmulLike.residual_common_scale =
               runtimeResidualEpilogue->residualCommonScale;
           if (failed(populateRuntimeVectorDesc(
-                  runtimeResidualEpilogue->residualMean,
-                  static_cast<size_t>(n),
+                  runtimeResidualEpilogue->residualMean, static_cast<size_t>(n),
                   selection.matmulLike.residual_mean)) ||
               failed(populateRuntimeVectorDesc(
                   runtimeResidualEpilogue->residualScale,
                   static_cast<size_t>(n),
                   selection.matmulLike.residual_channel_scale)) ||
               failed(populateRuntimeVectorDesc(
-                  runtimeResidualEpilogue->residualBias,
-                  static_cast<size_t>(n),
+                  runtimeResidualEpilogue->residualBias, static_cast<size_t>(n),
                   selection.matmulLike.residual_channel_bias))) {
             return failure();
           }
@@ -1343,10 +1333,9 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
         if (failed(inferredResidualBinding))
           return failure();
         residualBinding = *inferredResidualBinding;
-        selection.matmulLike.epilogue_flags =
-            TT_IREE_TTEX_EPILOGUE_AFFINE |
-            TT_IREE_TTEX_EPILOGUE_RESIDUAL |
-            TT_IREE_TTEX_EPILOGUE_RELU;
+        selection.matmulLike.epilogue_flags = TT_IREE_TTEX_EPILOGUE_AFFINE |
+                                              TT_IREE_TTEX_EPILOGUE_RESIDUAL |
+                                              TT_IREE_TTEX_EPILOGUE_RELU;
         selection.matmulLike.epilogue_scale = residualEpilogue->mainScale;
         selection.matmulLike.epilogue_bias = residualEpilogue->mainBias;
         selection.matmulLike.residual_scale = residualEpilogue->residualScale;
@@ -1383,11 +1372,10 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
     return failure();
   }
 
-  if (failed(populateTensorDesc(lhsType, lhsLoad.getSourceType().getShape(),
-                                lhsLoad.getMixedOffsets(),
-                                lhsLoad.getMixedStrides(), *lhsBinding,
-                                *lhsByteOffset, activationLayout,
-                                selection.matmulLike.lhs)) ||
+  if (failed(populateTensorDesc(
+          lhsType, lhsLoad.getSourceType().getShape(),
+          lhsLoad.getMixedOffsets(), lhsLoad.getMixedStrides(), *lhsBinding,
+          *lhsByteOffset, activationLayout, selection.matmulLike.lhs)) ||
       failed(populateTensorDesc(rhsType, rhsLoad.getSourceType().getShape(),
                                 rhsLoad.getMixedOffsets(),
                                 rhsLoad.getMixedStrides(), *rhsBinding,
@@ -1413,8 +1401,7 @@ inferF32MatmulLikeProgram(func::FuncOp funcOp) {
         failed(populateTensorDesc(
             residualType, residualLoad.getSourceType().getShape(),
             residualLoad.getMixedOffsets(), residualLoad.getMixedStrides(),
-            *residualBinding,
-            *residualByteOffset, activationLayout,
+            *residualBinding, *residualByteOffset, activationLayout,
             selection.matmulLike.residual))) {
       return failure();
     }
@@ -1546,16 +1533,13 @@ static FailureOr<BuiltinSelection> inferF32Conv2DProgram(func::FuncOp funcOp) {
       selection.convEpilogueScales = std::move(perChannelEpilogue->scales);
       selection.convEpilogueBiases = std::move(perChannelEpilogue->biases);
     } else {
-      selection.conv2d.epilogue_flags |=
-          TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
-      selection.conv2d.epilogue_common_scale =
-          perChannelEpilogue->commonScale;
-      if (failed(populateRuntimeVectorDesc(
-              perChannelEpilogue->mean, static_cast<size_t>(outputC),
-              selection.conv2d.epilogue_mean)) ||
+      selection.conv2d.epilogue_flags |= TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+      selection.conv2d.epilogue_common_scale = perChannelEpilogue->commonScale;
+      if (failed(populateRuntimeVectorDesc(perChannelEpilogue->mean,
+                                           static_cast<size_t>(outputC),
+                                           selection.conv2d.epilogue_mean)) ||
           failed(populateRuntimeVectorDesc(
-              perChannelEpilogue->channelScale,
-              static_cast<size_t>(outputC),
+              perChannelEpilogue->channelScale, static_cast<size_t>(outputC),
               selection.conv2d.epilogue_channel_scale)) ||
           failed(populateRuntimeVectorDesc(
               perChannelEpilogue->channelBias, static_cast<size_t>(outputC),
@@ -1591,13 +1575,13 @@ static FailureOr<BuiltinSelection> inferF32Conv2DProgram(func::FuncOp funcOp) {
   if (failed(populateTensorDesc(
           inputType, inputLoad.getSourceType().getShape(),
           inputLoad.getMixedOffsets(), inputLoad.getMixedStrides(),
-          *inputBinding, *inputByteOffset,
-          TT_IREE_TTEX_TENSOR_LAYOUT_CHW, selection.conv2d.input)) ||
+          *inputBinding, *inputByteOffset, TT_IREE_TTEX_TENSOR_LAYOUT_CHW,
+          selection.conv2d.input)) ||
       failed(populateTensorDesc(
           filterType, filterLoad.getSourceType().getShape(),
           filterLoad.getMixedOffsets(), filterLoad.getMixedStrides(),
-          *filterBinding, *filterByteOffset,
-          TT_IREE_TTEX_TENSOR_LAYOUT_OIHW, selection.conv2d.filter)) ||
+          *filterBinding, *filterByteOffset, TT_IREE_TTEX_TENSOR_LAYOUT_OIHW,
+          selection.conv2d.filter)) ||
       failed(populateTensorDesc(
           outputType, outputStore.getTargetType().getShape(),
           outputStore.getMixedOffsets(), outputStore.getMixedStrides(),
@@ -1609,7 +1593,8 @@ static FailureOr<BuiltinSelection> inferF32Conv2DProgram(func::FuncOp funcOp) {
   return selection;
 }
 
-static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp) {
+static FailureOr<BuiltinSelection>
+inferF32GlobalSumProgram(func::FuncOp funcOp) {
   linalg::GenericOp reductionOp;
   int genericCount = 0;
   funcOp.walk([&](linalg::GenericOp op) {
@@ -1621,8 +1606,8 @@ static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp)
     return failure();
   }
 
-  auto dummyType = dyn_cast<RankedTensorType>(
-      reductionOp.getDpsInputs()[0].getType());
+  auto dummyType =
+      dyn_cast<RankedTensorType>(reductionOp.getDpsInputs()[0].getType());
   auto sumType = dyn_cast<RankedTensorType>(reductionOp.getResult(0).getType());
   auto divisorType =
       dyn_cast<RankedTensorType>(reductionOp.getResult(1).getType());
@@ -1659,9 +1644,8 @@ static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp)
     return failure();
   }
   auto addOp = yieldOp.getValues()[0].getDefiningOp<arith::AddFOp>();
-  if (!addOp ||
-      (addOp.getLhs() != body.getArgument(1) &&
-       addOp.getRhs() != body.getArgument(1))) {
+  if (!addOp || (addOp.getLhs() != body.getArgument(1) &&
+                 addOp.getRhs() != body.getArgument(1))) {
     return failure();
   }
 
@@ -1672,7 +1656,8 @@ static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp)
     extractOp = op;
     ++extractCount;
   });
-  if (extractCount != 1) return failure();
+  if (extractCount != 1)
+    return failure();
   FailureOr<uint16_t> inputBinding =
       inferLoadBinding(extractOp.getTensor(), inputLoad);
   auto inputType = dyn_cast<RankedTensorType>(inputLoad.getType());
@@ -1688,17 +1673,22 @@ static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp)
   int storeCount = 0;
   funcOp.walk([&](IREE::TensorExt::DispatchTensorStoreOp op) {
     ++storeCount;
-    if (op.getValue() == reductionOp.getResult(0)) sumStore = op;
-    if (op.getValue() == reductionOp.getResult(1)) divisorStore = op;
+    if (op.getValue() == reductionOp.getResult(0))
+      sumStore = op;
+    if (op.getValue() == reductionOp.getResult(1))
+      divisorStore = op;
   });
-  if (storeCount != 2 || !sumStore || !divisorStore) return failure();
+  if (storeCount != 2 || !sumStore || !divisorStore)
+    return failure();
 
   auto inputSubspan =
-      inputLoad.getSource().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto sumSubspan =
-      sumStore.getTarget().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto divisorSubspan = divisorStore.getTarget()
-                            .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+      inputLoad.getSource()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto sumSubspan = sumStore.getTarget()
+                        .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto divisorSubspan =
+      divisorStore.getTarget()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
   if (!inputSubspan || !sumSubspan || !divisorSubspan ||
       sumSubspan.getBinding().getZExtValue() >
           std::numeric_limits<uint16_t>::max() ||
@@ -1740,7 +1730,8 @@ static FailureOr<BuiltinSelection> inferF32GlobalSumProgram(func::FuncOp funcOp)
   return selection;
 }
 
-static FailureOr<BuiltinSelection> inferF32ScalarDivProgram(func::FuncOp funcOp) {
+static FailureOr<BuiltinSelection>
+inferF32ScalarDivProgram(func::FuncOp funcOp) {
   linalg::GenericOp divideOp;
   int genericCount = 0;
   funcOp.walk([&](linalg::GenericOp op) {
@@ -1795,14 +1786,16 @@ static FailureOr<BuiltinSelection> inferF32ScalarDivProgram(func::FuncOp funcOp)
     outputStore = op;
     ++storeCount;
   });
-  auto divisorSubspan = divisorLoad.getSource()
-                            .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto divisorSubspan =
+      divisorLoad.getSource()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
   auto inputSubspan =
-      inputLoad.getSource().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto outputSubspan = outputStore
-                           ? outputStore.getTarget().getDefiningOp<
-                                 IREE::HAL::InterfaceBindingSubspanOp>()
-                           : IREE::HAL::InterfaceBindingSubspanOp{};
+      inputLoad.getSource()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto outputSubspan =
+      outputStore ? outputStore.getTarget()
+                        .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>()
+                  : IREE::HAL::InterfaceBindingSubspanOp{};
   if (failed(divisorBinding) || failed(inputBinding) || storeCount != 1 ||
       outputStore.getValue() != divideOp.getResult(0) || !divisorSubspan ||
       !inputSubspan || !outputSubspan ||
@@ -1866,7 +1859,8 @@ static FailureOr<BuiltinSelection> inferF32LinearProgram(func::FuncOp funcOp) {
   auto weightsType =
       dyn_cast<RankedTensorType>(matmulOp.getInputs()[1].getType());
   auto outputType = dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType());
-  auto biasType = dyn_cast<RankedTensorType>(biasOp.getDpsInputs()[1].getType());
+  auto biasType =
+      dyn_cast<RankedTensorType>(biasOp.getDpsInputs()[1].getType());
   if (!inputType || !weightsType || !outputType || !biasType ||
       !inputType.hasStaticShape() || !weightsType.hasStaticShape() ||
       !outputType.hasStaticShape() || inputType.getRank() != 2 ||
@@ -1915,15 +1909,17 @@ static FailureOr<BuiltinSelection> inferF32LinearProgram(func::FuncOp funcOp) {
     ++storeCount;
   });
   auto inputSubspan =
-      inputLoad.getSource().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto weightsSubspan = weightsLoad.getSource()
-                            .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto biasSubspan =
-      biasLoad.getSource().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
-  auto outputSubspan = outputStore
-                           ? outputStore.getTarget().getDefiningOp<
-                                 IREE::HAL::InterfaceBindingSubspanOp>()
-                           : IREE::HAL::InterfaceBindingSubspanOp{};
+      inputLoad.getSource()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto weightsSubspan =
+      weightsLoad.getSource()
+          .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto biasSubspan = biasLoad.getSource()
+                         .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto outputSubspan =
+      outputStore ? outputStore.getTarget()
+                        .getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>()
+                  : IREE::HAL::InterfaceBindingSubspanOp{};
   if (failed(inputBinding) || failed(weightsBinding) || failed(biasBinding) ||
       storeCount != 1 || outputStore.getValue() != biasOp.getResult(0) ||
       !inputSubspan || !weightsSubspan || !biasSubspan || !outputSubspan ||
@@ -1977,7 +1973,12 @@ static FailureOr<BuiltinSelection> inferF32LinearProgram(func::FuncOp funcOp) {
   return selection;
 }
 
-static FailureOr<BuiltinSelection> inferBuiltinProgram(func::FuncOp funcOp) {
+#include "TenstorrentBF16Lowering.inc"
+
+static FailureOr<BuiltinSelection> inferBuiltinProgram(func::FuncOp funcOp,
+                                                       bool bf16Tensix = false) {
+  auto bf16Selection = inferBF16NativeProgram(funcOp, bf16Tensix);
+  if (succeeded(bf16Selection)) return bf16Selection;
   FailureOr<BuiltinSelection> paddedCopySelection =
       inferF32PaddedCopyProgram(funcOp);
   if (succeeded(paddedCopySelection))
@@ -2013,73 +2014,13 @@ static FailureOr<BuiltinSelection> inferBuiltinProgram(func::FuncOp funcOp) {
     if (matmulCount != 1) {
       return failure();
     }
-
-    auto inputs = matchedMatmulOp.getInputs();
-    auto outputs = matchedMatmulOp.getOutputs();
-    if (inputs.size() != 2 || outputs.size() != 1) {
+    FailureOr<TenstorrentMatmulSelection> matmulSelection =
+        readTenstorrentMatmulSelection(matchedMatmulOp);
+    if (failed(matmulSelection))
       return failure();
-    }
-
-    if (!isStaticBf16TensorOfShape(inputs[0].getType(), {32, 32}) ||
-        !isStaticBf16TensorOfShape(inputs[1].getType(), {32, 32}) ||
-        !isStaticBf16TensorOfShape(outputs[0].getType(), {32, 32})) {
-      auto lhsType = dyn_cast<RankedTensorType>(inputs[0].getType());
-      auto rhsType = dyn_cast<RankedTensorType>(inputs[1].getType());
-      auto outType = dyn_cast<RankedTensorType>(outputs[0].getType());
-      if (!lhsType || !rhsType || !outType || lhsType.getRank() != 2 ||
-          rhsType.getRank() != 2 || outType.getRank() != 2 ||
-          !isRank2Bf16Tensor(lhsType) || !isRank2Bf16Tensor(rhsType) ||
-          !isRank2Bf16Tensor(outType)) {
-        return failure();
-      }
-
-      int64_t lhsM = lhsType.getDimSize(0);
-      int64_t lhsK = lhsType.getDimSize(1);
-      int64_t rhsK = rhsType.getDimSize(0);
-      int64_t rhsN = rhsType.getDimSize(1);
-      int64_t outM = outType.getDimSize(0);
-      int64_t outN = outType.getDimSize(1);
-
-      if (!isDynamicDimOrTileAligned(lhsM) ||
-          !isDynamicDimOrTileAligned(lhsK) ||
-          !isDynamicDimOrTileAligned(rhsK) ||
-          !isDynamicDimOrTileAligned(rhsN) ||
-          !isDynamicDimOrTileAligned(outM) ||
-          !isDynamicDimOrTileAligned(outN)) {
-        return failure();
-      }
-      if (!ShapedType::isDynamic(lhsM) && !ShapedType::isDynamic(outM) &&
-          lhsM != outM) {
-        return failure();
-      }
-      if (!ShapedType::isDynamic(lhsK) && !ShapedType::isDynamic(rhsK) &&
-          lhsK != rhsK) {
-        return failure();
-      }
-      if (!ShapedType::isDynamic(rhsN) && !ShapedType::isDynamic(outN) &&
-          rhsN != outN) {
-        return failure();
-      }
-
-      BuiltinSelection selection;
-      selection.program =
-          static_cast<uint32_t>(TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED);
-      if (!lhsType.isDynamicDim(0) && !lhsType.isDynamicDim(1) &&
-          !rhsType.isDynamicDim(1)) {
-        selection.mTiles = static_cast<uint32_t>(lhsM / 32);
-        selection.kTiles = static_cast<uint32_t>(lhsK / 32);
-        selection.nTiles = static_cast<uint32_t>(rhsN / 32);
-      }
-      return selection;
-    }
-
-    return BuiltinSelection{
-        static_cast<uint32_t>(
-            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32),
-        1,
-        1,
-        1,
-    };
+    return BuiltinSelection{matmulSelection->builtinProgram,
+                            matmulSelection->mTiles, matmulSelection->nTiles,
+                            matmulSelection->kTiles};
   }
 
   FailureOr<BuiltinSelection> matmulLikeSelection =
@@ -2158,6 +2099,8 @@ public:
       FailureOr<BuiltinSelection> selection = inferBuiltinProgram(funcOp);
       if (failed(selection) ||
           (selection->program !=
+               static_cast<uint32_t>(TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE) &&
+           selection->program !=
                static_cast<uint32_t>(
                    TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED) &&
            selection->program !=
@@ -2168,12 +2111,15 @@ public:
            selection->program !=
                static_cast<uint32_t>(
                    TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D) &&
-           selection->program != static_cast<uint32_t>(
-                                     TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM) &&
-           selection->program != static_cast<uint32_t>(
-                                     TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV) &&
            selection->program !=
-               static_cast<uint32_t>(TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR))) {
+               static_cast<uint32_t>(
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM) &&
+           selection->program !=
+               static_cast<uint32_t>(
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV) &&
+           selection->program !=
+               static_cast<uint32_t>(
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR))) {
         continue;
       }
 
@@ -2181,7 +2127,9 @@ public:
       builder.setInsertionPoint(funcOp.getBody().front().getTerminator());
       SmallVector<OpFoldResult, 2> workgroupCount;
 
-      if (selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+      if ((selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
+           !tt_iree_ttex_is_native_matrix_kind(selection->bf16Native.operation_kind)) ||
+          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
           selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
           selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
         workgroupCount.push_back(builder.getIndexAttr(1));
@@ -2189,8 +2137,8 @@ public:
       } else if (selection->mTiles != 0 && selection->nTiles != 0) {
         uint32_t gridX = selection->nTiles;
         uint32_t gridY = selection->mTiles;
-        if (selection->dispatchKind ==
-                TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+        if (selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE ||
+            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
             selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
             selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
           constexpr uint32_t kPortableGridLimit = 8;
@@ -2385,8 +2333,23 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       return exportOp.emitError("missing inner function for executable export");
     }
 
-    FailureOr<BuiltinSelection> builtinSelection = inferBuiltinProgram(funcOp);
+    FailureOr<BuiltinSelection> builtinSelection = inferBuiltinProgram(funcOp, options_.nativeBF16UseTensix);
     if (failed(builtinSelection)) {
+      linalg::MatmulOp supportedMatmulOp;
+      int supportedMatmulCount = 0;
+      funcOp.walk([&](linalg::MatmulOp matmulOp) {
+        if (succeeded(matchTenstorrentBf16Matmul(matmulOp))) {
+          supportedMatmulOp = matmulOp;
+          ++supportedMatmulCount;
+        }
+      });
+      if (supportedMatmulCount == 1 &&
+          failed(readTenstorrentMatmulSelection(supportedMatmulOp))) {
+        return exportOp.emitError(
+            "supported BF16 matmul is missing a valid Tenstorrent "
+            "selection-v1 annotation; compile from an earlier IREE phase or "
+            "run Tenstorrent preprocessing");
+      }
       return exportOp.emitError(
           "unsupported Tenstorrent dispatch; supported builtins are a single "
           "arith.addf path, a single static linalg.matmul on "
@@ -2398,6 +2361,12 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
           "epilogues, a static rank-3 F32 padded copy, a static rank-3 F32 "
           "3x3 stride-2 max-pool, or the exact F32 global-sum, scalar-divide, "
           "and biased-linear ResNet50 tail operations");
+    }
+    if (!tt_iree_ttex_builtin_matches_dispatch_kind(
+            builtinSelection->program, builtinSelection->dispatchKind)) {
+      return exportOp.emitError(
+          "internal Tenstorrent lowering error: builtin program and dispatch "
+          "kind are incompatible");
     }
 
     desc.constant_count = inferConstantCount(exportOp);
@@ -2415,6 +2384,11 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
     desc.max_pool = builtinSelection->maxPool;
     desc.global_sum = builtinSelection->globalSum;
     desc.scalar_div = builtinSelection->scalarDiv;
+    desc.bf16_native = builtinSelection->bf16Native;
+#ifndef TT_IREE_ENABLE_AOT
+    if (desc.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
+      return exportOp.emitError("BF16-native dispatch requires a TT-Metal AOT-enabled compiler");
+#endif
     desc.linear = builtinSelection->linear;
     if (builtinSelection->dispatchKind ==
             TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE &&
@@ -2451,18 +2425,39 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
                         TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
     bool isConvolution = builtinSelection->dispatchKind ==
                          TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
+    bool isPaddedCopy = builtinSelection->dispatchKind ==
+                        TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY;
     bool isLinear =
         builtinSelection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR;
-    if (isAdd || isBF16Matmul || isMatmulLike || isConvolution ||
-        isLinear) {
+    bool isNativeScalar =
+        builtinSelection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+        builtinSelection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
+        builtinSelection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV;
+    bool isBF16Native = desc.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+    if (isBF16Native && options_.nativeF32UseTensix)
+      return exportOp.emitError("BF16-native v17 cannot use the experimental F32 v16 option");
+    if (isBF16Native || isAdd || isBF16Matmul || isMatmulLike || isConvolution ||
+        isPaddedCopy || isLinear || isNativeScalar) {
       aotBundleStorage.emplace_back();
       SerializedAOTBundleStorage &aot = aotBundleStorage.back();
       std::string aotError;
       TenstorrentAOTTargetArch aotTargetArch =
           static_cast<TenstorrentAOTTargetArch>(*targetArch);
-      bool compiled =
-          isAdd ? compileAddAOT(aotTargetArch, aot.bundle, aotError)
-                : compileMatmulAOT(aotTargetArch, aot.bundle, aotError);
+      bool compiled = false;
+      if (isBF16Native) {
+        compiled = compileBF16NativeAOT(desc, builtinSelection->bf16Source,
+                                        builtinSelection->bf16Sources,
+                                        aotTargetArch, aot.bundle, aotError);
+      } else if (isAdd) {
+        compiled = compileAddAOT(aotTargetArch, aot.bundle, aotError);
+      } else if (isPaddedCopy) {
+        compiled = compilePaddedCopyAOT(aotTargetArch, aot.bundle, aotError);
+      } else if (isMatmulLike || isConvolution || isLinear || isNativeScalar) {
+        compiled = compileNativeDispatchAOT(desc, aotTargetArch, aot.bundle,
+                                            aotError, options_.nativeF32UseTensix);
+      } else {
+        compiled = compileMatmulAOT(aotTargetArch, aot.bundle, aotError);
+      }
       if (!compiled) {
         return exportOp.emitError("TT-Metal AOT kernel compilation failed: ")
                << aotError;
@@ -2479,8 +2474,14 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
   // 3. Build TTEX FlatBuffer.
   // ----------------------------------------------------------------
   iree_byte_span_t ttexData = {};
-  iree_status_t status = tt_iree_build_ttex_executable_def(
-      iree_allocator_system(), entryDescs.size(), entryDescs.data(), &ttexData);
+  iree_status_t status = tt_iree_build_ttex_executable_def_with_version(
+      iree_allocator_system(),
+      llvm::any_of(entryDescs, [](const auto &d) {
+        return d.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+      }) ? (options_.nativeBF16UseTensix ? TT_IREE_TTEX_VERSION_18 : TT_IREE_TTEX_VERSION_17)
+         : options_.nativeF32UseTensix ? TT_IREE_TTEX_VERSION_16
+                                 : TT_IREE_TTEX_VERSION_15,
+      entryDescs.size(), entryDescs.data(), &ttexData);
 
   if (!iree_status_is_ok(status)) {
     iree_status_ignore(status);

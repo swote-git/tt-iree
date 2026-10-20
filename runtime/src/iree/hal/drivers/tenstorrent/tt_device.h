@@ -15,6 +15,22 @@ extern "C" {
 typedef struct iree_hal_tenstorrent_driver_t iree_hal_tenstorrent_driver_t;
 typedef struct iree_hal_tt_device_t iree_hal_tt_device_t;
 
+// Describes where a builtin dispatch performs its tensor computation. This is
+// intentionally independent of mock mode so tooling can reason about whether a
+// physical-device run is free of host tensor computation.
+typedef enum iree_hal_tt_execution_domain_e {
+  IREE_HAL_TT_EXECUTION_DOMAIN_UNKNOWN = 0,
+  IREE_HAL_TT_EXECUTION_DOMAIN_DEVICE_NATIVE = 1,
+  IREE_HAL_TT_EXECUTION_DOMAIN_HOST_ASSISTED_DEVICE = 2,
+  IREE_HAL_TT_EXECUTION_DOMAIN_HOST = 3,
+} iree_hal_tt_execution_domain_t;
+
+iree_hal_tt_execution_domain_t iree_hal_tt_execution_domain_for_builtin(
+    uint32_t builtin_program);
+
+const char* iree_hal_tt_execution_domain_name(
+    iree_hal_tt_execution_domain_t domain);
+
 //===----------------------------------------------------------------------===//
 // Device creation and management
 //===----------------------------------------------------------------------===//
@@ -44,7 +60,14 @@ iree_status_t iree_hal_tt_device_create(
     iree_hal_device_t** out_device);
 
 #ifdef __cplusplus
-}  // extern "C"
+} // extern "C"
+
+namespace iree::hal::tenstorrent {
+class RuntimeProfiler;
+}
+
+iree::hal::tenstorrent::RuntimeProfiler *
+iree_hal_tt_device_runtime_profiler(iree_hal_device_t *device);
 
 #ifndef TT_IREE_ENABLE_MOCK
 namespace tt::tt_metal {
@@ -53,7 +76,7 @@ namespace distributed {
 class MeshDevice;
 class MeshCommandQueue;
 }
-}
+} // namespace tt::tt_metal
 
 tt::tt_metal::distributed::MeshDevice* iree_hal_tt_device_mesh_handle(iree_hal_tt_device_t* device);
 tt::tt_metal::distributed::MeshCommandQueue* iree_hal_tt_device_mesh_queue(iree_hal_tt_device_t* device);

@@ -10,6 +10,7 @@
 
 #include "iree/base/api.h"
 #include "iree/schema/tt_executable_builder_util.h"
+#include "iree/schema/tt_native_dispatch.h"
 #include "iree/testing/gtest.h"
 #include "iree/testing/status_matchers.h"
 
@@ -296,6 +297,113 @@ TEST(TtexSchemaTest, BuildVerifySingleEntry) {
   ASSERT_EQ(ttex_ns(EntryPointDef_builtin(ep0)), 0u);
 
   iree_allocator_free(alloc, data.data);
+}
+
+TEST(TtexSchemaTest, Bf16NativeRoundTripPreservesMixedPrecisionSlots) {
+  auto ep = MakeMatmulLikeEntry();
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE;
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+  auto &d = ep.bf16_native;
+  d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  d.m = d.n = d.k = 64;
+  d.tensors[0] = ep.matmul_like.lhs;
+  d.tensors[1] = ep.matmul_like.rhs;
+  d.tensors[2] = ep.matmul_like.output;
+  d.tensors[0].element_type = d.tensors[1].element_type =
+      d.tensors[2].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  d.tensors[10] = d.tensors[0];
+  d.tensors[10].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+  auto alloc = iree_allocator_system();
+  iree_byte_span_t data = {};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      alloc, TT_IREE_TTEX_VERSION_17, 1, &ep, &data));
+  ASSERT_EQ(ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)), 0);
+  auto root = ttex_ns(ExecutableDef_as_root(data.data));
+  auto fb_ep = ttex_ns(EntryPointDef_vec_at(ttex_ns(ExecutableDef_entry_points(root)), 0));
+  auto native = ttex_ns(EntryPointDef_bf16_native(fb_ep));
+  ASSERT_NE(native, nullptr);
+  auto tensors = ttex_ns(BF16NativeDef_tensors(native));
+  EXPECT_EQ(ttex_ns(TensorDesc_vec_len(tensors)), TT_IREE_BF16_NATIVE_TENSOR_COUNT);
+  EXPECT_EQ(ttex_ns(TensorDesc_element_type(ttex_ns(TensorDesc_vec_at(tensors, 0)))), TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16);
+  EXPECT_EQ(ttex_ns(TensorDesc_element_type(ttex_ns(TensorDesc_vec_at(tensors, 10)))), TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32);
+  EXPECT_EQ(ttex_ns(TensorDesc_rank(ttex_ns(TensorDesc_vec_at(tensors, 13)))), 0);
+  iree_allocator_free(alloc, data.data);
+  auto status = tt_iree_build_ttex_executable_def_with_version(
+      alloc, TT_IREE_TTEX_VERSION_15, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+}
+
+TEST(TtexSchemaTest, Bf16TensixRequiresV18MatrixAndThreeRoles) {
+  auto ep = MakeMatmulLikeEntry();
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+  ep.bf16_native.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  ep.bf16_native.m = ep.bf16_native.n = ep.bf16_native.k = 64;
+  auto allocator = iree_allocator_system();
+  iree_byte_span_t data = {};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      allocator, TT_IREE_TTEX_VERSION_18, 1, &ep, &data));
+  ASSERT_EQ(ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)), 0);
+  auto root = ttex_ns(ExecutableDef_as_root(data.data));
+  EXPECT_EQ(ttex_ns(ExecutableDef_version(root)), TT_IREE_TTEX_VERSION_18);
+  auto entry = ttex_ns(EntryPointDef_vec_at(ttex_ns(ExecutableDef_entry_points(root)), 0));
+  EXPECT_EQ(ttex_ns(EntryPointDef_builtin(entry)), TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX);
+  iree_allocator_free(allocator, data.data);
+  auto status = tt_iree_build_ttex_executable_def_with_version(
+      allocator, TT_IREE_TTEX_VERSION_17, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  ep.bf16_native.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL;
+  status = tt_iree_build_ttex_executable_def_with_version(
+      allocator, TT_IREE_TTEX_VERSION_18, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(__builtin_popcount(tt_iree_ttex_required_aot_kernel_roles_for_version(
+      TT_IREE_TTEX_VERSION_18, TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX,
+      TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)), 3);
+  EXPECT_EQ(__builtin_popcount(tt_iree_ttex_required_aot_kernel_roles_for_version(
+      TT_IREE_TTEX_VERSION_18, TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE,
+      TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)), 1);
+}
+
+TEST(TtexSchemaTest, BuiltinDispatchPairContract) {
+  EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD,
+      TT_IREE_TTEX_DISPATCH_KIND_BUILTIN));
+  EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED,
+      TT_IREE_TTEX_DISPATCH_KIND_BUILTIN));
+  EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE,
+      TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE));
+  EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D,
+      TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION));
+  EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR,
+      TT_IREE_TTEX_DISPATCH_KIND_LINEAR));
+  EXPECT_FALSE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D,
+      TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE));
+  EXPECT_FALSE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      /*builtin_program=*/999, TT_IREE_TTEX_DISPATCH_KIND_BUILTIN));
+  EXPECT_FALSE(tt_iree_ttex_builtin_matches_dispatch_kind(
+      TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD,
+      /*dispatch_kind=*/255));
+}
+
+TEST(TtexSchemaTest, RejectsMismatchedBuiltinDispatchKind) {
+  iree_allocator_t alloc = iree_allocator_system();
+  tt_iree_ttex_entry_point_desc_t ep = MakeMatmulLikeEntry();
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D;
+
+  iree_byte_span_t data = {};
+  iree_status_t status =
+      tt_iree_build_ttex_executable_def(alloc, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  EXPECT_EQ(data.data, nullptr);
 }
 
 TEST(TtexSchemaTest, BuildExplicitVersion) {
@@ -666,6 +774,115 @@ TEST(TtexSchemaTest, BuildVerifyAotKernelBundleV3) {
   iree_allocator_free(alloc, data.data);
 }
 
+TEST(TtexSchemaTest, SharesExactArtifactPayloadsAcrossPathsAndExports) {
+  auto ep = MakeMatmulLikeEntry();
+  tt_iree_ttex_kernel_source_desc_t kernels[] = {
+      {TT_IREE_TTEX_KERNEL_ROLE_READER, "reader"},
+      {TT_IREE_TTEX_KERNEL_ROLE_WRITER, "writer"},
+      {TT_IREE_TTEX_KERNEL_ROLE_COMPUTE, "compute"}};
+  const uint8_t first[] = {0x7f, 'E', 'L', 'F', 0, 1};
+  const uint8_t equal[] = {0x7f, 'E', 'L', 'F', 0, 1};
+  const uint8_t different[] = {0x7f, 'E', 'L', 'F', 0, 2};
+  tt_iree_ttex_artifact_file_desc_t artifacts[] = {
+      {"kernel/one/brisc.elf", first, sizeof(first)},
+      {"kernel/two/brisc.elf", equal, sizeof(equal)},
+      {"kernel/three/brisc.elf", different, sizeof(different)},
+      {"kernel/four/brisc.elf", first, sizeof(first) - 1}};
+  tt_iree_ttex_aot_kernel_bundle_desc_t bundle = {
+      TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE, IREE_ARRAYSIZE(kernels), kernels,
+      IREE_ARRAYSIZE(artifacts), artifacts};
+  ep.aot_kernel_bundle = &bundle;
+  tt_iree_ttex_entry_point_desc_t entries[] = {ep, ep};
+  entries[1].name = "second_export";
+  iree_byte_span_t data = {};
+  auto alloc = iree_allocator_system();
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      alloc, TT_IREE_TTEX_VERSION_3, IREE_ARRAYSIZE(entries), entries, &data));
+  ASSERT_EQ(ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)),
+            0);
+  auto parsed_entries = ttex_ns(
+      ExecutableDef_entry_points(ttex_ns(ExecutableDef_as_root(data.data))));
+  auto parsed_artifacts = [&](size_t i) {
+    return ttex_ns(TTMetalKernelBundleDef_artifacts(
+        ttex_ns(EntryPointDef_aot_kernel_bundle(
+            ttex_ns(EntryPointDef_vec_at(parsed_entries, i))))));
+  };
+  auto payload = [&](size_t ep_index, size_t artifact_index) {
+    return ttex_ns(ArtifactFileDef_data(ttex_ns(
+        ArtifactFileDef_vec_at(parsed_artifacts(ep_index), artifact_index))));
+  };
+  EXPECT_EQ(payload(0, 0), payload(0, 1));
+  EXPECT_EQ(payload(0, 0), payload(1, 0));
+  EXPECT_NE(payload(0, 0), payload(0, 2));
+  EXPECT_NE(payload(0, 0), payload(0, 3));
+  EXPECT_EQ(std::memcmp(payload(0, 2), different, sizeof(different)), 0);
+  EXPECT_EQ(flatbuffers_uint8_vec_len(payload(0, 3)), sizeof(first) - 1);
+  EXPECT_STREQ(ttex_ns(ArtifactFileDef_path(
+                   ttex_ns(ArtifactFileDef_vec_at(parsed_artifacts(0), 1)))),
+               "kernel/two/brisc.elf");
+  iree_allocator_free(alloc, data.data);
+}
+
+TEST(TtexSchemaTest, BuildVerifySingleKernelPaddedCopyAotV9) {
+  iree_allocator_t alloc = iree_allocator_system();
+  tt_iree_ttex_entry_point_desc_t ep = MakePaddedCopyEntry();
+  tt_iree_ttex_kernel_source_desc_t kernel = {
+      TT_IREE_TTEX_KERNEL_ROLE_READER, "void kernel_main() {}"};
+  const uint8_t elf_data[] = {0x7f, 'E', 'L', 'F'};
+  tt_iree_ttex_artifact_file_desc_t artifact = {
+      "Kernel_Source_Code/padded_copy/brisc/kernel.elf", elf_data,
+      sizeof(elf_data)};
+  tt_iree_ttex_aot_kernel_bundle_desc_t bundle = {
+      .target_arch = TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE,
+      .kernel_count = 1,
+      .kernels = &kernel,
+      .artifact_count = 1,
+      .artifacts = &artifact,
+  };
+  ep.aot_kernel_bundle = &bundle;
+
+  iree_byte_span_t data = {};
+  IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
+      alloc, TT_IREE_TTEX_VERSION_9, 1, &ep, &data));
+  ASSERT_EQ(ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)),
+            0);
+  auto parsed_ep = ttex_ns(EntryPointDef_vec_at(
+      ttex_ns(ExecutableDef_entry_points(
+          ttex_ns(ExecutableDef_as_root(data.data)))),
+      0));
+  auto parsed_bundle = ttex_ns(EntryPointDef_aot_kernel_bundle(parsed_ep));
+  ASSERT_NE(parsed_bundle, nullptr);
+  EXPECT_EQ(ttex_ns(KernelSourceDef_vec_len(
+                ttex_ns(TTMetalKernelBundleDef_kernels(parsed_bundle)))),
+            1u);
+  iree_allocator_free(alloc, data.data);
+}
+
+TEST(TtexSchemaTest, RejectsSingleKernelPaddedCopyAotBeforeV9) {
+  iree_allocator_t alloc = iree_allocator_system();
+  tt_iree_ttex_entry_point_desc_t ep = MakePaddedCopyEntry();
+  tt_iree_ttex_kernel_source_desc_t kernel = {
+      TT_IREE_TTEX_KERNEL_ROLE_READER, "void kernel_main() {}"};
+  const uint8_t artifact_data[] = {1};
+  tt_iree_ttex_artifact_file_desc_t artifact = {
+      "Kernel_Source_Code/padded_copy/brisc/kernel.elf", artifact_data,
+      sizeof(artifact_data)};
+  tt_iree_ttex_aot_kernel_bundle_desc_t bundle = {
+      .target_arch = TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE,
+      .kernel_count = 1,
+      .kernels = &kernel,
+      .artifact_count = 1,
+      .artifacts = &artifact,
+  };
+  ep.aot_kernel_bundle = &bundle;
+
+  iree_byte_span_t data = {};
+  iree_status_t status = tt_iree_build_ttex_executable_def_with_version(
+      alloc, TT_IREE_TTEX_VERSION_8, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+}
+
 TEST(TtexSchemaTest, RejectsAotBundleBeforeV3) {
   iree_allocator_t alloc = iree_allocator_system();
   tt_iree_ttex_entry_point_desc_t ep = MakeMatmulLikeEntry();
@@ -915,6 +1132,102 @@ TEST(TtexSchemaTest, VerifyRejectsGarbage) {
   uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03};
   int ret = ttex_ns(ExecutableDef_verify_as_root(garbage, sizeof(garbage)));
   ASSERT_NE(ret, 0);
+}
+
+TEST(TtexSchemaTest, NativeRoleContractIsVersioned) {
+  auto builtin = TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D;
+  auto kind = TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL;
+  EXPECT_EQ(tt_iree_ttex_required_aot_kernel_roles_for_version(12, builtin, kind),
+            tt_iree_ttex_required_aot_kernel_roles(builtin, kind));
+  EXPECT_EQ(tt_iree_ttex_required_aot_kernel_roles_for_version(13, builtin, kind),
+            TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_READER));
+}
+
+TEST(TtexSchemaTest, NativeAffineAndResidualTensorArgumentOrder) {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  ep.matmul_like.epilogue_flags = TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE |
+                                TT_IREE_TTEX_EPILOGUE_RESIDUAL |
+                                TT_IREE_TTEX_EPILOGUE_RESIDUAL_PER_CHANNEL;
+  const tt_iree_ttex_tensor_desc_t *t[TT_IREE_NATIVE_TENSOR_COUNT];
+  tt_iree_ttex_native_tensors(&ep, t);
+  EXPECT_EQ(t[0], &ep.matmul_like.lhs);
+  EXPECT_EQ(t[1], &ep.matmul_like.rhs);
+  EXPECT_EQ(t[2], &ep.matmul_like.output);
+  EXPECT_EQ(t[3], &ep.matmul_like.epilogue_mean);
+  EXPECT_EQ(t[4], &ep.matmul_like.epilogue_channel_scale);
+  EXPECT_EQ(t[5], &ep.matmul_like.epilogue_channel_bias);
+  EXPECT_EQ(t[6], &ep.matmul_like.residual);
+  EXPECT_EQ(t[7], &ep.matmul_like.residual_mean);
+  EXPECT_EQ(t[8], &ep.matmul_like.residual_channel_scale);
+  EXPECT_EQ(t[9], &ep.matmul_like.residual_channel_bias);
+  ep.matmul_like.epilogue_flags = 0;
+  tt_iree_ttex_native_tensors(&ep, t);
+  for (unsigned i = 3; i < TT_IREE_NATIVE_TENSOR_COUNT; ++i)
+    EXPECT_EQ(t[i], nullptr);
+}
+
+TEST(TtexSchemaTest, NativeFp32MatrixRoleContractIsVersioned) {
+  auto builtin = TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE;
+  auto kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  EXPECT_EQ(tt_iree_ttex_required_aot_kernel_roles_for_version(14, builtin, kind),
+            tt_iree_ttex_required_aot_kernel_roles(builtin, kind));
+  EXPECT_EQ(tt_iree_ttex_required_aot_kernel_roles_for_version(15, builtin, kind),
+            TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_READER));
+}
+
+TEST(TtexSchemaTest, NativeReductionUsesSeparateDivisorView) {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM;
+  const tt_iree_ttex_tensor_desc_t *t[TT_IREE_NATIVE_TENSOR_COUNT];
+  tt_iree_ttex_native_tensors(&ep, t);
+  EXPECT_EQ(t[0], &ep.global_sum.input);
+  EXPECT_EQ(t[1], &ep.global_sum.divisor);
+  EXPECT_EQ(t[2], &ep.global_sum.sum);
+}
+
+TEST(TtexSchemaTest, NativeBundleRolesEnforcedByBuilder) {
+  const tt_iree_ttex_kernel_source_desc_t kernels[] = {
+      {TT_IREE_TTEX_KERNEL_ROLE_READER, "void kernel_main() {}"},
+      {TT_IREE_TTEX_KERNEL_ROLE_WRITER, "void kernel_main() {}"},
+      {TT_IREE_TTEX_KERNEL_ROLE_COMPUTE, "void kernel_main() {}"},
+  };
+  const uint8_t elf[] = {0x7f, 'E', 'L', 'F'};
+  const tt_iree_ttex_artifact_file_desc_t artifact = {
+      "native/brisc/kernel.elf", elf, sizeof(elf)};
+  tt_iree_ttex_aot_kernel_bundle_desc_t bundle = {
+      .target_arch = TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE,
+      .kernel_count = 1,
+      .kernels = kernels,
+      .artifact_count = 1,
+      .artifacts = &artifact,
+  };
+  auto check = [&](tt_iree_ttex_entry_point_desc_t ep, uint32_t version,
+                   iree_host_size_t roles, bool accepted) {
+    bundle.kernel_count = roles;
+    ep.aot_kernel_bundle = &bundle;
+    iree_byte_span_t data = {};
+    iree_status_t status = tt_iree_build_ttex_executable_def_with_version(
+        iree_allocator_system(), version, 1, &ep, &data);
+    EXPECT_EQ(iree_status_is_ok(status), accepted);
+    iree_status_ignore(status);
+    if (data.data)
+      iree_allocator_free(iree_allocator_system(), data.data);
+  };
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_14, 3, true);
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_14, 1, false);
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_15, 1, true);
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_15, 3, false);
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_16, 3, true);
+  check(MakeMatmulLikeEntry(), TT_IREE_TTEX_VERSION_16, 1, false);
+  check(MakeConv2DEntry(), TT_IREE_TTEX_VERSION_16, 3, true);
+  check(MakeConv2DEntry(), TT_IREE_TTEX_VERSION_16, 1, false);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_12, 3, true);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_12, 1, false);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_13, 1, true);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_13, 3, false);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_16, 1, true);
+  check(MakeMaxPoolEntry(), TT_IREE_TTEX_VERSION_16, 3, false);
 }
 
 TEST(TtexSchemaTest, BuildEmpty) {

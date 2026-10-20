@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "flatcc/flatcc_builder.h"
@@ -24,12 +25,10 @@ static ns(TensorDesc_ref_t)
       desc->shape[0], desc->shape[1], desc->shape[2], desc->shape[3],
       desc->storage_shape[0], desc->storage_shape[1], desc->storage_shape[2],
       desc->storage_shape[3], desc->offset[0], desc->offset[1], desc->offset[2],
-      desc->offset[3], desc->byte_offset,
-      desc->stride[0] ? desc->stride[0] : 1,
+      desc->offset[3], desc->byte_offset, desc->stride[0] ? desc->stride[0] : 1,
       desc->stride[1] ? desc->stride[1] : 1,
       desc->stride[2] ? desc->stride[2] : 1,
-      desc->stride[3] ? desc->stride[3] : 1,
-      desc->byte_offset_constant);
+      desc->stride[3] ? desc->stride[3] : 1, desc->byte_offset_constant);
 }
 
 static bool
@@ -120,8 +119,21 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
   std::vector<ns(LinearDef_ref_t)> linear_refs(entry_point_count, 0);
   std::vector<ns(TTMetalKernelBundleDef_ref_t)> aot_bundle_refs(
       entry_point_count, 0);
+  // Views borrow the caller's immutable payloads only during this build. Hash
+  // collisions are resolved by full byte equality, never by hash alone.
+  std::unordered_map<std::string_view, flatbuffers_uint8_vec_ref_t>
+      artifact_data_refs;
   for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
     const tt_iree_ttex_entry_point_desc_t *ep = &entry_points[i];
+    if (!tt_iree_ttex_builtin_matches_dispatch_kind(ep->builtin_program,
+                                                    ep->dispatch_kind)) {
+      flatcc_builder_clear(&builder);
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX entry point %zu has incompatible builtin %u and dispatch "
+          "kind %u",
+          i, ep->builtin_program, ep->dispatch_kind);
+    }
     if (ep->aot_kernel_bundle) {
       if (version < TT_IREE_TTEX_VERSION_3) {
         flatcc_builder_clear(&builder);
@@ -131,20 +143,32 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
       }
       const tt_iree_ttex_aot_kernel_bundle_desc_t *bundle =
           ep->aot_kernel_bundle;
+      const uint32_t required_roles =
+          version >= TT_IREE_TTEX_VERSION_9
+              ? tt_iree_ttex_required_aot_kernel_roles_for_version(version, ep->builtin_program,
+                                                       ep->dispatch_kind)
+              : tt_iree_ttex_required_aot_kernel_roles(
+                    TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD,
+                    TT_IREE_TTEX_DISPATCH_KIND_BUILTIN);
+      const iree_host_size_t required_kernel_count =
+          static_cast<iree_host_size_t>(__builtin_popcount(required_roles));
       if (bundle->target_arch < TT_IREE_TTEX_TARGET_ARCH_WORMHOLE_B0 ||
           bundle->target_arch > TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE ||
-          bundle->kernel_count != TT_IREE_TTEX_AOT_KERNEL_COUNT ||
+          bundle->kernel_count != required_kernel_count ||
           !bundle->kernels || bundle->artifact_count == 0 ||
           !bundle->artifacts) {
         flatcc_builder_clear(&builder);
         return iree_make_status(
             IREE_STATUS_INVALID_ARGUMENT,
-            "AOT kernel bundle requires reader/writer/compute and artifacts");
+            "AOT kernel bundle role set does not match builtin %u/dispatch "
+            "kind %u",
+            ep->builtin_program, ep->dispatch_kind);
       }
 
       std::vector<ns(KernelSourceDef_ref_t)> kernel_refs(bundle->kernel_count,
                                                          0);
       bool seen_kernel_roles[TT_IREE_TTEX_AOT_KERNEL_COUNT + 1] = {};
+      uint32_t actual_roles = 0;
       for (iree_host_size_t j = 0; j < bundle->kernel_count; ++j) {
         const tt_iree_ttex_kernel_source_desc_t *kernel = &bundle->kernels[j];
         if (kernel->role < TT_IREE_TTEX_KERNEL_ROLE_READER ||
@@ -157,6 +181,7 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
               "AOT kernel source %zu has invalid role/source", j);
         }
         seen_kernel_roles[kernel->role] = true;
+        actual_roles |= TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(kernel->role);
         flatbuffers_string_ref_t source_ref =
             flatbuffers_string_create_str(&builder, kernel->source);
         kernel_refs[j] =
@@ -166,6 +191,14 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
           return iree_make_status(IREE_STATUS_INTERNAL,
                                   "failed to build AOT kernel source %zu", j);
         }
+      }
+      if (actual_roles != required_roles) {
+        flatcc_builder_clear(&builder);
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "AOT kernel bundle role set 0x%x does not match required set "
+            "0x%x",
+            actual_roles, required_roles);
       }
 
       std::vector<ns(ArtifactFileDef_ref_t)> artifact_refs(
@@ -181,8 +214,24 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
         }
         flatbuffers_string_ref_t path_ref =
             flatbuffers_string_create_str(&builder, artifact->path);
-        flatbuffers_uint8_vec_ref_t data_ref = flatbuffers_uint8_vec_create(
-            &builder, artifact->data, artifact->data_length);
+        const std::string_view payload(
+            reinterpret_cast<const char *>(artifact->data),
+            artifact->data_length);
+        auto existing = artifact_data_refs.find(payload);
+        flatbuffers_uint8_vec_ref_t data_ref;
+        if (existing != artifact_data_refs.end()) {
+          data_ref = existing->second;
+        } else {
+          data_ref = flatbuffers_uint8_vec_create(&builder, artifact->data,
+                                                  artifact->data_length);
+          if (!data_ref) {
+            flatcc_builder_clear(&builder);
+            return iree_make_status(IREE_STATUS_INTERNAL,
+                                    "failed to build AOT artifact payload %zu",
+                                    j);
+          }
+          artifact_data_refs.emplace(payload, data_ref);
+        }
         artifact_refs[j] =
             ns(ArtifactFileDef_create)(&builder, path_ref, data_ref);
         if (!artifact_refs[j]) {
@@ -207,6 +256,18 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
       }
     }
 
+    if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
+      bool tensix = ep->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+      if ((version != TT_IREE_TTEX_VERSION_17 && version != TT_IREE_TTEX_VERSION_18) ||
+          (tensix && (version != TT_IREE_TTEX_VERSION_18 ||
+           !(ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+             ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+             ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR)))) {
+        flatcc_builder_clear(&builder);
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "BF16 native requires v17/v18; Tensix requires v18 matrix dispatch");
+      }
+    }
     bool is_matmul_like =
         ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
     bool is_convolution =
@@ -230,17 +291,17 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
             "ResNet50 tail dispatches require TTEX version 8 or newer");
       }
       const tt_iree_ttex_tensor_desc_t *tensor0 =
-          is_global_sum ? &ep->global_sum.input
-                        : is_scalar_div ? &ep->scalar_div.input
-                                        : &ep->linear.input;
+          is_global_sum   ? &ep->global_sum.input
+          : is_scalar_div ? &ep->scalar_div.input
+                          : &ep->linear.input;
       const tt_iree_ttex_tensor_desc_t *tensor1 =
-          is_global_sum ? &ep->global_sum.sum
-                        : is_scalar_div ? &ep->scalar_div.divisor
-                                        : &ep->linear.weights;
+          is_global_sum   ? &ep->global_sum.sum
+          : is_scalar_div ? &ep->scalar_div.divisor
+                          : &ep->linear.weights;
       const tt_iree_ttex_tensor_desc_t *tensor2 =
-          is_global_sum ? &ep->global_sum.divisor
-                        : is_scalar_div ? &ep->scalar_div.output
-                                        : &ep->linear.bias;
+          is_global_sum   ? &ep->global_sum.divisor
+          : is_scalar_div ? &ep->scalar_div.output
+                          : &ep->linear.bias;
       const tt_iree_ttex_tensor_desc_t *tensor3 =
           is_linear ? &ep->linear.output : nullptr;
       if (!tt_iree_tensor_desc_rank_is_valid(tensor0) ||
@@ -272,8 +333,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
             ep->global_sum.reduce_h, ep->global_sum.reduce_w,
             ep->global_sum.divisor_value);
       } else if (is_scalar_div) {
-        scalar_div_refs[i] = ns(ScalarDivDef_create)(
-            &builder, tensor0_ref, tensor1_ref, tensor2_ref);
+        scalar_div_refs[i] = ns(ScalarDivDef_create)(&builder, tensor0_ref,
+                                                     tensor1_ref, tensor2_ref);
       } else {
         linear_refs[i] = ns(LinearDef_create)(
             &builder, tensor0_ref, tensor1_ref, tensor2_ref, tensor3_ref,
@@ -402,8 +463,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
     if (is_matmul_like) {
       bool has_per_channel =
           ep->matmul_like.epilogue_flags & TT_IREE_TTEX_EPILOGUE_PER_CHANNEL;
-      bool has_runtime_affine = ep->matmul_like.epilogue_flags &
-                                TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+      bool has_runtime_affine =
+          ep->matmul_like.epilogue_flags & TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
       bool has_residual_per_channel =
           ep->matmul_like.epilogue_flags &
           TT_IREE_TTEX_EPILOGUE_RESIDUAL_PER_CHANNEL;
@@ -487,8 +548,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
               "per-channel residual affine requires residual and runtime "
               "affine descriptors");
         }
-        residual_mean_refs[i] = tt_iree_build_tensor_desc(
-            &builder, &ep->matmul_like.residual_mean);
+        residual_mean_refs[i] =
+            tt_iree_build_tensor_desc(&builder, &ep->matmul_like.residual_mean);
         residual_channel_scale_refs[i] = tt_iree_build_tensor_desc(
             &builder, &ep->matmul_like.residual_channel_scale);
         residual_channel_bias_refs[i] = tt_iree_build_tensor_desc(
@@ -545,8 +606,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
     } else {
       bool has_per_channel =
           ep->conv2d.epilogue_flags & TT_IREE_TTEX_EPILOGUE_PER_CHANNEL;
-      bool has_runtime_affine = ep->conv2d.epilogue_flags &
-                                TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
+      bool has_runtime_affine =
+          ep->conv2d.epilogue_flags & TT_IREE_TTEX_EPILOGUE_RUNTIME_AFFINE;
       if (has_per_channel) {
         if (has_runtime_affine) {
           if (version < TT_IREE_TTEX_VERSION_8 ||
@@ -563,15 +624,15 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
                 "runtime convolution affine requires TTEX version 8, three "
                 "tensor descriptors, and no embedded vectors");
           }
-          conv_mean_refs[i] = tt_iree_build_tensor_desc(
-              &builder, &ep->conv2d.epilogue_mean);
+          conv_mean_refs[i] =
+              tt_iree_build_tensor_desc(&builder, &ep->conv2d.epilogue_mean);
           conv_channel_scale_refs[i] = tt_iree_build_tensor_desc(
               &builder, &ep->conv2d.epilogue_channel_scale);
           conv_channel_bias_refs[i] = tt_iree_build_tensor_desc(
               &builder, &ep->conv2d.epilogue_channel_bias);
         } else if (version < TT_IREE_TTEX_VERSION_5 ||
-            ep->conv2d.epilogue_channel_count == 0 ||
-            !ep->conv2d.epilogue_scales || !ep->conv2d.epilogue_biases) {
+                   ep->conv2d.epilogue_channel_count == 0 ||
+                   !ep->conv2d.epilogue_scales || !ep->conv2d.epilogue_biases) {
           flatcc_builder_clear(&builder);
           return iree_make_status(
               IREE_STATUS_INVALID_ARGUMENT,
@@ -579,12 +640,12 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
               "a non-zero channel count, and scale/bias vectors");
         }
         if (!has_runtime_affine) {
-          conv_scale_refs[i] = flatbuffers_float_vec_create(
-              &builder, ep->conv2d.epilogue_scales,
-              ep->conv2d.epilogue_channel_count);
-          conv_bias_refs[i] = flatbuffers_float_vec_create(
-              &builder, ep->conv2d.epilogue_biases,
-              ep->conv2d.epilogue_channel_count);
+          conv_scale_refs[i] =
+              flatbuffers_float_vec_create(&builder, ep->conv2d.epilogue_scales,
+                                           ep->conv2d.epilogue_channel_count);
+          conv_bias_refs[i] =
+              flatbuffers_float_vec_create(&builder, ep->conv2d.epilogue_biases,
+                                           ep->conv2d.epilogue_channel_count);
           if (!conv_scale_refs[i] || !conv_bias_refs[i]) {
             flatcc_builder_clear(&builder);
             return iree_make_status(
@@ -624,8 +685,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
            ns(Conv2DDef_epilogue_scales_add(&builder, conv_scale_refs[i]))) ||
           (conv_bias_refs[i] &&
            ns(Conv2DDef_epilogue_biases_add(&builder, conv_bias_refs[i]))) ||
-          (conv_mean_refs[i] && ns(Conv2DDef_epilogue_mean_add(
-                                    &builder, conv_mean_refs[i]))) ||
+          (conv_mean_refs[i] &&
+           ns(Conv2DDef_epilogue_mean_add(&builder, conv_mean_refs[i]))) ||
           (conv_channel_scale_refs[i] &&
            ns(Conv2DDef_epilogue_channel_scale_add(
                &builder, conv_channel_scale_refs[i]))) ||
@@ -657,6 +718,19 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
   for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
     const tt_iree_ttex_entry_point_desc_t *ep = &entry_points[i];
 
+    ns(BF16NativeDef_ref_t) bf16_ref = 0;
+    if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
+      ns(TensorDesc_ref_t) tensors[TT_IREE_BF16_NATIVE_TENSOR_COUNT] = {};
+      for (unsigned j = 0; j < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++j) {
+        tensors[j] = tt_iree_build_tensor_desc(&builder,
+                                              &ep->bf16_native.tensors[j]);
+      }
+      auto refs = ns(TensorDesc_vec_create)(&builder, tensors,
+                                            TT_IREE_BF16_NATIVE_TENSOR_COUNT);
+      bf16_ref = ns(BF16NativeDef_create)(
+          &builder, ep->bf16_native.operation_kind, ep->bf16_native.m,
+          ep->bf16_native.n, ep->bf16_native.k, refs);
+    }
     ns(ExecutableDef_entry_points_push_start(&builder));
     ns(EntryPointDef_name_create_str(&builder, ep->name ? ep->name : ""));
     ns(EntryPointDef_constant_count_add(&builder, ep->constant_count));
@@ -670,6 +744,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
     ns(EntryPointDef_builtin_n_tiles_add(&builder, ep->builtin_n_tiles));
     ns(EntryPointDef_builtin_k_tiles_add(&builder, ep->builtin_k_tiles));
     ns(EntryPointDef_dispatch_kind_add(&builder, ep->dispatch_kind));
+    if (bf16_ref)
+      ns(EntryPointDef_bf16_native_add(&builder, bf16_ref));
     if (matmul_like_refs[i]) {
       ns(EntryPointDef_matmul_like_add(&builder, matmul_like_refs[i]));
     }

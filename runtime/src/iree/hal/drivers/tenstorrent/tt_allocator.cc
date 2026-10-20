@@ -120,10 +120,9 @@ static iree_hal_buffer_compatibility_t
 iree_hal_tt_allocator_query_buffer_compatibility(
     iree_hal_allocator_t* base,
     iree_hal_buffer_params_t* params,
-    iree_device_size_t* allocation_size) {
-  if (allocation_size && (*allocation_size % 32) != 0) {
-    *allocation_size = ((*allocation_size + 31) / 32) * 32;
-  }
+    iree_device_size_t*) {
+  // Physical DRAM page padding is private to tt_buffer; tensor I/O must see
+  // the requested logical size, not an alignment-rounded payload length.
   if (!(params->type & IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     return IREE_HAL_BUFFER_COMPATIBILITY_NONE;
   }
@@ -138,8 +137,6 @@ static iree_status_t iree_hal_tt_allocator_allocate_buffer(
     iree_device_size_t allocation_size,
     iree_hal_buffer_t** out_buffer) {
   auto* allocator = iree_hal_tt_allocator_cast(base);
-  
-  allocation_size = ((allocation_size + 31) / 32) * 32;
   
   iree_status_t status = iree_hal_tt_buffer_create(
       allocator->device, *params, allocation_size,

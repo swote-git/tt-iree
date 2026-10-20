@@ -44,7 +44,7 @@ endif()
 
 file(STRINGS "${OUTPUT}" generated_source
   LIMIT_COUNT 1
-  REGEX "compute_kernel_hw_startup<SrcOrder::Reverse>"
+  REGEX "Device RISC-V tiled FP32"
 )
 if(NOT generated_source)
   message(FATAL_ERROR "AOT VMFB contains no compiler-generated compute source")

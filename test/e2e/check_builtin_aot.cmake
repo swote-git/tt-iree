@@ -60,6 +60,16 @@ compile_and_check(simple_matmul_64 simple_matmul_64.mlir
                   "out_subblock_num_tiles = get_arg_val")
 compile_and_check(dynamic_matmul dynamic_matmul.mlir
                   "out_subblock_num_tiles = get_arg_val")
+compile_and_check(resnet50_input_pad resnet50_input_pad.mlir
+                  "write_scratch_offset = 4096")
+compile_and_check(device_native_f32_matmul device_native_f32_matmul.mlir
+                  "native-v15 descriptor-specialized")
+compile_and_check(device_native_f32_matmul_tail
+                  device_native_f32_matmul_tail.mlir
+                  "native-v15 descriptor-specialized")
+compile_and_check(device_native_f32_runtime_affine_matmul
+                  device_native_f32_runtime_affine_matmul.mlir
+                  "native-v15 descriptor-specialized")
 
 if(NOT "${simple_matmul_ELF_PATH}" STREQUAL
        "${simple_matmul_64_ELF_PATH}" OR
@@ -69,4 +79,8 @@ if(NOT "${simple_matmul_ELF_PATH}" STREQUAL
     "Static, multicore, and dynamic matmul did not reuse the same AOT artifact")
 endif()
 
-message(STATUS "Tenstorrent add and shape-independent matmul AOT verified")
+# v15 specializes a single FP32 data-movement kernel for each descriptor.
+# Its ELF identity intentionally differs across shapes and epilogues.
+
+message(STATUS
+  "Tenstorrent add, matmul, native F32 matmul/affine, and padded-copy AOT verified")

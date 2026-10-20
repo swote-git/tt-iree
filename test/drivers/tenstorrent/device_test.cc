@@ -4,6 +4,8 @@
 // Tests for Tenstorrent HAL device creation and queries.
 
 #include "iree/hal/device_group.h"
+#include "iree/hal/drivers/tenstorrent/tt_device.h"
+#include "iree/schema/tt_executable_builder_util.h"
 #include "utils.h"
 
 namespace iree {
@@ -59,6 +61,27 @@ TEST_F(DeviceTest, Allocator) {
   ASSERT_NE(allocator, nullptr);
 }
 
+TEST_F(DeviceTest, ClassifiesBuiltinExecutionDomains) {
+  EXPECT_EQ(iree_hal_tt_execution_domain_for_builtin(
+                TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32),
+            IREE_HAL_TT_EXECUTION_DOMAIN_DEVICE_NATIVE);
+  EXPECT_EQ(iree_hal_tt_execution_domain_for_builtin(
+                TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED),
+            IREE_HAL_TT_EXECUTION_DOMAIN_HOST_ASSISTED_DEVICE);
+  EXPECT_EQ(iree_hal_tt_execution_domain_for_builtin(
+                TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D),
+            IREE_HAL_TT_EXECUTION_DOMAIN_HOST_ASSISTED_DEVICE);
+  EXPECT_EQ(iree_hal_tt_execution_domain_for_builtin(
+                TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY),
+            IREE_HAL_TT_EXECUTION_DOMAIN_DEVICE_NATIVE);
+  EXPECT_EQ(iree_hal_tt_execution_domain_for_builtin(
+                TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D),
+            IREE_HAL_TT_EXECUTION_DOMAIN_HOST);
+  EXPECT_STREQ(iree_hal_tt_execution_domain_name(
+                   IREE_HAL_TT_EXECUTION_DOMAIN_DEVICE_NATIVE),
+               "device_native");
+}
+
 TEST_F(DeviceTest, DeviceGroupCreation) {
   iree_hal_device_group_t* group = nullptr;
   IREE_ASSERT_OK(iree_hal_device_group_create_from_device(
@@ -67,6 +90,27 @@ TEST_F(DeviceTest, DeviceGroupCreation) {
   EXPECT_EQ(iree_hal_device_group_device_count(group), 1u);
   EXPECT_EQ(iree_hal_device_group_device_at(group, 0), device_);
   iree_hal_device_group_release(group);
+}
+
+TEST_F(DeviceTest, QueueBarrierWaitsAndSignals) {
+  iree_hal_semaphore_t* semaphore = nullptr;
+  IREE_ASSERT_OK(iree_hal_semaphore_create(
+      device_, IREE_HAL_QUEUE_AFFINITY_ANY, /*initial_value=*/1,
+      IREE_HAL_SEMAPHORE_FLAG_DEFAULT, &semaphore));
+  iree_hal_semaphore_t* semaphores[] = {semaphore};
+  uint64_t wait_values[] = {1};
+  uint64_t signal_values[] = {2};
+  iree_hal_semaphore_list_t wait_list = {1, semaphores, wait_values};
+  iree_hal_semaphore_list_t signal_list = {1, semaphores, signal_values};
+
+  IREE_ASSERT_OK(iree_hal_device_queue_barrier(
+      device_, IREE_HAL_QUEUE_AFFINITY_ANY, wait_list, signal_list,
+      IREE_HAL_EXECUTE_FLAG_NONE));
+
+  uint64_t value = 0;
+  IREE_ASSERT_OK(iree_hal_semaphore_query(semaphore, &value));
+  EXPECT_EQ(value, 2u);
+  iree_hal_semaphore_release(semaphore);
 }
 
 }  // namespace

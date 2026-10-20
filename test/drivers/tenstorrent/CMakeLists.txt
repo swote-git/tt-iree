@@ -18,6 +18,23 @@ target_link_libraries(tile_layout_test
 add_test(NAME tt_tile_layout_test COMMAND tile_layout_test)
 set_tests_properties(tt_tile_layout_test PROPERTIES LABELS "tt-iree;unit")
 
+# Native source generation is descriptor-only; test it without Metal or hardware.
+add_executable(native_kernel_test
+  native_kernel_test.cc
+  ../../../compiler/plugins/target/tenstorrent/TenstorrentNativeKernels.cpp
+)
+target_include_directories(native_kernel_test PRIVATE
+  ../../../compiler/plugins/target/tenstorrent
+  ../../../runtime/src
+)
+target_link_libraries(native_kernel_test PRIVATE
+  tt_executable_builder_util
+  iree_testing_gtest
+  iree_testing_gtest_main
+)
+add_test(NAME tt_native_kernel_test COMMAND native_kernel_test)
+set_tests_properties(tt_native_kernel_test PROPERTIES LABELS "tt-iree;unit;codegen")
+
 #-------------------------------------------------------------------------------
 # Helper: create a gtest-based HAL test
 #-------------------------------------------------------------------------------
@@ -88,6 +105,22 @@ tt_iree_hal_test(
 )
 
 tt_iree_hal_test(
+  NAME runtime_profiler_test
+  SRCS runtime_profiler_test.cc
+)
+
+tt_iree_hal_test(
+  NAME runtime_checkpoint_test
+  SRCS runtime_checkpoint_test.cc
+)
+
+tt_iree_hal_test(
+  NAME executable_cache_test
+  SRCS executable_cache_test.cc
+  DEPS tt_executable_builder_util
+)
+
+tt_iree_hal_test(
   NAME buffer_test
   SRCS buffer_test.cc
 )
@@ -95,6 +128,11 @@ tt_iree_hal_test(
 tt_iree_hal_test(
   NAME copy_test
   SRCS copy_test.cc
+)
+
+tt_iree_hal_test(
+  NAME file_test
+  SRCS file_test.cc
 )
 
 tt_iree_hal_test(
@@ -106,6 +144,14 @@ tt_iree_hal_test(
 # Physical dispatch tests exercise the same compiler-generated AOT bundles as
 # production VMFBs instead of relying on tt-metal example/test kernel paths.
 if(TARGET TenstorrentAOTCompiler)
+  tt_iree_hal_test(NAME aot_artifact_test SRCS aot_artifact_test.cc
+    DEPS TenstorrentAOTCompiler tt_executable_builder_util)
+  target_compile_features(aot_artifact_test PRIVATE cxx_std_20)
+  target_include_directories(aot_artifact_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent)
+  tt_metal_target_link_libraries(aot_artifact_test)
+  set_tests_properties(tt_aot_artifact_test PROPERTIES
+    LABELS "tt-iree;unit;aot")
   target_link_libraries(dispatch_test PRIVATE TenstorrentAOTCompiler)
   target_include_directories(dispatch_test PRIVATE
     ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent
@@ -118,6 +164,36 @@ endif()
 # dispatch_test needs direct TT-Metal access for bfloat16 data transfer.
 if(NOT TT_IREE_ENABLE_MOCK)
   tt_metal_target_link_libraries(dispatch_test)
+endif()
+
+if(TT_IREE_ENABLE_MOCK)
+  add_test(NAME tt_executable_preparation_profile_test
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:executable_cache_test>
+      -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/executable_preparation_profile
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/check_executable_preparation_profile.cmake)
+  set_tests_properties(tt_executable_preparation_profile_test PROPERTIES
+    LABELS "tt-iree;hal;mock;profiling")
+  add_test(
+    NAME tt_runtime_checkpoint_dispatch_test
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:dispatch_test>
+      -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/runtime_checkpoint_dispatch
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_checkpoint.cmake
+  )
+  set_tests_properties(tt_runtime_checkpoint_dispatch_test PROPERTIES
+    LABELS "tt-iree;hal;mock;correctness"
+  )
+
+  add_test(
+    NAME tt_device_native_gate_test
+    COMMAND ${CMAKE_COMMAND}
+      -DTEST_EXECUTABLE=$<TARGET_FILE:dispatch_test>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/check_device_native_gate.cmake
+  )
+  set_tests_properties(tt_device_native_gate_test PROPERTIES
+    LABELS "tt-iree;hal;mock;device-native"
+  )
 endif()
 
 # Descriptor-only executable creation does not require a physical device.
@@ -145,3 +221,12 @@ target_link_libraries(ttex_test
 )
 add_test(NAME tt_ttex_test COMMAND ttex_test)
 set_tests_properties(tt_ttex_test PROPERTIES LABELS "tt-iree;unit")
+
+# Manual precision diagnostic: deliberately independent of IREE and TTEX.
+# Numerical discrepancies are recorded, not silently accepted as CI passes.
+if(TT_IREE_ENABLE_TTNN AND NOT TT_IREE_ENABLE_MOCK)
+  add_executable(tensix_precision_probe tensix_precision_probe.cc)
+  target_compile_features(tensix_precision_probe PRIVATE cxx_std_20)
+  target_compile_options(tensix_precision_probe PRIVATE -ffp-contract=off)
+  tt_metal_target_link_libraries(tensix_precision_probe)
+endif()

@@ -397,7 +397,7 @@ static iree_status_t iree_hal_tt_validate_tensor_binding_range(
         tensor.binding, bindings.count);
   }
 
-  uint64_t required_length = sizeof(float);
+  uint64_t required_length = tensor.element_type == TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ? 2 : sizeof(float);
   for (uint8_t i = 0; i < tensor.rank; ++i) {
     required_length *= tensor.storage_shape[i];
   }
@@ -456,7 +456,12 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
   IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params(
       executable, export_ordinal, &kernel_params));
   bool is_multicore_compute =
-      kernel_params && (kernel_params->builtin_program ==
+      kernel_params && ((kernel_params->dispatch_kind ==
+                             TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
+                         (kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+                          kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+                          kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR)) ||
+                        kernel_params->builtin_program ==
                             TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED ||
                         kernel_params->builtin_program ==
                             TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE ||
@@ -564,6 +569,20 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
     }
   }
 
+  if (kernel_params && kernel_params->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
+    for (const auto &tensor : kernel_params->bf16_native.tensors) {
+      if (tensor.rank) {
+        IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_binding_range(tensor, "BF16 native tensor", bindings));
+      }
+    }
+    if (is_multicore_compute) {
+      uint32_t mt = kernel_params->bf16_native.m / 32 + (kernel_params->bf16_native.m % 32 != 0);
+      uint32_t nt = kernel_params->bf16_native.n / 32 + (kernel_params->bf16_native.n % 32 != 0);
+      if (mt % config.workgroup_count[1] || nt % config.workgroup_count[0])
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native grid cannot partition output tiles");
+    }
+    return iree_ok_status();
+  }
   if (kernel_params && kernel_params->builtin_program ==
                            TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE) {
     const tt_iree_ttex_matmul_like_desc_t &matmul = kernel_params->matmul_like;

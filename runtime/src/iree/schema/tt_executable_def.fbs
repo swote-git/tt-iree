@@ -50,8 +50,8 @@ enum BuiltinProgram : uint32 {
   // dimension. M1 accepts one static CHW x OIHW 3x3 convolution.
   F32_CONV2D = 5,
 
-  // Correctness-first host-mediated copy of one static F32 CHW slice into a
-  // larger destination tensor. This is the first ResNet50 padding dispatch.
+  // Device-native copy of one static F32 CHW slice into a larger destination
+  // tensor. TTEX v9 carries its single data-movement AOT kernel.
   F32_PADDED_COPY = 6,
 
   // Correctness-first static F32 CHW max-pool. M1 recognizes the ResNet50
@@ -62,6 +62,10 @@ enum BuiltinProgram : uint32 {
   F32_GLOBAL_SUM = 8,
   F32_SCALAR_DIV = 9,
   F32_LINEAR = 10,
+  BF16_NATIVE = 11,
+  // v18: BF16 operands, HiFi4 Tensix contraction, FP32 Dst/output CB,
+  // generated device-RISC-V epilogue preserving explicit IR BF16 casts.
+  BF16_NATIVE_TENSIX = 12,
 }
 
 enum DispatchKind : uint8 {
@@ -73,6 +77,7 @@ enum DispatchKind : uint8 {
   GLOBAL_SUM = 5,
   SCALAR_DIV = 6,
   LINEAR = 7,
+  BF16_NATIVE = 8,
 }
 
 enum TensorElementType : uint8 {
@@ -91,7 +96,7 @@ enum TensorLayout : uint8 {
 }
 
 // ---------------------------------------------------------------------------
-// TT-Metal AOT kernel bundle (v3)
+// TT-Metal AOT kernel bundle (v3; operation-specific role sets in v9)
 // ---------------------------------------------------------------------------
 
 enum KernelRole : uint8 {
@@ -299,6 +304,16 @@ table LinearDef {
 // Fields map directly to iree_hal_executable_export_info_t so the runtime
 // can populate that struct without additional computation.
 
+// v17 static BF16 ResNet kernels. Absent slots have rank zero; slot 2 is output.
+// Matrix operands use slots 0/1. Scalar epilogues preserve explicit IR casts.
+table BF16NativeDef {
+  operation_kind:uint8;
+  m:uint32;
+  n:uint32;
+  k:uint32;
+  tensors:[TensorDesc];
+}
+
 table EntryPointDef {
   // HAL export name (used for ordinal mapping / debug).
   name:string;
@@ -352,6 +367,7 @@ table EntryPointDef {
   global_sum:GlobalSumDef;
   scalar_div:ScalarDivDef;
   linear:LinearDef;
+  bf16_native:BF16NativeDef;
 
   // --- Phase C extension point (TTNN high-level op) ---
   // ttnn_op:TTNNOpDesc;  // op_type + input/output tensor descs + attrs
@@ -363,8 +379,17 @@ table EntryPointDef {
 
 table ExecutableDef {
   // Schema version. Keep the default at 0 forever so old blobs with an absent
-  // field remain distinguishable. Current serializers explicitly emit v8;
-  // the runtime also accepts v1-v7 blobs.
+  // field remain distinguishable. The compiler emits v15 for F32 and v17 for
+  // native BF16; the runtime accepts v1-v17. v13 adds descriptor-specialized
+  // native matrix kernels and single-reader pooling/reduction/division kernels.
+  // v14 adds BF16 component CBs 4-7 and six-product FP32 accumulation/output.
+  // v15 native F32 matrices use one reader-role device FP32 kernel and bounded
+  // UInt32 L1 scratch CBs 0/1/16; no input quantization or host tensor arithmetic.
+  // Experimental v16 native matrices use four signed INT8 digits per operand,
+  // INT32 product partials, row/column scales and device FP32 Kahan summation.
+  // Reader/writer/compute roles and CBs 0-12/16-18 retain external F32 storage.
+  // v17 BF16-native dispatches use 14 address/base pairs, one reader-role
+  // device kernel, BF16/F32 storage and explicit round-to-nearest-even casts.
   version:uint32 = 0;
 
   // One entry per HAL export ordinal.

@@ -50,3 +50,6 @@ Thumbs.db
 
 # TT-Metal runtime inspector artifacts
 generated/
+
+# backlog
+reports/

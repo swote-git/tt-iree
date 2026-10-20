@@ -24,6 +24,8 @@ namespace mlir::iree_compiler::IREE::HAL {
 struct TenstorrentTargetOptions {
   std::string deviceId = "p100a";
   bool dumpTTEX = false;   // dump TTEX binary for debugging
+  bool nativeF32UseTensix = false; // experimental INT8-digit v16 path
+  bool nativeBF16UseTensix = false; // v18 HiFi4 contraction, IR epilogue
 };
 
 //===----------------------------------------------------------------------===//

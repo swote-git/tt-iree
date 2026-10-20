@@ -27,7 +27,17 @@ extern "C" {
 #define TT_IREE_TTEX_VERSION_6 6u
 #define TT_IREE_TTEX_VERSION_7 7u
 #define TT_IREE_TTEX_VERSION_8 8u
-#define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_8
+#define TT_IREE_TTEX_VERSION_9 9u
+#define TT_IREE_TTEX_VERSION_10 10u
+#define TT_IREE_TTEX_VERSION_11 11u
+#define TT_IREE_TTEX_VERSION_12 12u
+#define TT_IREE_TTEX_VERSION_13 13u
+#define TT_IREE_TTEX_VERSION_14 14u
+#define TT_IREE_TTEX_VERSION_15 15u
+#define TT_IREE_TTEX_VERSION_16 16u
+#define TT_IREE_TTEX_VERSION_17 17u
+#define TT_IREE_TTEX_VERSION_18 18u
+#define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_18
 
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
 // Must stay in sync with BuiltinProgram in tt_executable_def.fbs.
@@ -43,6 +53,8 @@ typedef enum tt_iree_ttex_builtin_program_e {
   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM = 8,
   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV = 9,
   TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR = 10,
+  TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE = 11,
+  TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX = 12,
 } tt_iree_ttex_builtin_program_e;
 
 typedef enum tt_iree_ttex_dispatch_kind_e {
@@ -54,7 +66,43 @@ typedef enum tt_iree_ttex_dispatch_kind_e {
   TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM = 5,
   TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV = 6,
   TT_IREE_TTEX_DISPATCH_KIND_LINEAR = 7,
+  TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE = 8,
 } tt_iree_ttex_dispatch_kind_e;
+
+// Returns whether an opcode and descriptor family form a valid TTEX dispatch.
+// Keep this as the single pairing table used by the compiler, schema builder,
+// and runtime parser.
+static inline bool
+tt_iree_ttex_builtin_matches_dispatch_kind(uint32_t builtin_program,
+                                           uint8_t dispatch_kind) {
+  switch (dispatch_kind) {
+  case TT_IREE_TTEX_DISPATCH_KIND_BUILTIN:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD ||
+           builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_TTNN_ELTWISE_ADD ||
+           builtin_program ==
+               TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32 ||
+           builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
+  case TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE;
+  case TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D;
+  case TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY;
+  case TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MAX_POOL_2D;
+  case TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_GLOBAL_SUM;
+  case TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_SCALAR_DIV;
+  case TT_IREE_TTEX_DISPATCH_KIND_LINEAR:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR;
+  case TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE:
+    return builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE ||
+           builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+  default:
+    return false;
+  }
+}
 
 typedef enum tt_iree_ttex_tensor_element_type_e {
   TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_UNKNOWN = 0,
@@ -85,6 +133,41 @@ typedef enum tt_iree_ttex_target_arch_e {
 } tt_iree_ttex_target_arch_e;
 
 #define TT_IREE_TTEX_AOT_KERNEL_COUNT 3u
+#define TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(role) (1u << (role))
+
+// Returns the exact AOT role set required by a v9 entry point. Versions 3-8
+// retain the original fixed reader/writer/compute contract.
+static inline uint32_t tt_iree_ttex_required_aot_kernel_roles(
+    uint32_t builtin_program, uint8_t dispatch_kind) {
+  if (builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_F32_PADDED_COPY &&
+      dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {
+    // A single data-movement kernel owns both the DRAM read and write.
+    return TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(
+        TT_IREE_TTEX_KERNEL_ROLE_READER);
+  }
+  return TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_READER) |
+         TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_WRITER) |
+         TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_COMPUTE);
+}
+
+static inline uint32_t tt_iree_ttex_required_aot_kernel_roles_for_version(
+    uint32_t version, uint32_t builtin_program, uint8_t dispatch_kind) {
+  if (version >= TT_IREE_TTEX_VERSION_17 &&
+      builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE &&
+      dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
+    return TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_READER);
+  if (version >= TT_IREE_TTEX_VERSION_13 &&
+      tt_iree_ttex_builtin_matches_dispatch_kind(builtin_program, dispatch_kind) &&
+      ((version == TT_IREE_TTEX_VERSION_15 &&
+        (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+         dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+         dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR)) ||
+       dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+       dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
+       dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV))
+    return TT_IREE_TTEX_AOT_KERNEL_ROLE_BIT(TT_IREE_TTEX_KERNEL_ROLE_READER);
+  return tt_iree_ttex_required_aot_kernel_roles(builtin_program, dispatch_kind);
+}
 
 typedef struct tt_iree_ttex_kernel_source_desc_t {
   uint8_t role;       // tt_iree_ttex_kernel_role_e
@@ -226,6 +309,16 @@ typedef struct tt_iree_ttex_linear_desc_t {
 } tt_iree_ttex_linear_desc_t;
 
 // Describes a single entry point to be serialized into a TTEX blob.
+// v17 BF16 storage, explicit IR rounding, device FP32 contraction accumulation.
+// Slots 0/1 are matrix operands, 2 is output; remaining slots are epilogue
+// inputs. A rank-zero slot is absent. This ABI never routes through host math.
+#define TT_IREE_BF16_NATIVE_TENSOR_COUNT 14u
+typedef struct tt_iree_ttex_bf16_native_desc_t {
+  uint8_t operation_kind; // one of the existing descriptor dispatch kinds
+  uint32_t m, n, k;
+  tt_iree_ttex_tensor_desc_t tensors[TT_IREE_BF16_NATIVE_TENSOR_COUNT];
+} tt_iree_ttex_bf16_native_desc_t;
+
 // Field semantics match EntryPointDef in tt_executable_def.fbs.
 typedef struct tt_iree_ttex_entry_point_desc_t {
   const char *name; // null-terminated, may be NULL (defaults to "")
@@ -245,6 +338,7 @@ typedef struct tt_iree_ttex_entry_point_desc_t {
   tt_iree_ttex_global_sum_desc_t global_sum;
   tt_iree_ttex_scalar_div_desc_t scalar_div;
   tt_iree_ttex_linear_desc_t linear;
+  tt_iree_ttex_bf16_native_desc_t bf16_native;
   const tt_iree_ttex_aot_kernel_bundle_desc_t *aot_kernel_bundle;
 } tt_iree_ttex_entry_point_desc_t;
 

@@ -16,6 +16,8 @@ set(TT_HAL_DRIVER_SRCS
   tt_semaphore.cc
   tt_command_buffer.cc
   tt_executable_cache.cc
+  tt_runtime_checkpoint.cc
+  tt_runtime_profiler.cc
   registration/driver_module.c
 )
 
@@ -23,12 +25,15 @@ set(TT_HAL_DRIVER_HDRS
   api.h
   tt_driver.h
   tt_device.h
+  tt_native_dispatch.inc
   tt_allocator.h
   tt_buffer.h
   tt_executable.h
   tt_semaphore.h
   tt_command_buffer.h
   tt_executable_cache.h
+  tt_runtime_checkpoint.h
+  tt_runtime_profiler.h
   registration/driver_module.h
 )
 
@@ -109,6 +114,7 @@ target_link_libraries(iree_hal_tenstorrent
   PUBLIC
     iree_base_base
     iree_hal_hal
+    iree_hal_utils_files
     iree_hal_utils_semaphore_base
 )
 

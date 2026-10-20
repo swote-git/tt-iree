@@ -19,6 +19,8 @@ if(TT_IREE_ENABLE_TTNN)
   add_library(TenstorrentAOTCompiler STATIC
     TenstorrentAOTCompiler.cpp
     TenstorrentAOTCompiler.h
+    TenstorrentNativeKernels.cpp
+    TenstorrentNativeKernels.h
   )
   target_compile_features(TenstorrentAOTCompiler PRIVATE cxx_std_20)
   target_compile_options(TenstorrentAOTCompiler PRIVATE -fsized-deallocation)
@@ -39,6 +41,7 @@ if(TT_IREE_ENABLE_TTNN)
     PRIVATE
       ${TT_METAL_LIBRARIES}
       "${TT_METAL_LIB_DIR}/libfmt.so"
+      tt_executable_builder_util
   )
   target_compile_definitions(TenstorrentAOTCompiler
     PRIVATE
