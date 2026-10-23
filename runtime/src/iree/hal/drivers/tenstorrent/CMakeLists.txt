@@ -28,6 +28,10 @@ set(TT_HAL_DRIVER_HDRS
   tt_native_dispatch.inc
   tt_allocator.h
   tt_buffer.h
+  tt_buffer_transfer.h
+  tt_fill.h
+  tt_fill_aot.h
+  tt_fill_kernel.h
   tt_executable.h
   tt_semaphore.h
   tt_command_buffer.h
@@ -79,6 +83,29 @@ if(TT_IREE_ENABLE_TTNN)
     BUILD_RPATH "${TT_METAL_LIB_DIR}"
     INSTALL_RPATH "${TT_METAL_LIB_DIR}"
   )
+endif()
+
+# Build transfer kernels offline even in runtime-only hardware builds. The HAL
+# links only embedded artifacts, never the offline compiler or MLIR libraries.
+if(TT_IREE_ENABLE_TTNN AND NOT TT_IREE_ENABLE_MOCK)
+  get_filename_component(_TT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../.." ABSOLUTE)
+  include("${_TT_ROOT}/cmake/tt_aot_compiler.cmake")
+  tt_iree_add_aot_compiler()
+  add_executable(tt-iree-transfer-aot "${_TT_ROOT}/tools/generate_transfer_aot.cc")
+  target_compile_features(tt-iree-transfer-aot PRIVATE cxx_std_20)
+  set_property(TARGET tt-iree-transfer-aot PROPERTY CXX_SCAN_FOR_MODULES OFF)
+  target_include_directories(tt-iree-transfer-aot PRIVATE
+    "${_TT_ROOT}/compiler/plugins/target/tenstorrent")
+  target_link_libraries(tt-iree-transfer-aot PRIVATE TenstorrentAOTCompiler)
+  set(_TT_FILL_AOT_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/tt_fill_aot_generated.cc")
+  add_custom_command(OUTPUT "${_TT_FILL_AOT_SOURCE}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "TT_METAL_CACHE=${CMAKE_CURRENT_BINARY_DIR}/fill-aot-cache"
+      $<TARGET_FILE:tt-iree-transfer-aot> "${_TT_FILL_AOT_SOURCE}"
+    DEPENDS tt-iree-transfer-aot "${CMAKE_CURRENT_SOURCE_DIR}/tt_fill_kernel.h"
+    COMMENT "Offline-compiling embedded HAL fill kernels (Wormhole/Blackhole)"
+    VERBATIM)
+  target_sources(iree_hal_tenstorrent PRIVATE tt_fill.cc "${_TT_FILL_AOT_SOURCE}")
 endif()
 
 # TTEX parsing is independent of TT-Metal and must also be available in mock

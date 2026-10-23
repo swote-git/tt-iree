@@ -33,6 +33,7 @@
 #ifndef TT_IREE_ENABLE_MOCK
 #include "impl/kernels/kernel.hpp"
 #include "impl/program/program_impl.hpp"
+#include "iree/hal/drivers/tenstorrent/tt_fill.h"
 #include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/device.hpp"
 #include "tt-metalium/distributed.hpp"
@@ -85,6 +86,7 @@ struct iree_hal_tt_device_t {
   // A bounded single-signature pool avoids allocating three DRAM buffers per
   // core for consecutive host-assisted matmuls with the same partition.
   iree_hal_tt_matmul_scratch_pool_t matmul_scratch_pool;
+  std::unique_ptr<iree::hal::tenstorrent::DeviceFill> fill_program;
 #endif
 };
 
@@ -230,8 +232,12 @@ iree_hal_tt_copy_resolved_buffer_refs(const iree_hal_buffer_ref_t &source_ref,
                                 IREE_HAL_MEMORY_ACCESS_WRITE, target_ref.offset,
                                 target_ref.length, &target_mapping);
   if (iree_status_is_ok(status)) {
-    std::memcpy(target_mapping.contents.data, source_mapping.contents.data,
-                static_cast<size_t>(source_ref.length));
+    {
+      iree::hal::tenstorrent::RuntimeTransferStage stage(
+          iree::hal::tenstorrent::RuntimeTransferStageKind::HostCopy);
+      std::memcpy(target_mapping.contents.data, source_mapping.contents.data,
+                  static_cast<size_t>(source_ref.length));
+    }
     status =
         iree_status_join(status, iree_hal_buffer_unmap_range(&target_mapping));
   }
@@ -290,10 +296,57 @@ static iree_status_t iree_hal_tt_resolve_transfer_buffer_ref(
   return iree_ok_status();
 }
 
-static iree_status_t iree_hal_tt_execute_transfer_command(
-    iree_hal_command_buffer_t *command_buffer,
+#ifndef TT_IREE_ENABLE_MOCK
+static iree_status_t iree_hal_tt_execute_device_fill(
+    iree_hal_tt_device_t *device, const iree_hal_buffer_ref_t &target,
+    const uint8_t *pattern, iree_host_size_t pattern_length) {
+  if (pattern_length != 1 && pattern_length != 2 && pattern_length != 4)
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "invalid fill pattern length");
+  if (!target.length)
+    return iree_ok_status();
+  if (target.offset % pattern_length || target.length % pattern_length)
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "unaligned fill pattern range");
+  if (iree_hal_buffer_allocation_placement(target.buffer).device !=
+      reinterpret_cast<iree_hal_device_t *>(device))
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "fill target is not owned by this device");
+  auto *handle = iree_hal_tt_buffer_handle(target.buffer);
+  if (!handle || handle->page_size() != 2048)
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "fill requires a TT DRAM buffer with 2048-byte pages");
+  uint64_t offset = iree_hal_buffer_byte_offset(target.buffer) + target.offset;
+  if (offset > UINT32_MAX || target.length > UINT32_MAX - offset)
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "fill address range exceeds 32 bits");
+  const uint64_t address = handle->address();
+  if (address > UINT32_MAX)
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "fill buffer address exceeds 32 bits");
+  // A subspan may start at an odd allocation offset. Rotate the pattern so
+  // scratch[absolute_offset % 2048] is still the first requested pattern byte.
+  uint32_t word = 0;
+  for (uint32_t i = 0; i < 4; ++i)
+    word |= uint32_t(pattern[(i + pattern_length - offset % pattern_length) %
+                             pattern_length])
+            << (i * 8);
+  if (!device->fill_program)
+    device->fill_program =
+        std::make_unique<iree::hal::tenstorrent::DeviceFill>();
+  return device->fill_program->Execute(
+      device->mesh_device.get(), device->mesh_cq,
+      static_cast<uint32_t>(address), static_cast<uint32_t>(offset),
+      static_cast<uint32_t>(target.length), word);
+}
+#endif
+
+static iree_status_t iree_hal_tt_execute_transfer_command_impl(
+    iree_hal_tt_device_t *device, iree_hal_command_buffer_t *command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
-    const iree_hal_tt_command_t &command, bool *out_handled) {
+    const iree_hal_tt_command_t &command, bool *out_handled,
+    iree::hal::tenstorrent::RuntimeTransferScope &transfer) {
   *out_handled = true;
   switch (command.type) {
   case IREE_HAL_TT_COMMAND_TYPE_FILL: {
@@ -301,15 +354,22 @@ static iree_status_t iree_hal_tt_execute_transfer_command(
     iree_hal_buffer_ref_t target_ref = {};
     IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_transfer_buffer_ref(
         binding_table, cmd.target_ref, &target_ref));
+    transfer.Target(target_ref.buffer, target_ref.offset, target_ref.length);
+#ifndef TT_IREE_ENABLE_MOCK
+    return iree_hal_tt_execute_device_fill(device, target_ref, cmd.pattern,
+                                           cmd.pattern_length);
+#else
     return iree_hal_buffer_map_fill(target_ref.buffer, target_ref.offset,
                                     target_ref.length, cmd.pattern,
                                     cmd.pattern_length);
+#endif
   }
   case IREE_HAL_TT_COMMAND_TYPE_UPDATE: {
     const auto &cmd = command.update;
     iree_hal_buffer_ref_t target_ref = {};
     IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_transfer_buffer_ref(
         binding_table, cmd.target_ref, &target_ref));
+    transfer.Target(target_ref.buffer, target_ref.offset, target_ref.length);
     iree_const_byte_span_t source_data = iree_const_byte_span_empty();
     IREE_RETURN_IF_ERROR(iree_hal_tt_command_buffer_get_update_data(
         command_buffer, cmd.source_data_offset, cmd.source_data_length,
@@ -331,12 +391,33 @@ static iree_status_t iree_hal_tt_execute_transfer_command(
         binding_table, cmd.source_ref, &source_ref));
     IREE_RETURN_IF_ERROR(iree_hal_tt_resolve_transfer_buffer_ref(
         binding_table, cmd.target_ref, &target_ref));
+    transfer.Source(source_ref.buffer, source_ref.offset, source_ref.length);
+    transfer.Target(target_ref.buffer, target_ref.offset, target_ref.length);
     return iree_hal_tt_copy_resolved_buffer_refs(source_ref, target_ref);
   }
   default:
     *out_handled = false;
     return iree_ok_status();
   }
+}
+
+static iree_status_t iree_hal_tt_execute_transfer_command(
+    iree_hal_tt_device_t *device, iree_hal_command_buffer_t *command_buffer,
+    iree_hal_buffer_binding_table_t binding_table,
+    const iree_hal_tt_command_t &command, bool *out_handled) {
+  const char *operation =
+      command.type == IREE_HAL_TT_COMMAND_TYPE_FILL     ? "FILL"
+      : command.type == IREE_HAL_TT_COMMAND_TYPE_UPDATE ? "UPDATE"
+      : command.type == IREE_HAL_TT_COMMAND_TYPE_COPY   ? "COPY"
+                                                        : nullptr;
+  if (!operation) {
+    *out_handled = false;
+    return iree_ok_status();
+  }
+  iree::hal::tenstorrent::RuntimeTransferScope transfer(
+      &device->runtime_profiler, operation);
+  return transfer.Finish(iree_hal_tt_execute_transfer_command_impl(
+      device, command_buffer, binding_table, command, out_handled, transfer));
 }
 
 #ifndef TT_IREE_ENABLE_MOCK
@@ -2791,6 +2872,8 @@ static iree_hal_tt_device_t *iree_hal_tt_device_cast(iree_hal_device_t *base) {
 
 iree::hal::tenstorrent::RuntimeProfiler *
 iree_hal_tt_device_runtime_profiler(iree_hal_device_t *base) {
+  if (!base || !iree_hal_resource_is(base, &iree_hal_tt_device_vtable))
+    return nullptr;
   auto *device = iree_hal_tt_device_cast(base);
   return device->runtime_profiler.enabled() ? &device->runtime_profiler
                                             : nullptr;
@@ -2982,6 +3065,7 @@ static void iree_hal_tt_device_destroy(iree_hal_device_t *base) {
       // TT-Metal buffers must release their device allocations before the
       // owning MeshDevice is closed.
       device->matmul_scratch_pool = {};
+      device->fill_program.reset();
       device->mesh_device->close();
       // shared_ptr will handle deletion
     } catch (...) {
@@ -2998,6 +3082,7 @@ static void iree_hal_tt_device_destroy(iree_hal_device_t *base) {
     iree_status_ignore(
         device->runtime_profiler.RecordPreparation(std::move(record)));
   }
+  iree_status_ignore(device->runtime_profiler.Flush());
   device->~iree_hal_tt_device_t();
   iree_allocator_free(host_allocator, device);
   IREE_TRACE_ZONE_END(z0);
@@ -3232,9 +3317,25 @@ static iree_status_t iree_hal_tt_device_queue_fill(
   IREE_RETURN_IF_ERROR(iree_hal_buffer_calculate_range(
       /*base_offset=*/0, iree_hal_buffer_byte_length(target_buffer),
       target_offset, length, &resolved_offset, &resolved_length));
-  IREE_RETURN_IF_ERROR(iree_hal_buffer_map_fill(target_buffer, resolved_offset,
-                                                resolved_length, pattern,
-                                                pattern_length));
+  auto *device = iree_hal_tt_device_cast(base_device);
+  std::lock_guard<std::mutex> queue_lock(device->queue_mutex);
+  iree::hal::tenstorrent::RuntimeProfileCommandScope command(
+      &device->runtime_profiler, device->runtime_profiler.NextSubmissionId(),
+      0);
+  iree::hal::tenstorrent::RuntimeTransferScope transfer(
+      &device->runtime_profiler, "FILL");
+  transfer.Target(target_buffer, resolved_offset, resolved_length);
+#ifndef TT_IREE_ENABLE_MOCK
+  IREE_RETURN_IF_ERROR(transfer.Finish(iree_hal_tt_execute_device_fill(
+      device,
+      iree_hal_make_buffer_ref(target_buffer, resolved_offset, resolved_length),
+      static_cast<const uint8_t *>(pattern), pattern_length)));
+#else
+  IREE_RETURN_IF_ERROR(transfer.Finish(
+      iree_hal_buffer_map_fill(target_buffer, resolved_offset, resolved_length,
+                               pattern, pattern_length)));
+#endif
+  IREE_RETURN_IF_ERROR(device->runtime_profiler.Flush());
   return iree_hal_semaphore_list_signal(signal_semaphore_list);
 }
 
@@ -3647,6 +3748,7 @@ static iree_status_t iree_hal_tt_device_queue_execute(
 
   auto *device = iree_hal_tt_device_cast(base_device);
   std::lock_guard<std::mutex> queue_lock(device->queue_mutex);
+  const uint64_t submission_id = device->runtime_profiler.NextSubmissionId();
 
 #ifndef TT_IREE_ENABLE_MOCK
   iree_host_size_t command_count = 0;
@@ -3663,9 +3765,12 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   }
 
   for (iree_host_size_t i = 0; i < command_count; ++i) {
+    iree::hal::tenstorrent::RuntimeProfileCommandScope profile_command(
+        &device->runtime_profiler, submission_id, i,
+        commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH);
     bool transfer_handled = false;
     IREE_RETURN_IF_ERROR(iree_hal_tt_execute_transfer_command(
-        command_buffer, binding_table, commands[i], &transfer_handled));
+        device, command_buffer, binding_table, commands[i], &transfer_handled));
     if (transfer_handled)
       continue;
 
@@ -3926,9 +4031,12 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   iree_hal_tt_command_t *commands =
       iree_hal_tt_command_buffer_get_commands(command_buffer, &command_count);
   for (iree_host_size_t i = 0; i < command_count; ++i) {
+    iree::hal::tenstorrent::RuntimeProfileCommandScope profile_command(
+        &device->runtime_profiler, submission_id, i,
+        commands[i].type == IREE_HAL_TT_COMMAND_TYPE_DISPATCH);
     bool transfer_handled = false;
     IREE_RETURN_IF_ERROR(iree_hal_tt_execute_transfer_command(
-        command_buffer, binding_table, commands[i], &transfer_handled));
+        device, command_buffer, binding_table, commands[i], &transfer_handled));
     if (transfer_handled)
       continue;
 
@@ -4006,7 +4114,7 @@ static iree_status_t iree_hal_tt_device_queue_execute(
   }
 #endif
 
-  return iree_ok_status();
+  return device->runtime_profiler.Flush();
 }
 
 static iree_status_t iree_hal_tt_device_queue_flush(iree_hal_device_t *base,
@@ -4063,10 +4171,11 @@ static iree_status_t iree_hal_tt_device_profiling_begin(
   return iree_ok_status();
 }
 
-static iree_status_t iree_hal_tt_device_profiling_flush(iree_hal_device_t *) {
-  return iree_ok_status();
+static iree_status_t
+iree_hal_tt_device_profiling_flush(iree_hal_device_t *base) {
+  return iree_hal_tt_device_cast(base)->runtime_profiler.Flush();
 }
 
-static iree_status_t iree_hal_tt_device_profiling_end(iree_hal_device_t *) {
-  return iree_ok_status();
+static iree_status_t iree_hal_tt_device_profiling_end(iree_hal_device_t *base) {
+  return iree_hal_tt_device_cast(base)->runtime_profiler.Flush();
 }

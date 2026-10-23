@@ -8,7 +8,13 @@
 #include <limits>
 #include <mutex>
 
+#include "iree/hal/drivers/tenstorrent/tt_buffer_transfer.h"
 #include "iree/hal/drivers/tenstorrent/tt_device.h"
+#include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
+
+using iree::hal::tenstorrent::RuntimeTransferScope;
+using iree::hal::tenstorrent::RuntimeTransferStage;
+using iree::hal::tenstorrent::RuntimeTransferStageKind;
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "tt-metalium/host_api.hpp"
@@ -112,12 +118,14 @@ static iree_hal_tt_buffer_t* iree_hal_tt_buffer_cast(iree_hal_buffer_t* base) {
 #ifndef TT_IREE_ENABLE_MOCK
 static iree_status_t iree_hal_tt_buffer_read_physical_allocation(
     iree_hal_tt_buffer_t* buffer, uint8_t* target) {
+  RuntimeTransferStage stage(RuntimeTransferStageKind::Read);
   if (!buffer->tt_buffer) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                             "TT-Metal buffer is not initialized");
   }
   try {
     tt::tt_metal::detail::ReadFromBuffer(*buffer->tt_buffer, target);
+    RuntimeTransferScope::ReadBytes(buffer->physical_allocation_size);
     return iree_ok_status();
   } catch (const std::exception& e) {
     return iree_make_status(IREE_STATUS_INTERNAL,
@@ -130,6 +138,7 @@ static iree_status_t iree_hal_tt_buffer_read_physical_allocation(
 
 static iree_status_t iree_hal_tt_buffer_write_physical_allocation(
     iree_hal_tt_buffer_t* buffer, const uint8_t* source) {
+  RuntimeTransferStage stage(RuntimeTransferStageKind::Write);
   if (!buffer->tt_buffer) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                             "TT-Metal buffer is not initialized");
@@ -138,6 +147,7 @@ static iree_status_t iree_hal_tt_buffer_write_physical_allocation(
     ttsl::Span<const uint8_t> span(
         source, static_cast<size_t>(buffer->physical_allocation_size));
     tt::tt_metal::detail::WriteToBuffer(*buffer->tt_buffer, span);
+    RuntimeTransferScope::WriteBytes(buffer->physical_allocation_size);
     return iree_ok_status();
   } catch (const std::exception& e) {
     return iree_make_status(IREE_STATUS_INTERNAL,
@@ -152,19 +162,25 @@ static iree_status_t iree_hal_tt_buffer_read_range(
     iree_hal_tt_buffer_t* buffer, iree_device_size_t byte_offset,
     iree_device_size_t byte_length, uint8_t* target) {
   void* physical_data = nullptr;
-  iree_status_t status = iree_allocator_malloc(
-      buffer->host_allocator,
-      static_cast<iree_host_size_t>(buffer->physical_allocation_size),
-      &physical_data);
+  iree_status_t status;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Allocation);
+    status = iree_allocator_malloc(
+        buffer->host_allocator,
+        static_cast<iree_host_size_t>(buffer->physical_allocation_size),
+        &physical_data);
+  }
   if (iree_status_is_ok(status)) {
     status = iree_hal_tt_buffer_read_physical_allocation(
         buffer, static_cast<uint8_t*>(physical_data));
   }
   if (iree_status_is_ok(status)) {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::HostCopy);
     std::memcpy(target, static_cast<uint8_t*>(physical_data) + byte_offset,
                 static_cast<size_t>(byte_length));
   }
   if (physical_data) {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Deallocation);
     iree_allocator_free(buffer->host_allocator, physical_data);
   }
   return status;
@@ -173,25 +189,15 @@ static iree_status_t iree_hal_tt_buffer_read_range(
 static iree_status_t iree_hal_tt_buffer_write_range(
     iree_hal_tt_buffer_t* buffer, iree_device_size_t byte_offset,
     iree_device_size_t byte_length, const uint8_t* source) {
-  void* physical_data = nullptr;
-  iree_status_t status = iree_allocator_malloc(
-      buffer->host_allocator,
-      static_cast<iree_host_size_t>(buffer->physical_allocation_size),
-      &physical_data);
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_tt_buffer_read_physical_allocation(
-        buffer, static_cast<uint8_t*>(physical_data));
-  }
-  if (iree_status_is_ok(status)) {
-    std::memcpy(static_cast<uint8_t*>(physical_data) + byte_offset, source,
-                static_cast<size_t>(byte_length));
-    status = iree_hal_tt_buffer_write_physical_allocation(
-        buffer, static_cast<const uint8_t*>(physical_data));
-  }
-  if (physical_data) {
-    iree_allocator_free(buffer->host_allocator, physical_data);
-  }
-  return status;
+  return iree::hal::tenstorrent::WriteBufferRange(
+      buffer->host_allocator, iree_hal_buffer_byte_length(&buffer->base),
+      buffer->physical_allocation_size, byte_offset, byte_length, source,
+      [&](uint8_t *data) {
+        return iree_hal_tt_buffer_read_physical_allocation(buffer, data);
+      },
+      [&](const uint8_t *data) {
+        return iree_hal_tt_buffer_write_physical_allocation(buffer, data);
+      });
 }
 
 static iree_hal_tt_buffer_mapping_state_t*
@@ -229,6 +235,9 @@ uint32_t iree_hal_tt_buffer_device_address(iree_hal_buffer_t* base_buffer) {
 
 tt::tt_metal::Buffer* iree_hal_tt_buffer_handle(iree_hal_buffer_t* base_buffer) {
   if (!base_buffer) return nullptr;
+  if (!iree_hal_resource_is(iree_hal_buffer_allocated_buffer(base_buffer),
+                            &iree_hal_tt_buffer_vtable))
+    return nullptr;
   auto* buffer = iree_hal_tt_buffer_cast(
       iree_hal_buffer_allocated_buffer(base_buffer));
   return buffer ? buffer->tt_buffer.get() : nullptr;
@@ -239,12 +248,10 @@ tt::tt_metal::Buffer* iree_hal_tt_buffer_handle(iree_hal_buffer_t* base_buffer) 
 // Buffer creation
 //===----------------------------------------------------------------------===//
 
-iree_status_t iree_hal_tt_buffer_create(
-    iree_hal_tt_device_t* device,
-    iree_hal_buffer_params_t params,
-    iree_device_size_t allocation_size,
-    iree_allocator_t host_allocator,
-    iree_hal_buffer_t** out_buffer) {
+static iree_status_t iree_hal_tt_buffer_create_impl(
+    iree_hal_tt_device_t *device, iree_hal_buffer_params_t params,
+    iree_device_size_t allocation_size, iree_allocator_t host_allocator,
+    iree_hal_buffer_t **out_buffer) {
   IREE_ASSERT_ARGUMENT(device);
   IREE_ASSERT_ARGUMENT(out_buffer);
   *out_buffer = nullptr;
@@ -340,7 +347,7 @@ iree_status_t iree_hal_tt_buffer_create(
 // Buffer vtable
 //===----------------------------------------------------------------------===//
 
-static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t* base_buffer) {
+static void iree_hal_tt_buffer_destroy_impl(iree_hal_buffer_t *base_buffer) {
   auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
   iree_allocator_t host_allocator = buffer->host_allocator;
   
@@ -355,13 +362,11 @@ static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t* base_buffer) {
   IREE_TRACE_ZONE_END(z0);
 }
 
-static iree_status_t iree_hal_tt_buffer_map_range(
-    iree_hal_buffer_t* base_buffer,
-    iree_hal_mapping_mode_t mapping_mode,
+static iree_status_t iree_hal_tt_buffer_map_range_impl(
+    iree_hal_buffer_t *base_buffer, iree_hal_mapping_mode_t mapping_mode,
     iree_hal_memory_access_t memory_access,
-    iree_device_size_t local_byte_offset,
-    iree_device_size_t local_byte_length,
-    iree_hal_buffer_mapping_t* mapping) {
+    iree_device_size_t local_byte_offset, iree_device_size_t local_byte_length,
+    iree_hal_buffer_mapping_t *mapping) {
   auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
   
   IREE_TRACE_ZONE_BEGIN(z0);
@@ -443,11 +448,9 @@ static iree_status_t iree_hal_tt_buffer_map_range(
   return iree_ok_status();
 }
 
-static iree_status_t iree_hal_tt_buffer_unmap_range(
-    iree_hal_buffer_t* base_buffer,
-    iree_device_size_t local_byte_offset,
-    iree_device_size_t local_byte_length,
-    iree_hal_buffer_mapping_t* mapping) {
+static iree_status_t iree_hal_tt_buffer_unmap_range_impl(
+    iree_hal_buffer_t *base_buffer, iree_device_size_t local_byte_offset,
+    iree_device_size_t local_byte_length, iree_hal_buffer_mapping_t *mapping) {
   auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
   
   IREE_TRACE_ZONE_BEGIN(z0);
@@ -486,9 +489,10 @@ static iree_status_t iree_hal_tt_buffer_unmap_range(
 #endif
 }
 
-static iree_status_t iree_hal_tt_buffer_invalidate_range(
-    iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
-    iree_device_size_t local_byte_length) {
+static iree_status_t
+iree_hal_tt_buffer_invalidate_range_impl(iree_hal_buffer_t *base_buffer,
+                                         iree_device_size_t local_byte_offset,
+                                         iree_device_size_t local_byte_length) {
 #ifndef TT_IREE_ENABLE_MOCK
   auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
   std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
@@ -507,9 +511,10 @@ static iree_status_t iree_hal_tt_buffer_invalidate_range(
 #endif
 }
 
-static iree_status_t iree_hal_tt_buffer_flush_range(
-    iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
-    iree_device_size_t local_byte_length) {
+static iree_status_t
+iree_hal_tt_buffer_flush_range_impl(iree_hal_buffer_t *base_buffer,
+                                    iree_device_size_t local_byte_offset,
+                                    iree_device_size_t local_byte_length) {
 #ifndef TT_IREE_ENABLE_MOCK
   auto* buffer = iree_hal_tt_buffer_cast(base_buffer);
   std::lock_guard<std::mutex> lock(buffer->mapping_mutex);
@@ -526,4 +531,104 @@ static iree_status_t iree_hal_tt_buffer_flush_range(
 #else
   return iree_ok_status();
 #endif
+}
+
+static iree::hal::tenstorrent::RuntimeProfiler *
+iree_hal_tt_buffer_profiler(iree_hal_buffer_t *base) {
+  return iree_hal_tt_device_runtime_profiler(
+      reinterpret_cast<iree_hal_device_t *>(
+          iree_hal_tt_buffer_cast(base)->device));
+}
+
+iree_status_t iree_hal_tt_buffer_create(iree_hal_tt_device_t *device,
+                                        iree_hal_buffer_params_t params,
+                                        iree_device_size_t allocation_size,
+                                        iree_allocator_t host_allocator,
+                                        iree_hal_buffer_t **out_buffer) {
+  RuntimeTransferScope transfer(
+      iree_hal_tt_device_runtime_profiler(
+          reinterpret_cast<iree_hal_device_t *>(device)),
+      "ALLOCATE");
+  iree_status_t result;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Allocation);
+    result = iree_hal_tt_buffer_create_impl(device, params, allocation_size,
+                                            host_allocator, out_buffer);
+  }
+  if (iree_status_is_ok(result))
+    transfer.Target(*out_buffer, 0, allocation_size);
+  return transfer.Finish(result);
+}
+
+static void iree_hal_tt_buffer_destroy(iree_hal_buffer_t *base) {
+  RuntimeTransferScope transfer(iree_hal_tt_buffer_profiler(base),
+                                "DEALLOCATE");
+  transfer.Target(base, 0, iree_hal_buffer_byte_length(base));
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Deallocation);
+    iree_hal_tt_buffer_destroy_impl(base);
+  }
+  iree_status_ignore(transfer.Finish(iree_ok_status()));
+}
+
+static iree_status_t iree_hal_tt_buffer_map_range(
+    iree_hal_buffer_t *base, iree_hal_mapping_mode_t mode,
+    iree_hal_memory_access_t access, iree_device_size_t offset,
+    iree_device_size_t length, iree_hal_buffer_mapping_t *mapping) {
+  RuntimeTransferScope transfer(iree_hal_tt_buffer_profiler(base), "MAP");
+  if (access & IREE_HAL_MEMORY_ACCESS_READ)
+    transfer.Source(base, offset, length);
+  if (access & IREE_HAL_MEMORY_ACCESS_WRITE)
+    transfer.Target(base, offset, length);
+  iree_status_t result;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Map);
+    result = iree_hal_tt_buffer_map_range_impl(base, mode, access, offset,
+                                               length, mapping);
+  }
+  return transfer.Finish(result);
+}
+
+static iree_status_t iree_hal_tt_buffer_unmap_range(
+    iree_hal_buffer_t *base, iree_device_size_t offset,
+    iree_device_size_t length, iree_hal_buffer_mapping_t *mapping) {
+  RuntimeTransferScope transfer(iree_hal_tt_buffer_profiler(base), "UNMAP");
+  if (mapping->impl.allowed_access & IREE_HAL_MEMORY_ACCESS_WRITE)
+    transfer.Target(base, offset, length);
+  else
+    transfer.Source(base, offset, length);
+  iree_status_t result;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Unmap);
+    result = iree_hal_tt_buffer_unmap_range_impl(base, offset, length, mapping);
+  }
+  return transfer.Finish(result);
+}
+
+static iree_status_t
+iree_hal_tt_buffer_invalidate_range(iree_hal_buffer_t *base,
+                                    iree_device_size_t offset,
+                                    iree_device_size_t length) {
+  RuntimeTransferScope transfer(iree_hal_tt_buffer_profiler(base),
+                                "INVALIDATE");
+  transfer.Source(base, offset, length);
+  iree_status_t result;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Invalidate);
+    result = iree_hal_tt_buffer_invalidate_range_impl(base, offset, length);
+  }
+  return transfer.Finish(result);
+}
+
+static iree_status_t iree_hal_tt_buffer_flush_range(iree_hal_buffer_t *base,
+                                                    iree_device_size_t offset,
+                                                    iree_device_size_t length) {
+  RuntimeTransferScope transfer(iree_hal_tt_buffer_profiler(base), "FLUSH");
+  transfer.Target(base, offset, length);
+  iree_status_t result;
+  {
+    RuntimeTransferStage stage(RuntimeTransferStageKind::Flush);
+    result = iree_hal_tt_buffer_flush_range_impl(base, offset, length);
+  }
+  return transfer.Finish(result);
 }

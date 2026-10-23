@@ -109,6 +109,9 @@ tt_iree_hal_test(
   SRCS runtime_profiler_test.cc
 )
 
+tt_iree_hal_test(NAME buffer_transfer_test SRCS buffer_transfer_test.cc)
+set_tests_properties(tt_buffer_transfer_test PROPERTIES LABELS "tt-iree;unit;transfer")
+
 tt_iree_hal_test(
   NAME runtime_checkpoint_test
   SRCS runtime_checkpoint_test.cc
@@ -136,6 +139,30 @@ tt_iree_hal_test(
   NAME copy_test
   SRCS copy_test.cc
 )
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  set(_TT_TRANSFER_ANALYSIS_ARGS)
+  if(TT_IREE_ENABLE_MOCK)
+    list(APPEND _TT_TRANSFER_ANALYSIS_ARGS --copy-test $<TARGET_FILE:copy_test>)
+  endif()
+  add_test(NAME tt_runtime_transfer_analysis_test
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/runtime_transfer_analysis_test.py"
+      ${_TT_TRANSFER_ANALYSIS_ARGS})
+  set_tests_properties(tt_runtime_transfer_analysis_test PROPERTIES
+    LABELS "tt-iree;unit;profiling")
+  if(NOT TT_IREE_ENABLE_MOCK)
+    add_test(NAME tt_device_fill_profile_test
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime_transfer_analysis_test.py"
+        --copy-test $<TARGET_FILE:copy_test> --expect-device-fill)
+    set_tests_properties(tt_device_fill_profile_test PROPERTIES
+      LABELS "tt-iree;hal;device-native;profiling"
+      RUN_SERIAL TRUE
+      ENVIRONMENT "TT_METAL_RUNTIME_ROOT=${CMAKE_SOURCE_DIR}/third_party/tt-metal")
+  endif()
+endif()
 
 tt_iree_hal_test(
   NAME file_test

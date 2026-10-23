@@ -71,6 +71,12 @@ bool compilePaddedCopyAOT(TenstorrentAOTTargetArch target_arch,
                           TenstorrentAOTKernelBundle &out_bundle,
                           std::string &error_message);
 
+// Shape-independent HAL fill. Compiled at build time and embedded in the HAL;
+// this needs no executable metadata or HAL linkage to the offline compiler.
+bool compileFillAOT(TenstorrentAOTTargetArch target_arch,
+                    TenstorrentAOTKernelBundle &out_bundle,
+                    std::string &error_message);
+
 // Descriptor-specialized native kernels without host tensor staging: v15
 // device-RISC-V FP32 by default, or experimental v16 INT8-digit Tensix math.
 bool compileNativeDispatchAOT(const tt_iree_ttex_entry_point_desc_t &entry,

@@ -4,14 +4,18 @@
 #ifndef IREE_HAL_DRIVERS_TENSTORRENT_TT_RUNTIME_PROFILER_H_
 #define IREE_HAL_DRIVERS_TENSTORRENT_TT_RUNTIME_PROFILER_H_
 
+#include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "iree/base/api.h"
+#include "iree/hal/buffer.h"
 
 namespace iree::hal::tenstorrent {
+
+enum class RuntimeInvocationPhase { Unscoped, Input, Invoke, Output };
 
 struct RuntimeProfileStages {
   uint64_t input_staging_ns = 0;
@@ -32,6 +36,9 @@ struct RuntimeProfileRecord {
   std::string storage_datatype;
   std::string compute_datatype;
   uint64_t global_call_count = 0;
+  uint64_t invocation_id = 0;
+  uint64_t submission_id = 0;
+  uint64_t command_ordinal = 0;
   uint32_t builtin_program = 0;
   uint32_t dispatch_kind = 0;
   uint32_t grid_x = 0;
@@ -48,6 +55,25 @@ struct RuntimeProfileRecord {
   uint64_t host_end_ns = 0;
   uint64_t host_duration_ns = 0;
   RuntimeProfileStages stages;
+};
+
+// One root operation per thread. Nested map/read/write stages contribute
+// exclusive time to this row instead of producing double-counted child rows.
+struct RuntimeTransferRecord {
+  std::string operation;
+  uint64_t invocation_id = 0, submission_id = 0, command_ordinal = 0;
+  uint64_t source_buffer_id = 0, target_buffer_id = 0;
+  uint64_t source_offset = 0, target_offset = 0, requested_bytes = 0;
+  uint64_t physical_read_bytes = 0, physical_write_bytes = 0;
+  uint64_t device_fill_bytes = 0;
+  uint64_t host_start_ns = 0, host_end_ns = 0, host_duration_ns = 0;
+  uint64_t map_ns = 0, unmap_ns = 0, allocation_ns = 0;
+  uint64_t read_ns = 0, write_ns = 0, host_copy_ns = 0;
+  uint64_t flush_ns = 0, invalidate_ns = 0, deallocation_ns = 0;
+  uint64_t device_setup_ns = 0, device_enqueue_wait_ns = 0;
+  int status_code = 0;
+  bool within_dispatch = false;
+  RuntimeInvocationPhase phase = RuntimeInvocationPhase::Unscoped;
 };
 
 // Host setup events are disjoint from dispatch records and device timing.
@@ -109,6 +135,11 @@ public:
   bool enabled() const { return enabled_; }
   iree_status_t Record(RuntimeProfileRecord record);
   iree_status_t RecordPreparation(RuntimePreparationRecord record);
+  iree_status_t RecordTransfer(RuntimeTransferRecord record);
+  iree_status_t Flush();
+  void SetInvocationId(uint64_t id, RuntimeInvocationPhase phase =
+                                        RuntimeInvocationPhase::Invoke);
+  uint64_t NextSubmissionId() { return enabled_ ? next_submission_id_++ : 0; }
 
   static uint64_t NowNs();
 
@@ -122,9 +153,85 @@ private:
   std::string architecture_;
   std::string output_directory_;
   uint64_t next_call_count_ = 1;
-  std::vector<RuntimeProfileRecord> records_;
-  std::vector<RuntimePreparationRecord> preparation_records_;
+  uint64_t dispatch_count_ = 0, dispatch_ns_ = 0, enqueue_ns_ = 0;
+  uint64_t domain_counts_[5] = {};
+  uint64_t preparation_count_ = 0, preparation_ns_ = 0, cache_hits_ = 0;
+  uint64_t device_create_ns_ = 0, device_destroy_ns_ = 0;
+  uint64_t transfer_count_ = 0, transfer_ns_ = 0;
+  uint64_t transfer_read_bytes_ = 0, transfer_write_bytes_ = 0;
+  uint64_t transfer_record_ns_ = 0;
+  std::atomic<uint64_t> next_submission_id_{1};
+  std::ofstream transfers_;
   mutable std::mutex mutex_;
+};
+
+struct RuntimeProfileContext {
+  RuntimeProfiler *profiler = nullptr;
+  uint64_t invocation = 0, submission = 0, command = 0;
+  bool within_dispatch = false;
+  RuntimeInvocationPhase phase = RuntimeInvocationPhase::Unscoped;
+};
+
+class RuntimeProfileCommandScope {
+public:
+  RuntimeProfileCommandScope(RuntimeProfiler *profiler, uint64_t submission,
+                             uint64_t command, bool within_dispatch = false);
+  ~RuntimeProfileCommandScope();
+  RuntimeProfileCommandScope(const RuntimeProfileCommandScope &) = delete;
+  RuntimeProfileCommandScope &
+  operator=(const RuntimeProfileCommandScope &) = delete;
+
+private:
+  RuntimeProfileContext previous_;
+};
+
+enum class RuntimeTransferStageKind {
+  Map,
+  Unmap,
+  Allocation,
+  Read,
+  Write,
+  HostCopy,
+  Flush,
+  Invalidate,
+  Deallocation,
+  DeviceSetup,
+  DeviceEnqueueWait
+};
+
+class RuntimeTransferScope {
+public:
+  RuntimeTransferScope(RuntimeProfiler *profiler, const char *operation);
+  ~RuntimeTransferScope();
+  void Source(iree_hal_buffer_t *buffer, uint64_t offset, uint64_t length);
+  void Target(iree_hal_buffer_t *buffer, uint64_t offset, uint64_t length);
+  iree_status_t Finish(iree_status_t status);
+  static void ReadBytes(uint64_t bytes);
+  static void WriteBytes(uint64_t bytes);
+  static RuntimeTransferRecord *CurrentRecord();
+  RuntimeTransferScope(const RuntimeTransferScope &) = delete;
+  RuntimeTransferScope &operator=(const RuntimeTransferScope &) = delete;
+
+private:
+  RuntimeProfiler *profiler_;
+  RuntimeTransferScope *previous_;
+  RuntimeTransferRecord record_;
+  bool owns_record_ = false;
+  bool finished_ = false;
+};
+
+class RuntimeTransferStage {
+public:
+  explicit RuntimeTransferStage(RuntimeTransferStageKind kind);
+  ~RuntimeTransferStage();
+  RuntimeTransferStage(const RuntimeTransferStage &) = delete;
+  RuntimeTransferStage &operator=(const RuntimeTransferStage &) = delete;
+
+private:
+  RuntimeTransferRecord *record_ = nullptr;
+  RuntimeTransferStage *previous_ = nullptr;
+  uint64_t *duration_ = nullptr;
+  uint64_t start_ = 0, children_ns_ = 0;
 };
 
 } // namespace iree::hal::tenstorrent

@@ -27,7 +27,24 @@ constexpr char kOperationsHeader[] =
     "[ns],IREE PACK DURATION [ns],IREE "
     "UPLOAD DURATION [ns],IREE PROGRAM SETUP DURATION [ns],IREE ENQUEUE "
     "WAIT DURATION [ns],IREE DOWNLOAD DURATION [ns],IREE UNPACK DURATION "
-    "[ns],IREE OUTPUT STAGING DURATION [ns]\n";
+    "[ns],IREE OUTPUT STAGING DURATION [ns],IREE INVOCATION ID,"
+    "IREE SUBMISSION ID,IREE COMMAND ORDINAL\n";
+
+constexpr char kTransfersHeader[] =
+    "OPERATION,INVOCATION ID,SUBMISSION ID,COMMAND ORDINAL,WITHIN DISPATCH,"
+    "SOURCE BUFFER ID,TARGET BUFFER ID,SOURCE OFFSET,TARGET OFFSET,"
+    "REQUESTED BYTES,READFROMBUFFER BYTES,WRITETOBUFFER BYTES,"
+    "HOST START TS [ns],HOST END TS [ns],HOST DURATION [ns],"
+    "MAP EXCLUSIVE [ns],UNMAP EXCLUSIVE [ns],ALLOCATION EXCLUSIVE [ns],"
+    "READ EXCLUSIVE [ns],WRITE EXCLUSIVE [ns],HOST COPY EXCLUSIVE [ns],"
+    "FLUSH EXCLUSIVE [ns],INVALIDATE EXCLUSIVE [ns],"
+    "DEALLOCATION EXCLUSIVE [ns],DEVICE SETUP EXCLUSIVE [ns],"
+    "DEVICE ENQUEUE WAIT EXCLUSIVE [ns],OTHER [ns],STATUS CODE,INVOCATION "
+    "PHASE,DEVICE FILL BYTES\n";
+
+thread_local RuntimeProfileContext current_context;
+thread_local RuntimeTransferScope *current_transfer = nullptr;
+thread_local RuntimeTransferStage *current_stage = nullptr;
 
 constexpr char kCoreMappingHeader[] =
     "GLOBAL CALL COUNT,OP CODE,CORE X,CORE Y,M TILE BEGIN,M TILE END,N TILE "
@@ -133,8 +150,14 @@ iree_status_t RuntimeProfiler::Initialize(std::string output_directory,
   device_id_ = device_id;
   architecture_ = std::move(architecture);
   next_call_count_ = 1;
-  records_.clear();
-  preparation_records_.clear();
+  dispatch_count_ = dispatch_ns_ = enqueue_ns_ = 0;
+  for (auto &count : domain_counts_)
+    count = 0;
+  preparation_count_ = preparation_ns_ = cache_hits_ = 0;
+  device_create_ns_ = device_destroy_ns_ = 0;
+  transfer_count_ = transfer_ns_ = transfer_record_ns_ = 0;
+  transfer_read_bytes_ = transfer_write_bytes_ = 0;
+  next_submission_id_ = 1;
 
   const std::filesystem::path output_path(output_directory_);
   const std::filesystem::path operations_path =
@@ -153,6 +176,14 @@ iree_status_t RuntimeProfiler::Initialize(std::string output_directory,
   preparation << kPreparationHeader;
   IREE_RETURN_IF_ERROR(CheckOutputStream(preparation, preparation_path));
 
+  if (transfers_.is_open())
+    transfers_.close();
+  const auto transfer_path = output_path / "transfer_perf_results.csv";
+  transfers_.open(transfer_path, std::ios::out | std::ios::trunc);
+  transfers_ << kTransfersHeader;
+  transfers_.flush();
+  IREE_RETURN_IF_ERROR(CheckOutputStream(transfers_, transfer_path));
+
   enabled_ = true;
   IREE_RETURN_IF_ERROR(WriteSummaryLocked());
   std::fprintf(stderr, "tt-iree: profiling output: %s\n",
@@ -165,9 +196,22 @@ iree_status_t RuntimeProfiler::Record(RuntimeProfileRecord record) {
     return iree_ok_status();
   std::lock_guard<std::mutex> lock(mutex_);
   record.global_call_count = next_call_count_++;
+  if (current_context.profiler == this) {
+    record.invocation_id = current_context.invocation;
+    record.submission_id = current_context.submission;
+    record.command_ordinal = current_context.command;
+  }
   IREE_RETURN_IF_ERROR(AppendOperationLocked(record));
   IREE_RETURN_IF_ERROR(AppendCoreMappingLocked(record));
-  records_.push_back(std::move(record));
+  ++dispatch_count_;
+  dispatch_ns_ += record.host_duration_ns;
+  enqueue_ns_ += record.stages.enqueue_wait_ns;
+  size_t domain = record.execution_domain == "device_native"          ? 0
+                  : record.execution_domain == "host_assisted_device" ? 1
+                  : record.execution_domain == "host"                 ? 2
+                  : record.execution_domain == "host_mock"            ? 3
+                                                                      : 4;
+  ++domain_counts_[domain];
   return WriteSummaryLocked();
 }
 
@@ -189,7 +233,15 @@ RuntimeProfiler::RecordPreparation(RuntimePreparationRecord record) {
          << record.data_copy_ns << ',' << record.materialization_ns << ','
          << record.program_creation_ns << ',' << record.cache_insert_ns << '\n';
   IREE_RETURN_IF_ERROR(CheckOutputStream(output, path));
-  preparation_records_.push_back(std::move(record));
+  if (record.event == "EXECUTABLE_PREPARE") {
+    ++preparation_count_;
+    preparation_ns_ += record.host_duration_ns;
+    cache_hits_ += record.cache_hit ? 1 : 0;
+  } else if (record.event == "DEVICE_CREATE") {
+    device_create_ns_ += record.host_duration_ns;
+  } else if (record.event == "DEVICE_DESTROY") {
+    device_destroy_ns_ += record.host_duration_ns;
+  }
   return WriteSummaryLocked();
 }
 
@@ -231,7 +283,9 @@ RuntimeProfiler::AppendOperationLocked(const RuntimeProfileRecord &record) {
          << record.stages.program_setup_ns << ','
          << record.stages.enqueue_wait_ns << ',' << record.stages.download_ns
          << ',' << record.stages.unpack_ns << ','
-         << record.stages.output_staging_ns << '\n';
+         << record.stages.output_staging_ns << ',' << record.invocation_id
+         << ',' << record.submission_id << ',' << record.command_ordinal
+         << '\n';
   return CheckOutputStream(output, path);
 }
 
@@ -269,43 +323,8 @@ RuntimeProfiler::AppendCoreMappingLocked(const RuntimeProfileRecord &record) {
 }
 
 iree_status_t RuntimeProfiler::WriteSummaryLocked() {
-  uint64_t total_dispatch_duration_ns = 0;
-  uint64_t total_enqueue_wait_duration_ns = 0;
-  uint64_t device_native_dispatch_count = 0;
-  uint64_t host_assisted_dispatch_count = 0;
-  uint64_t host_dispatch_count = 0;
-  uint64_t host_mock_dispatch_count = 0;
-  uint64_t unknown_dispatch_count = 0;
-  for (const RuntimeProfileRecord &record : records_) {
-    total_dispatch_duration_ns += record.host_duration_ns;
-    total_enqueue_wait_duration_ns += record.stages.enqueue_wait_ns;
-    if (record.execution_domain == "device_native") {
-      ++device_native_dispatch_count;
-    } else if (record.execution_domain == "host_assisted_device") {
-      ++host_assisted_dispatch_count;
-    } else if (record.execution_domain == "host") {
-      ++host_dispatch_count;
-    } else if (record.execution_domain == "host_mock") {
-      ++host_mock_dispatch_count;
-    } else {
-      ++unknown_dispatch_count;
-    }
-  }
   const bool all_dispatches_device_native =
-      !records_.empty() && device_native_dispatch_count == records_.size();
-  uint64_t preparation_count = 0, preparation_ns = 0, cache_hit_count = 0;
-  uint64_t device_create_ns = 0, device_destroy_ns = 0;
-  for (const auto &record : preparation_records_) {
-    if (record.event == "EXECUTABLE_PREPARE") {
-      ++preparation_count;
-      preparation_ns += record.host_duration_ns;
-      cache_hit_count += record.cache_hit ? 1 : 0;
-    } else if (record.event == "DEVICE_CREATE") {
-      device_create_ns += record.host_duration_ns;
-    } else if (record.event == "DEVICE_DESTROY") {
-      device_destroy_ns += record.host_duration_ns;
-    }
-  }
+      dispatch_count_ != 0 && domain_counts_[0] == dispatch_count_;
 
   const std::filesystem::path directory(output_directory_);
   const std::filesystem::path temporary_path =
@@ -322,29 +341,34 @@ iree_status_t RuntimeProfiler::WriteSummaryLocked() {
          << "  \"device_id\": " << device_id_ << ",\n"
          << "  \"architecture\": \"" << JsonEscape(architecture_) << "\",\n"
          << "  \"clock\": \"steady_clock\",\n"
-         << "  \"dispatch_count\": " << records_.size() << ",\n"
-         << "  \"total_dispatch_duration_ns\": " << total_dispatch_duration_ns
-         << ",\n"
-         << "  \"total_enqueue_wait_duration_ns\": "
-         << total_enqueue_wait_duration_ns << ",\n"
+         << "  \"dispatch_count\": " << dispatch_count_ << ",\n"
+         << "  \"total_dispatch_duration_ns\": " << dispatch_ns_ << ",\n"
+         << "  \"total_enqueue_wait_duration_ns\": " << enqueue_ns_ << ",\n"
          << "  \"execution_domain_counts\": {\n"
-         << "    \"device_native\": " << device_native_dispatch_count << ",\n"
-         << "    \"host_assisted_device\": " << host_assisted_dispatch_count
-         << ",\n"
-         << "    \"host\": " << host_dispatch_count << ",\n"
-         << "    \"host_mock\": " << host_mock_dispatch_count << ",\n"
-         << "    \"unknown\": " << unknown_dispatch_count << "\n"
+         << "    \"device_native\": " << domain_counts_[0] << ",\n"
+         << "    \"host_assisted_device\": " << domain_counts_[1] << ",\n"
+         << "    \"host\": " << domain_counts_[2] << ",\n"
+         << "    \"host_mock\": " << domain_counts_[3] << ",\n"
+         << "    \"unknown\": " << domain_counts_[4] << "\n"
          << "  },\n"
          << "  \"all_dispatches_device_native\": "
          << (all_dispatches_device_native ? "true" : "false") << ",\n"
          << "  \"total_device_kernel_duration_ns\": null,\n"
          << "  \"device_trace_available\": false,\n"
-         << "  \"executable_prepare_count\": " << preparation_count << ",\n"
-         << "  \"executable_cache_hit_count\": " << cache_hit_count << ",\n"
-         << "  \"total_executable_prepare_duration_ns\": " << preparation_ns
+         << "  \"executable_prepare_count\": " << preparation_count_ << ",\n"
+         << "  \"executable_cache_hit_count\": " << cache_hits_ << ",\n"
+         << "  \"total_executable_prepare_duration_ns\": " << preparation_ns_
          << ",\n"
-         << "  \"device_create_duration_ns\": " << device_create_ns << ",\n"
-         << "  \"device_destroy_duration_ns\": " << device_destroy_ns << ",\n"
+         << "  \"device_create_duration_ns\": " << device_create_ns_ << ",\n"
+         << "  \"device_destroy_duration_ns\": " << device_destroy_ns_ << ",\n"
+         << "  \"transfer_count\": " << transfer_count_ << ",\n"
+         << "  \"total_transfer_duration_ns\": " << transfer_ns_ << ",\n"
+         << "  \"readfrombuffer_bytes\": " << transfer_read_bytes_ << ",\n"
+         << "  \"writetobuffer_bytes\": " << transfer_write_bytes_ << ",\n"
+         << "  \"transfer_record_overhead_ns\": " << transfer_record_ns_
+         << ",\n"
+         << "  \"transfer_stages_exclusive\": true,\n"
+         << "  \"transfer_perf\": \"transfer_perf_results.csv\",\n"
          << "  \"host_setup\": \"host_setup_results.csv\",\n"
          << "  \"operations\": \"ops_perf_results.csv\",\n"
          << "  \"core_mapping\": \"core_mapping.csv\"\n"
@@ -360,6 +384,183 @@ iree_status_t RuntimeProfiler::WriteSummaryLocked() {
                             final_path.c_str(), error.message().c_str());
   }
   return iree_ok_status();
+}
+
+iree_status_t RuntimeProfiler::Flush() {
+  if (!enabled_)
+    return iree_ok_status();
+  std::lock_guard<std::mutex> lock(mutex_);
+  transfers_.flush();
+  IREE_RETURN_IF_ERROR(
+      CheckOutputStream(transfers_, std::filesystem::path(output_directory_) /
+                                        "transfer_perf_results.csv"));
+  return WriteSummaryLocked();
+}
+
+iree_status_t RuntimeProfiler::RecordTransfer(RuntimeTransferRecord record) {
+  if (!enabled_)
+    return iree_ok_status();
+  const uint64_t start = NowNs();
+  std::lock_guard<std::mutex> lock(mutex_);
+  const uint64_t stages =
+      record.map_ns + record.unmap_ns + record.allocation_ns + record.read_ns +
+      record.write_ns + record.host_copy_ns + record.flush_ns +
+      record.invalidate_ns + record.deallocation_ns + record.device_setup_ns +
+      record.device_enqueue_wait_ns;
+  transfers_ << CsvEscape(record.operation) << ',' << record.invocation_id
+             << ',' << record.submission_id << ',' << record.command_ordinal
+             << ',' << record.within_dispatch << ',' << record.source_buffer_id
+             << ',' << record.target_buffer_id << ',' << record.source_offset
+             << ',' << record.target_offset << ',' << record.requested_bytes
+             << ',' << record.physical_read_bytes << ','
+             << record.physical_write_bytes << ',' << record.host_start_ns
+             << ',' << record.host_end_ns << ',' << record.host_duration_ns
+             << ',' << record.map_ns << ',' << record.unmap_ns << ','
+             << record.allocation_ns << ',' << record.read_ns << ','
+             << record.write_ns << ',' << record.host_copy_ns << ','
+             << record.flush_ns << ',' << record.invalidate_ns << ','
+             << record.deallocation_ns << ',' << record.device_setup_ns << ','
+             << record.device_enqueue_wait_ns << ','
+             << (record.host_duration_ns >= stages
+                     ? record.host_duration_ns - stages
+                     : 0)
+             << ',' << record.status_code << ','
+             << (record.phase == RuntimeInvocationPhase::Input    ? "input"
+                 : record.phase == RuntimeInvocationPhase::Invoke ? "invoke"
+                 : record.phase == RuntimeInvocationPhase::Output ? "output"
+                                                                  : "unscoped")
+             << ',' << record.device_fill_bytes << '\n';
+  IREE_RETURN_IF_ERROR(
+      CheckOutputStream(transfers_, std::filesystem::path(output_directory_) /
+                                        "transfer_perf_results.csv"));
+  ++transfer_count_;
+  transfer_ns_ += record.host_duration_ns;
+  transfer_read_bytes_ += record.physical_read_bytes;
+  transfer_write_bytes_ += record.physical_write_bytes;
+  transfer_record_ns_ += NowNs() - start;
+  return iree_ok_status();
+}
+
+void RuntimeProfiler::SetInvocationId(uint64_t id,
+                                      RuntimeInvocationPhase phase) {
+  if (enabled_)
+    current_context = id ? RuntimeProfileContext{this, id, 0, 0, false, phase}
+                         : RuntimeProfileContext{};
+}
+
+RuntimeProfileCommandScope::RuntimeProfileCommandScope(
+    RuntimeProfiler *profiler, uint64_t submission, uint64_t command,
+    bool within_dispatch)
+    : previous_(current_context) {
+  current_context = {profiler,
+                     previous_.profiler == profiler ? previous_.invocation : 0,
+                     submission,
+                     command,
+                     within_dispatch,
+                     previous_.profiler == profiler
+                         ? previous_.phase
+                         : RuntimeInvocationPhase::Unscoped};
+}
+RuntimeProfileCommandScope::~RuntimeProfileCommandScope() {
+  current_context = previous_;
+}
+
+RuntimeTransferScope::RuntimeTransferScope(RuntimeProfiler *profiler,
+                                           const char *operation)
+    : profiler_(profiler), previous_(current_transfer) {
+  if (!profiler || !profiler->enabled() || current_transfer)
+    return;
+  owns_record_ = true;
+  record_.host_start_ns = RuntimeProfiler::NowNs();
+  record_.operation = operation;
+  if (current_context.profiler == profiler) {
+    record_.invocation_id = current_context.invocation;
+    record_.submission_id = current_context.submission;
+    record_.command_ordinal = current_context.command;
+    record_.within_dispatch = current_context.within_dispatch;
+    record_.phase = current_context.phase;
+  }
+  current_transfer = this;
+}
+RuntimeTransferScope::~RuntimeTransferScope() {
+  if (owns_record_) {
+    if (!finished_)
+      iree_status_ignore(Finish(iree_status_from_code(IREE_STATUS_UNKNOWN)));
+    current_transfer = previous_;
+  }
+}
+void RuntimeTransferScope::Source(iree_hal_buffer_t *buffer, uint64_t offset,
+                                  uint64_t length) {
+  if (!owns_record_ || !buffer)
+    return;
+  record_.source_buffer_id =
+      reinterpret_cast<uintptr_t>(iree_hal_buffer_allocated_buffer(buffer));
+  record_.source_offset = iree_hal_buffer_byte_offset(buffer) + offset;
+  record_.requested_bytes = length;
+}
+void RuntimeTransferScope::Target(iree_hal_buffer_t *buffer, uint64_t offset,
+                                  uint64_t length) {
+  if (!owns_record_ || !buffer)
+    return;
+  record_.target_buffer_id =
+      reinterpret_cast<uintptr_t>(iree_hal_buffer_allocated_buffer(buffer));
+  record_.target_offset = iree_hal_buffer_byte_offset(buffer) + offset;
+  record_.requested_bytes = length;
+}
+iree_status_t RuntimeTransferScope::Finish(iree_status_t status) {
+  if (!owns_record_ || finished_)
+    return status;
+  finished_ = true;
+  record_.host_end_ns = RuntimeProfiler::NowNs();
+  record_.host_duration_ns = record_.host_end_ns - record_.host_start_ns;
+  record_.status_code = iree_status_code(status);
+  // A successful map/allocation transfers ownership to the caller. Do not turn
+  // it into a failure (and leak that ownership) because CSV output failed.
+  // Flush reports sticky stream errors at submission/invocation boundaries.
+  iree_status_ignore(profiler_->RecordTransfer(std::move(record_)));
+  return status;
+}
+RuntimeTransferRecord *RuntimeTransferScope::CurrentRecord() {
+  return current_transfer && !current_transfer->finished_
+             ? &current_transfer->record_
+             : nullptr;
+}
+void RuntimeTransferScope::ReadBytes(uint64_t bytes) {
+  if (auto *record = CurrentRecord())
+    record->physical_read_bytes += bytes;
+}
+void RuntimeTransferScope::WriteBytes(uint64_t bytes) {
+  if (auto *record = CurrentRecord())
+    record->physical_write_bytes += bytes;
+}
+RuntimeTransferStage::RuntimeTransferStage(RuntimeTransferStageKind kind)
+    : record_(RuntimeTransferScope::CurrentRecord()) {
+  if (!record_)
+    return;
+  uint64_t *durations[] = {&record_->map_ns,
+                           &record_->unmap_ns,
+                           &record_->allocation_ns,
+                           &record_->read_ns,
+                           &record_->write_ns,
+                           &record_->host_copy_ns,
+                           &record_->flush_ns,
+                           &record_->invalidate_ns,
+                           &record_->deallocation_ns,
+                           &record_->device_setup_ns,
+                           &record_->device_enqueue_wait_ns};
+  duration_ = durations[static_cast<size_t>(kind)];
+  previous_ = current_stage;
+  current_stage = this;
+  start_ = RuntimeProfiler::NowNs();
+}
+RuntimeTransferStage::~RuntimeTransferStage() {
+  if (!record_)
+    return;
+  const uint64_t elapsed = RuntimeProfiler::NowNs() - start_;
+  *duration_ += elapsed - children_ns_;
+  if (previous_ && previous_->record_ == record_)
+    previous_->children_ns_ += elapsed;
+  current_stage = previous_;
 }
 
 } // namespace iree::hal::tenstorrent

@@ -148,6 +148,71 @@ TEST_F(CopyTest, RecordedFillHandlesDirectAndIndirectSubranges) {
   EXPECT_EQ(actual, expected);
 }
 
+TEST_F(CopyTest, FillPatternsCrossPageBoundariesAndPreserveNeighbors) {
+  constexpr iree_device_size_t size = 4099;
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), TransferBufferParams(), size, &buffer));
+  std::vector<uint8_t> expected(size, 0xcc), actual(size);
+  IREE_ASSERT_OK(
+      iree_hal_buffer_map_write(buffer.get(), 0, expected.data(), size));
+  struct Case {
+    uint32_t offset, length, pattern;
+    uint32_t pattern_length;
+  };
+  const Case cases[] = {{2047, 3, 0xa5, 1},        {2046, 6, 0xff80, 2},
+                        {2044, 12, 0x89abcdef, 4}, {0, 1, 0x77, 1},
+                        {4098, 1, 0x88, 1},        {0, size, 0, 1}};
+  const iree_hal_semaphore_list_t none = {};
+  for (const auto &item : cases) {
+    SCOPED_TRACE(item.offset);
+    ApplyFill(expected, item.offset, item.length, &item.pattern,
+              item.pattern_length);
+    IREE_ASSERT_OK(iree_hal_device_queue_fill(
+        device_, IREE_HAL_QUEUE_AFFINITY_ANY, none, none, buffer.get(),
+        item.offset, item.length, &item.pattern, item.pattern_length,
+        IREE_HAL_FILL_FLAG_NONE));
+    IREE_ASSERT_OK(
+        iree_hal_buffer_map_read(buffer.get(), 0, actual.data(), size));
+    EXPECT_EQ(actual, expected);
+  }
+}
+
+TEST_F(CopyTest, RecordedFillRotatesPatternForUnalignedSubspanBase) {
+  constexpr iree_device_size_t size = 8192;
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  IREE_ASSERT_OK(iree_hal_allocator_allocate_buffer(
+      device_allocator(), TransferBufferParams(), size, &buffer));
+  std::vector<uint8_t> expected(size, 0xcc), actual(size);
+  IREE_ASSERT_OK(
+      iree_hal_buffer_map_write(buffer.get(), 0, expected.data(), size));
+  const uint32_t pattern = 0x12345678;
+  for (uint32_t offset : {1, 3, 31, 2047}) {
+    SCOPED_TRACE(offset);
+    iree::vm::ref<iree_hal_buffer_t> subspan;
+    IREE_ASSERT_OK(iree_hal_buffer_subspan(buffer.get(), offset, 4096,
+                                           host_allocator(), &subspan));
+    iree::vm::ref<iree_hal_command_buffer_t> commands;
+    IREE_ASSERT_OK(iree_hal_tt_device_create_command_buffer(
+        device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+        IREE_HAL_COMMAND_CATEGORY_TRANSFER, IREE_HAL_QUEUE_AFFINITY_ANY, 0,
+        &commands));
+    IREE_ASSERT_OK(iree_hal_command_buffer_begin(commands.get()));
+    IREE_ASSERT_OK(iree_hal_command_buffer_fill_buffer(
+        commands.get(), iree_hal_make_buffer_ref(subspan.get(), 0, 2060),
+        &pattern, sizeof(pattern), IREE_HAL_FILL_FLAG_NONE));
+    IREE_ASSERT_OK(iree_hal_command_buffer_end(commands.get()));
+    const iree_hal_semaphore_list_t none = {};
+    IREE_ASSERT_OK(iree_hal_device_queue_execute(
+        device_, IREE_HAL_QUEUE_AFFINITY_ANY, none, none, commands.get(),
+        iree_hal_buffer_binding_table_empty(), IREE_HAL_EXECUTE_FLAG_NONE));
+    ApplyFill(expected, offset, 2060, &pattern, sizeof(pattern));
+    IREE_ASSERT_OK(
+        iree_hal_buffer_map_read(buffer.get(), 0, actual.data(), size));
+    EXPECT_EQ(actual, expected);
+  }
+}
+
 TEST_F(CopyTest, RecordedUpdateSnapshotsHostData) {
   constexpr iree_device_size_t kBufferSize = 4096;
   constexpr iree_device_size_t kBindingOffset = 700;

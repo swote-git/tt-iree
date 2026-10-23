@@ -3,6 +3,7 @@
 
 #include "TenstorrentAOTCompiler.h"
 #include "TenstorrentNativeKernels.h"
+#include "iree/hal/drivers/tenstorrent/tt_fill_kernel.h"
 #include "iree/schema/tt_native_dispatch.h"
 
 #include <algorithm>
@@ -1067,6 +1068,23 @@ static bool compileDataMovementAOTKernel(
     error_message = "unknown tt-metal offline compiler failure";
     return false;
   }
+}
+
+bool compileFillAOT(TenstorrentAOTTargetArch target_arch,
+                    TenstorrentAOTKernelBundle &out_bundle,
+                    std::string &error_message) {
+  std::vector<uint32_t> args;
+  TensorAccessorArgs::create_dram_interleaved().append_to(args);
+  args.back() = 2048;
+  DataMovementConfig config{
+      .processor = DataMovementProcessor::RISCV_0,
+      .noc = NOC::RISCV_0_default,
+      .compile_args = std::move(args),
+  };
+  return compileDataMovementAOTKernel(
+      iree::hal::tenstorrent::kDeviceFillSource, config,
+      {{.cb_index = 0, .data_format = tt::DataFormat::UInt32}}, target_arch,
+      out_bundle, error_message);
 }
 
 bool compileAddAOT(TenstorrentAOTTargetArch target_arch,

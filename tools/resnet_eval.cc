@@ -13,6 +13,10 @@
 
 #include "iree/hal/buffer_transfer.h"
 #include "iree/runtime/api.h"
+#ifdef TT_IREE_EVAL_PROFILER
+#include "iree/hal/drivers/tenstorrent/tt_device.h"
+#include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
+#endif
 
 namespace {
 #ifdef TT_IREE_EVAL_MNIST
@@ -33,6 +37,20 @@ double Seconds(Clock::time_point start) {
 iree_status_t Evaluate(iree_runtime_session_t *session,
                        const std::string &input, const std::string &output,
                        size_t index, std::ostream &timings) {
+#ifdef TT_IREE_EVAL_PROFILER
+  auto *profiler =
+      iree_hal_tt_device_runtime_profiler(iree_runtime_session_device(session));
+  if (profiler)
+    profiler->SetInvocationId(
+        index + 1, iree::hal::tenstorrent::RuntimeInvocationPhase::Input);
+  struct InvocationScope {
+    iree::hal::tenstorrent::RuntimeProfiler *profiler;
+    ~InvocationScope() {
+      if (profiler)
+        profiler->SetInvocationId(0);
+    }
+  } invocation_scope{profiler};
+#endif
   auto start = Clock::now();
   std::vector<uint8_t> input_data(kInputBytes);
   std::ifstream input_stream(input, std::ios::binary);
@@ -63,10 +81,19 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
   iree_hal_buffer_view_release(arg);
   double input_seconds = Seconds(start);
   auto invoke_start = Clock::now();
+#ifdef TT_IREE_EVAL_PROFILER
+  if (profiler)
+    profiler->SetInvocationId(index + 1);
+#endif
   if (iree_status_is_ok(status)) {
     status = iree_runtime_call_invoke(&call, 0);
   }
   double invoke_seconds = Seconds(invoke_start);
+#ifdef TT_IREE_EVAL_PROFILER
+  if (profiler)
+    profiler->SetInvocationId(
+        index + 1, iree::hal::tenstorrent::RuntimeInvocationPhase::Output);
+#endif
   auto output_start = Clock::now();
   iree_hal_buffer_view_t *result = nullptr;
   if (iree_status_is_ok(status)) {
@@ -106,6 +133,10 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
   double output_seconds = Seconds(output_start);
   iree_hal_buffer_view_release(result);
   iree_runtime_call_deinitialize(&call);
+#ifdef TT_IREE_EVAL_PROFILER
+  if (profiler)
+    status = iree_status_join(status, profiler->Flush());
+#endif
   if (iree_status_is_ok(status)) {
     timings << index << ',' << input_seconds << ',' << invoke_seconds << ','
             << output_seconds << ',' << Seconds(start) << '\n';

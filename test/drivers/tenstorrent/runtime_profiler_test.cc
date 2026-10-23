@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
@@ -236,6 +237,136 @@ TEST(RuntimeProfilerTest, DisabledPreparationAndTimerAreNoOps) {
     EXPECT_EQ(stopped, duration);
   }
   EXPECT_GE(duration, 10u);
+}
+
+TEST(RuntimeProfilerTest,
+     TransferStagesAreExclusiveAndNestedScopesDoNotDuplicate) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_transfer_test_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "mock"));
+  profiler.SetInvocationId(7);
+  const auto submission = profiler.NextSubmissionId();
+  {
+    RuntimeProfileCommandScope command(&profiler, submission, 3);
+    RuntimeTransferScope fill(&profiler, "FILL");
+    {
+      RuntimeTransferStage map(RuntimeTransferStageKind::Map);
+      RuntimeTransferScope nested(&profiler, "MAP");
+      {
+        RuntimeTransferStage read(RuntimeTransferStageKind::Read);
+        RuntimeTransferScope::ReadBytes(4096);
+      }
+      IREE_ASSERT_OK(nested.Finish(iree_ok_status()));
+    }
+    {
+      RuntimeTransferStage unmap(RuntimeTransferStageKind::Unmap);
+      RuntimeTransferStage write(RuntimeTransferStageKind::Write);
+      RuntimeTransferScope::WriteBytes(4096);
+    }
+    const auto record = *RuntimeTransferScope::CurrentRecord();
+    EXPECT_EQ(record.invocation_id, 7u);
+    EXPECT_EQ(record.submission_id, submission);
+    EXPECT_EQ(record.command_ordinal, 3u);
+    EXPECT_FALSE(record.within_dispatch);
+    EXPECT_EQ(record.physical_read_bytes, 4096u);
+    EXPECT_EQ(record.physical_write_bytes, 4096u);
+    const auto stages =
+        record.map_ns + record.read_ns + record.unmap_ns + record.write_ns;
+    EXPECT_LE(stages, RuntimeProfiler::NowNs() - record.host_start_ns);
+    IREE_ASSERT_OK(fill.Finish(iree_ok_status()));
+  }
+  EXPECT_EQ(RuntimeTransferScope::CurrentRecord(), nullptr);
+  IREE_ASSERT_OK(profiler.Flush());
+  std::istringstream lines(ReadFile(directory / "transfer_perf_results.csv"));
+  std::string header, row, extra;
+  ASSERT_TRUE(static_cast<bool>(std::getline(lines, header)));
+  ASSERT_TRUE(static_cast<bool>(std::getline(lines, row)));
+  EXPECT_FALSE(static_cast<bool>(std::getline(lines, extra)));
+  EXPECT_EQ(CsvColumnCount(header), CsvColumnCount(row));
+  EXPECT_EQ(row.find("FILL,7,1,3,0,"), 0u);
+  const auto summary = ReadFile(directory / "run_results.json");
+  EXPECT_NE(summary.find("\"transfer_count\": 1,"), std::string::npos);
+  EXPECT_NE(summary.find("\"readfrombuffer_bytes\": 4096,"), std::string::npos);
+  EXPECT_NE(summary.find("\"writetobuffer_bytes\": 4096,"), std::string::npos);
+  profiler.SetInvocationId(0);
+  std::filesystem::remove_all(directory);
+}
+
+TEST(RuntimeProfilerTest, RestoresContextAndPreservesTransferFailure) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_transfer_context_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "mock"));
+  profiler.SetInvocationId(2);
+  {
+    RuntimeProfileCommandScope dispatch(&profiler, profiler.NextSubmissionId(),
+                                        4, true);
+    RuntimeTransferScope read(&profiler, "MAP");
+    EXPECT_TRUE(RuntimeTransferScope::CurrentRecord()->within_dispatch);
+    iree_status_t result =
+        read.Finish(iree_status_from_code(IREE_STATUS_OUT_OF_RANGE));
+    EXPECT_EQ(iree_status_code(result), IREE_STATUS_OUT_OF_RANGE);
+    iree_status_ignore(result);
+    RuntimeProfileRecord operation;
+    operation.op_type = "MATMUL";
+    IREE_ASSERT_OK(profiler.Record(operation));
+  }
+  {
+    RuntimeTransferScope outside(&profiler, "ALLOCATE");
+    EXPECT_EQ(RuntimeTransferScope::CurrentRecord()->submission_id, 0u);
+    EXPECT_EQ(RuntimeTransferScope::CurrentRecord()->invocation_id, 2u);
+    EXPECT_FALSE(RuntimeTransferScope::CurrentRecord()->within_dispatch);
+    IREE_ASSERT_OK(outside.Finish(iree_ok_status()));
+  }
+  IREE_ASSERT_OK(profiler.Flush());
+  const auto operations = ReadFile(directory / "ops_perf_results.csv");
+  EXPECT_NE(operations.find(",2,1,4\n"), std::string::npos);
+  const auto transfers = ReadFile(directory / "transfer_perf_results.csv");
+  EXPECT_NE(transfers.find("MAP,2,1,4,1,"), std::string::npos);
+  EXPECT_NE(transfers.find(",11,invoke,0\n"),
+            std::string::npos); // OUT_OF_RANGE
+  profiler.SetInvocationId(0);
+  std::filesystem::remove_all(directory);
+}
+
+TEST(RuntimeProfilerTest,
+     InvocationContextIsThreadLocalAndSubmissionIdsAreUnique) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_transfer_threads_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "mock"));
+  auto record = [&](uint64_t invocation) {
+    profiler.SetInvocationId(invocation);
+    RuntimeProfileCommandScope command(&profiler, profiler.NextSubmissionId(),
+                                       0);
+    RuntimeTransferScope transfer(&profiler, "UPDATE");
+    EXPECT_EQ(RuntimeTransferScope::CurrentRecord()->invocation_id, invocation);
+    IREE_ASSERT_OK(transfer.Finish(iree_ok_status()));
+  };
+  std::thread first(record, 10), second(record, 20);
+  first.join();
+  second.join();
+  EXPECT_EQ(profiler.NextSubmissionId(), 3u);
+  IREE_ASSERT_OK(profiler.Flush());
+  const auto summary = ReadFile(directory / "run_results.json");
+  EXPECT_NE(summary.find("\"transfer_count\": 2,"), std::string::npos);
+  std::filesystem::remove_all(directory);
+}
+
+TEST(RuntimeProfilerTest, DisabledTransfersDoNotCreateRecords) {
+  RuntimeProfiler profiler;
+  profiler.SetInvocationId(1);
+  EXPECT_EQ(profiler.NextSubmissionId(), 0u);
+  RuntimeTransferScope transfer(&profiler, "FILL");
+  RuntimeTransferStage stage(RuntimeTransferStageKind::Read);
+  RuntimeTransferScope::ReadBytes(4096);
+  EXPECT_EQ(RuntimeTransferScope::CurrentRecord(), nullptr);
+  IREE_ASSERT_OK(transfer.Finish(iree_ok_status()));
+  IREE_ASSERT_OK(profiler.Flush());
 }
 
 } // namespace
