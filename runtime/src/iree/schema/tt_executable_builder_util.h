@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "iree/base/api.h"
+#include "iree/schema/tt_spatial_plan.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,9 @@ extern "C" {
 #define TT_IREE_TTEX_VERSION_16 16u
 #define TT_IREE_TTEX_VERSION_17 17u
 #define TT_IREE_TTEX_VERSION_18 18u
+// Opt-in metadata contract. Production emission stays at the executable v18
+// baseline until the runtime can honor spatial resource/dataflow requirements.
+#define TT_IREE_TTEX_VERSION_19 19u
 #define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_18
 
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
@@ -340,6 +344,7 @@ typedef struct tt_iree_ttex_entry_point_desc_t {
   tt_iree_ttex_linear_desc_t linear;
   tt_iree_ttex_bf16_native_desc_t bf16_native;
   const tt_iree_ttex_aot_kernel_bundle_desc_t *aot_kernel_bundle;
+  const tt_iree_spatial_plan_t *spatial_plan;
 } tt_iree_ttex_entry_point_desc_t;
 
 // Builds a complete TTEX FlatBuffer from the given entry point descriptors.
@@ -356,8 +361,8 @@ iree_status_t tt_iree_build_ttex_executable_def(
     const tt_iree_ttex_entry_point_desc_t *entry_points,
     iree_byte_span_t *out_data);
 
-// Builds a TTEX blob with an explicit version. Intended for compatibility
-// tests; production serializers should use the current-version wrapper above.
+// Builds a TTEX blob with an explicit version, including opt-in v19 spatial
+// contracts. Existing serializers retain their operation-specific v15-v18 ABIs.
 iree_status_t tt_iree_build_ttex_executable_def_with_version(
     iree_allocator_t allocator, uint32_t version,
     iree_host_size_t entry_point_count,

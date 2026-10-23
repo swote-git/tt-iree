@@ -59,6 +59,80 @@ static bool tt_iree_aot_artifact_path_is_safe(const char *path_cstr) {
   return true;
 }
 
+static ns(SpatialPlanDef_ref_t)
+    tt_iree_build_spatial_plan(flatcc_builder_t *builder,
+                               const tt_iree_spatial_plan_t &plan) {
+  std::vector<ns(SpatialCoreDef_ref_t)> cores;
+  for (iree_host_size_t i = 0; i < plan.core_count; ++i) {
+    const auto &core = plan.cores[i];
+    auto ref =
+        ns(SpatialCoreDef_create)(builder, core.x, core.y, core.kernel_roles);
+    if (!ref)
+      return 0;
+    cores.push_back(ref);
+  }
+  auto core_refs =
+      ns(SpatialCoreDef_vec_create)(builder, cores.data(), cores.size());
+  if (!core_refs)
+    return 0;
+  std::vector<ns(SpatialResourceDef_ref_t)> resources;
+  for (iree_host_size_t i = 0; i < plan.resource_count; ++i) {
+    const auto &resource = plan.resources[i];
+    std::vector<ns(SpatialShardDef_ref_t)> shards;
+    for (iree_host_size_t j = 0; j < resource.shard_count; ++j) {
+      const auto &shard = resource.shards[j];
+      auto ref = ns(SpatialShardDef_create)(
+          builder, shard.core, shard.logical_byte_offset, shard.byte_length,
+          shard.arena_byte_offset);
+      if (!ref)
+        return 0;
+      shards.push_back(ref);
+    }
+    auto shard_refs =
+        ns(SpatialShardDef_vec_create)(builder, shards.data(), shards.size());
+    if (!shard_refs)
+      return 0;
+    auto ref = ns(SpatialResourceDef_create)(
+        builder, resource.binding, resource.binding_byte_offset,
+        resource.byte_length, resource.element_type, resource.storage,
+        resource.memory_space, resource.sharding, resource.lifetime,
+        resource.resource_key, resource.first_epoch, resource.last_epoch,
+        resource.alignment, shard_refs);
+    if (!ref)
+      return 0;
+    resources.push_back(ref);
+  }
+  auto resource_refs = ns(SpatialResourceDef_vec_create)(
+      builder, resources.data(), resources.size());
+  if (!resource_refs)
+    return 0;
+  std::vector<ns(SpatialRouteDef_ref_t)> routes;
+  for (iree_host_size_t i = 0; i < plan.route_count; ++i) {
+    const auto &route = plan.routes[i];
+    auto receivers = flatbuffers_uint32_vec_create(
+        builder, route.destination_shards, route.destination_count);
+    auto dependencies = flatbuffers_uint32_vec_create(
+        builder, route.dependencies, route.dependency_count);
+    if (!receivers || !dependencies)
+      return 0;
+    auto ref = ns(SpatialRouteDef_create)(
+        builder, route.transfer, route.noc, route.epoch, route.source_resource,
+        route.source_shard, route.source_byte_offset,
+        route.destination_resource, receivers, route.destination_byte_offset,
+        route.byte_length, dependencies);
+    if (!ref)
+      return 0;
+    routes.push_back(ref);
+  }
+  auto route_refs =
+      ns(SpatialRouteDef_vec_create)(builder, routes.data(), routes.size());
+  if (!route_refs)
+    return 0;
+  return ns(SpatialPlanDef_create)(builder, plan.epoch_count,
+                                   plan.l1_bytes_per_core, core_refs,
+                                   resource_refs, route_refs);
+}
+
 iree_status_t tt_iree_build_ttex_executable_def(
     iree_allocator_t allocator, iree_host_size_t entry_point_count,
     const tt_iree_ttex_entry_point_desc_t *entry_points,
@@ -81,6 +155,19 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
   if (entry_point_count > 0 && !entry_points) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "entry_points is null with count > 0");
+  }
+
+  for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
+    const auto &ep = entry_points[i];
+    if ((ep.spatial_plan != nullptr) != (version == TT_IREE_TTEX_VERSION_19)) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX spatial plans require opt-in v19, with a plan on every export");
+    }
+    if (ep.spatial_plan) {
+      IREE_RETURN_IF_ERROR(
+          tt_iree_validate_spatial_plan(ep.spatial_plan, ep.binding_count));
+    }
   }
 
   flatcc_builder_t builder;
@@ -119,12 +206,22 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
   std::vector<ns(LinearDef_ref_t)> linear_refs(entry_point_count, 0);
   std::vector<ns(TTMetalKernelBundleDef_ref_t)> aot_bundle_refs(
       entry_point_count, 0);
+  std::vector<ns(SpatialPlanDef_ref_t)> spatial_plan_refs(entry_point_count, 0);
   // Views borrow the caller's immutable payloads only during this build. Hash
   // collisions are resolved by full byte equality, never by hash alone.
   std::unordered_map<std::string_view, flatbuffers_uint8_vec_ref_t>
       artifact_data_refs;
   for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
     const tt_iree_ttex_entry_point_desc_t *ep = &entry_points[i];
+    if (ep->spatial_plan) {
+      spatial_plan_refs[i] =
+          tt_iree_build_spatial_plan(&builder, *ep->spatial_plan);
+      if (!spatial_plan_refs[i]) {
+        flatcc_builder_clear(&builder);
+        return iree_make_status(IREE_STATUS_INTERNAL,
+                                "failed to build spatial plan");
+      }
+    }
     if (!tt_iree_ttex_builtin_matches_dispatch_kind(ep->builtin_program,
                                                     ep->dispatch_kind)) {
       flatcc_builder_clear(&builder);
@@ -258,14 +355,19 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
 
     if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
       bool tensix = ep->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
-      if ((version != TT_IREE_TTEX_VERSION_17 && version != TT_IREE_TTEX_VERSION_18) ||
-          (tensix && (version != TT_IREE_TTEX_VERSION_18 ||
-           !(ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
-             ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
-             ep->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR)))) {
+      if ((version < TT_IREE_TTEX_VERSION_17 ||
+           version > TT_IREE_TTEX_VERSION_19) ||
+          (tensix && (version < TT_IREE_TTEX_VERSION_18 ||
+                      !(ep->bf16_native.operation_kind ==
+                            TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+                        ep->bf16_native.operation_kind ==
+                            TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+                        ep->bf16_native.operation_kind ==
+                            TT_IREE_TTEX_DISPATCH_KIND_LINEAR)))) {
         flatcc_builder_clear(&builder);
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17/v18; Tensix requires v18 matrix dispatch");
+                                "BF16 native requires v17-v19; Tensix requires "
+                                "v18+ matrix dispatch");
       }
     }
     bool is_matmul_like =
@@ -744,6 +846,8 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
     ns(EntryPointDef_builtin_n_tiles_add(&builder, ep->builtin_n_tiles));
     ns(EntryPointDef_builtin_k_tiles_add(&builder, ep->builtin_k_tiles));
     ns(EntryPointDef_dispatch_kind_add(&builder, ep->dispatch_kind));
+    if (spatial_plan_refs[i])
+      ns(EntryPointDef_spatial_plan_add(&builder, spatial_plan_refs[i]));
     if (bf16_ref)
       ns(EntryPointDef_bf16_native_add(&builder, bf16_ref));
     if (matmul_like_refs[i]) {

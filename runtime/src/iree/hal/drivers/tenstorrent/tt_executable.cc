@@ -1774,7 +1774,8 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       version != TT_IREE_TTEX_VERSION_15 &&
       version != TT_IREE_TTEX_VERSION_16 &&
       version != TT_IREE_TTEX_VERSION_17 &&
-      version != TT_IREE_TTEX_VERSION_18) {
+      version != TT_IREE_TTEX_VERSION_18 &&
+      version != TT_IREE_TTEX_VERSION_19) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
         "unsupported TTEX version %u (runtime supports versions %u-%u)",
@@ -1791,6 +1792,25 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "TTEX contains 0 entry points");
   }
+  // Spatial requirements must never be silently ignored by legacy program
+  // builders, including mock mode. Reject before allocation or Metal setup.
+  for (iree_host_size_t i = 0; i < ep_count; ++i) {
+    auto fb_ep = ttex_ns(EntryPointDef_vec_at(eps, i));
+    auto plan = ttex_ns(EntryPointDef_spatial_plan(fb_ep));
+    if ((plan != nullptr) != (version == TT_IREE_TTEX_VERSION_19))
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "TTEX spatial plans require v19 and a plan on every export");
+    if (plan) {
+      IREE_RETURN_IF_ERROR(tt_iree_validate_spatial_plan_table(
+          plan, ttex_ns(EntryPointDef_binding_count(fb_ep))));
+    }
+  }
+  if (version == TT_IREE_TTEX_VERSION_19)
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "TTEX v19 spatial plan is valid but spatial execution, L1 residency "
+        "leases and NoC dependency lowering are not implemented");
   for (iree_host_size_t i = 0; i < ep_count; ++i) {
     ttex_ns(EntryPointDef_table_t) fb_ep =
         ttex_ns(EntryPointDef_vec_at(eps, i));

@@ -417,7 +417,7 @@ TEST(TtexSchemaTest, BuildExplicitVersion) {
   ep.workgroup_size[2] = 1;
   ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
 
-  constexpr uint32_t kFutureVersion = TT_IREE_TTEX_CURRENT_VERSION + 1;
+  constexpr uint32_t kFutureVersion = TT_IREE_TTEX_VERSION_19 + 1;
   iree_byte_span_t data = {0};
   IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
       alloc, kFutureVersion, 1, &ep, &data));

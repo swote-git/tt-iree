@@ -86,6 +86,9 @@ endif()
 # Expand the schema target's include dirs without adding it to IREE's install
 # export set.
 if(TARGET tt_executable_def_c_fbs)
+  # Share validation with the descriptor builder without pulling HAL/Metal
+  # dependencies into the schema library or requiring headers in non-TTEX builds.
+  target_sources(iree_hal_tenstorrent PRIVATE ../../../schema/tt_spatial_plan.cc)
   target_include_directories(iree_hal_tenstorrent PRIVATE
     $<TARGET_PROPERTY:tt_executable_def_c_fbs,INTERFACE_INCLUDE_DIRECTORIES>
   )

@@ -121,6 +121,13 @@ tt_iree_hal_test(
 )
 
 tt_iree_hal_test(
+  NAME spatial_plan_test
+  SRCS spatial_plan_test.cc
+  DEPS tt_executable_builder_util
+)
+set_tests_properties(tt_spatial_plan_test PROPERTIES LABELS "tt-iree;unit;abi;spatial")
+
+tt_iree_hal_test(
   NAME buffer_test
   SRCS buffer_test.cc
 )

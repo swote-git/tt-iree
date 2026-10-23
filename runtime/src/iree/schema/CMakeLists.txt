@@ -62,6 +62,8 @@ target_include_directories(tt_executable_def_c_fbs INTERFACE
 add_library(tt_executable_builder_util STATIC
   tt_executable_builder_util.cc
   tt_executable_builder_util.h
+  tt_spatial_plan.cc
+  tt_spatial_plan.h
 )
 
 target_link_libraries(tt_executable_builder_util

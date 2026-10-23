@@ -13,7 +13,7 @@
 // Extension roadmap:
 //   Phase A: BuiltinProgram enum selects hardcoded PoC programs
 //   Phase B (current): Embed compiler-generated kernel sources and AOT artifacts
-//   Phase C: Add ttnn_op_desc table (op name + attrs + tensor layout)
+//   Phase C: Explicit spatial resource/dataflow contracts (v19, metadata only)
 //   Phase D: Add binary cache hash, profile/trace metadata
 
 namespace iree.tenstorrent.hal;
@@ -314,6 +314,69 @@ table BF16NativeDef {
   tensors:[TensorDesc];
 }
 
+// v19 describes a required execution contract, never an advisory optimization.
+// Current program builders cannot execute these plans and must reject them.
+// Existing compilers keep emitting v15-v18 without this optional table.
+enum SpatialMemorySpace : uint8 { UNKNOWN = 0, DRAM = 1, L1 = 2 }
+enum SpatialSharding : uint8 { NONE = 0, PARTITIONED = 1, REPLICATED = 2 }
+enum SpatialStorage : uint8 { LINEAR = 0, TILE_32X32_FACE = 1 }
+enum SpatialLifetime : uint8 { DISPATCH = 0, SESSION = 1 }
+enum SpatialTransfer : uint8 { READ = 0, WRITE = 1, MULTICAST = 2 }
+
+table SpatialCoreDef {
+  x:uint16;
+  y:uint16;
+  kernel_roles:uint32;
+}
+
+table SpatialShardDef {
+  core:uint32 = 4294967295;
+  logical_byte_offset:uint64;
+  byte_length:uint64;
+  arena_byte_offset:uint64;
+}
+
+table SpatialResourceDef {
+  binding:uint32 = 4294967295;
+  binding_byte_offset:uint64;
+  byte_length:uint64;
+  element_type:TensorElementType = UNKNOWN;
+  storage:SpatialStorage = LINEAR;
+  memory_space:SpatialMemorySpace = UNKNOWN;
+  sharding:SpatialSharding = NONE;
+  lifetime:SpatialLifetime = DISPATCH;
+  resource_key:uint64;
+  first_epoch:uint32;
+  last_epoch:uint32;
+  alignment:uint32;
+  shards:[SpatialShardDef];
+}
+
+table SpatialRouteDef {
+  transfer:SpatialTransfer = READ;
+  noc:uint8;
+  epoch:uint32;
+  source_resource:uint32;
+  source_shard:uint32;
+  source_byte_offset:uint64;
+  destination_resource:uint32;
+  destination_shards:[uint32];
+  destination_byte_offset:uint64;
+  byte_length:uint64;
+  dependencies:[uint32];
+}
+
+// Indices refer only to this plan. Epochs are ordered internal program phases,
+// NOT IREE dispatch ordinals/timepoints. SESSION keys require a future runtime
+// resource registry/lease protocol; this table cannot extend HAL buffer lifetime.
+table SpatialPlanDef {
+  epoch_count:uint32;
+  l1_bytes_per_core:uint64;
+  cores:[SpatialCoreDef];
+  resources:[SpatialResourceDef];
+  routes:[SpatialRouteDef];
+}
+
 table EntryPointDef {
   // HAL export name (used for ordinal mapping / debug).
   name:string;
@@ -369,6 +432,9 @@ table EntryPointDef {
   linear:LinearDef;
   bf16_native:BF16NativeDef;
 
+  // Append-only v19 execution contract; never valid on v1-v18 payloads.
+  spatial_plan:SpatialPlanDef;
+
   // --- Phase C extension point (TTNN high-level op) ---
   // ttnn_op:TTNNOpDesc;  // op_type + input/output tensor descs + attrs
 }
@@ -380,7 +446,8 @@ table EntryPointDef {
 table ExecutableDef {
   // Schema version. Keep the default at 0 forever so old blobs with an absent
   // field remain distinguishable. The compiler emits v15 for F32 and v17 for
-  // native BF16; the runtime accepts v1-v17. v13 adds descriptor-specialized
+  // native BF16. Execution supports v1-v18; v19 spatial plans are validated
+  // but rejected until a spatial executor is implemented. v13 adds specialized
   // native matrix kernels and single-reader pooling/reduction/division kernels.
   // v14 adds BF16 component CBs 4-7 and six-product FP32 accumulation/output.
   // v15 native F32 matrices use one reader-role device FP32 kernel and bounded
