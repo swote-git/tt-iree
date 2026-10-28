@@ -9,6 +9,7 @@
 #include "iree/base/api.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
 #include "iree/schema/tt_executable_builder_util.h"
+#include "iree/schema/tt_native_dispatch.h"
 
 //===----------------------------------------------------------------------===//
 // Data Structures
@@ -455,20 +456,34 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
   const iree_hal_tt_kernel_params_t *kernel_params = nullptr;
   IREE_RETURN_IF_ERROR(iree_hal_tt_executable_lookup_kernel_params(
       executable, export_ordinal, &kernel_params));
+  const bool native_matrix_grid =
+      kernel_params && kernel_params->ttex_version >= TT_IREE_TTEX_VERSION_13 &&
+      kernel_params->aot_kernel_bundle &&
+      tt_iree_ttex_is_native_matrix_kind(kernel_params->dispatch_kind);
   bool is_multicore_compute =
-      kernel_params && ((kernel_params->dispatch_kind ==
-                             TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
-                         (kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
-                          kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
-                          kernel_params->bf16_native.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR)) ||
-                        kernel_params->builtin_program ==
-                            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED ||
-                        kernel_params->builtin_program ==
-                            TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE ||
-                        kernel_params->builtin_program ==
-                            TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D ||
-                        kernel_params->builtin_program ==
-                            TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR);
+      kernel_params &&
+      ((kernel_params->dispatch_kind ==
+            TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
+        (kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY ||
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_LINEAR)) ||
+       (kernel_params->ttex_version >= TT_IREE_TTEX_VERSION_13 &&
+        kernel_params->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) ||
+       kernel_params->builtin_program ==
+           TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED ||
+       kernel_params->builtin_program ==
+           TT_IREE_TTEX_BUILTIN_PROGRAM_F32_MATMUL_LIKE ||
+       kernel_params->builtin_program ==
+           TT_IREE_TTEX_BUILTIN_PROGRAM_F32_CONV2D ||
+       kernel_params->builtin_program ==
+           TT_IREE_TTEX_BUILTIN_PROGRAM_F32_LINEAR);
   if (is_multicore_compute && config.workgroup_count[2] != 1) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
@@ -575,10 +590,11 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
         IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_binding_range(tensor, "BF16 native tensor", bindings));
       }
     }
-    if (is_multicore_compute) {
+    if (tt_iree_ttex_is_native_matrix_kind(
+            kernel_params->bf16_native.operation_kind)) {
       uint32_t mt = kernel_params->bf16_native.m / 32 + (kernel_params->bf16_native.m % 32 != 0);
       uint32_t nt = kernel_params->bf16_native.n / 32 + (kernel_params->bf16_native.n % 32 != 0);
-      if (mt % config.workgroup_count[1] || nt % config.workgroup_count[0])
+      if (config.workgroup_count[1] > mt || config.workgroup_count[0] > nt)
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native grid cannot partition output tiles");
     }
     return iree_ok_status();
@@ -616,11 +632,14 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
     constexpr uint32_t kTileSize = 32;
     uint32_t m_tiles = (matmul.m + kTileSize - 1) / kTileSize;
     uint32_t n_tiles = (matmul.n + kTileSize - 1) / kTileSize;
-    if (m_tiles % config.workgroup_count[1] != 0 ||
-        n_tiles % config.workgroup_count[0] != 0) {
+    if (native_matrix_grid
+            ? (config.workgroup_count[1] > m_tiles ||
+               config.workgroup_count[0] > n_tiles)
+            : (m_tiles % config.workgroup_count[1] != 0 ||
+               n_tiles % config.workgroup_count[0] != 0)) {
       return iree_make_status(
           IREE_STATUS_INVALID_ARGUMENT,
-          "workgroup grid %ux%u does not evenly partition F32 matmul output "
+          "workgroup grid %ux%u cannot partition F32 matmul output "
           "tiles %ux%u",
           config.workgroup_count[0], config.workgroup_count[1], n_tiles,
           m_tiles);
@@ -651,11 +670,14 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
     uint64_t n_tiles =
         (static_cast<uint64_t>(conv2d.output.shape[0]) + kTileSize - 1) /
         kTileSize;
-    if (m_tiles % config.workgroup_count[1] != 0 ||
-        n_tiles % config.workgroup_count[0] != 0) {
+    if (native_matrix_grid
+            ? (config.workgroup_count[1] > m_tiles ||
+               config.workgroup_count[0] > n_tiles)
+            : (m_tiles % config.workgroup_count[1] != 0 ||
+               n_tiles % config.workgroup_count[0] != 0)) {
       return iree_make_status(
           IREE_STATUS_INVALID_ARGUMENT,
-          "workgroup grid %ux%u does not evenly partition F32 convolution "
+          "workgroup grid %ux%u cannot partition F32 convolution "
           "output tiles %" PRIu64 "x%" PRIu64,
           config.workgroup_count[0], config.workgroup_count[1], n_tiles,
           m_tiles);
@@ -707,11 +729,14 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
     constexpr uint32_t kTileSize = 32;
     uint32_t m_tiles = (desc.m + kTileSize - 1) / kTileSize;
     uint32_t n_tiles = (desc.n + kTileSize - 1) / kTileSize;
-    if (m_tiles % config.workgroup_count[1] != 0 ||
-        n_tiles % config.workgroup_count[0] != 0) {
+    if (native_matrix_grid
+            ? (config.workgroup_count[1] > m_tiles ||
+               config.workgroup_count[0] > n_tiles)
+            : (m_tiles % config.workgroup_count[1] != 0 ||
+               n_tiles % config.workgroup_count[0] != 0)) {
       return iree_make_status(
           IREE_STATUS_INVALID_ARGUMENT,
-          "workgroup grid %ux%u does not evenly partition linear tiles %ux%u",
+          "workgroup grid %ux%u cannot partition linear tiles %ux%u",
           config.workgroup_count[0], config.workgroup_count[1], n_tiles,
           m_tiles);
     }

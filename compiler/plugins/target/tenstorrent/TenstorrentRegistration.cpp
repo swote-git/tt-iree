@@ -42,6 +42,11 @@ struct TenstorrentOptions {
         llvm::cl::desc("Use v18 BF16 HiFi4 Tensix contractions instead of "
                        "v17 device-RISC-V FP32; preserve IR epilogue rounding"));
     binder.opt<bool>(
+        "iree-tenstorrent-native-bf16-reuse-output-tiles", nativeBF16ReuseOutputTiles,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Reuse BF16 operands across pairs of output tiles using "
+                       "the existing two-page CBs; requires BF16 Tensix"));
+    binder.opt<bool>(
         "iree-tenstorrent-native-f32-use-tensix", nativeF32UseTensix,
         llvm::cl::cat(category),
         llvm::cl::desc("Use experimental v16 INT8-digit Tensix math instead "
@@ -52,6 +57,7 @@ struct TenstorrentOptions {
   bool dumpTTEX = false;
   bool nativeF32UseTensix = false;
   bool nativeBF16UseTensix = false;
+  bool nativeBF16ReuseOutputTiles = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -77,6 +83,7 @@ struct TenstorrentSession
       opts.dumpTTEX = options.dumpTTEX;
       opts.nativeF32UseTensix = options.nativeF32UseTensix;
       opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
+      opts.nativeBF16ReuseOutputTiles = options.nativeBF16ReuseOutputTiles;
       return std::make_shared<IREE::HAL::TenstorrentTargetDevice>(opts);
     });
   }
@@ -89,6 +96,7 @@ struct TenstorrentSession
       opts.dumpTTEX = options.dumpTTEX;
       opts.nativeF32UseTensix = options.nativeF32UseTensix;
       opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
+      opts.nativeBF16ReuseOutputTiles = options.nativeBF16ReuseOutputTiles;
       return std::make_shared<IREE::HAL::TenstorrentTargetBackend>(opts);
     });
   }

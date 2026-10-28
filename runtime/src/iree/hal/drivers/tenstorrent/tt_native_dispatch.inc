@@ -77,10 +77,10 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
   uint32_t cols = cmd.config.workgroup_count[0],
            rows = cmd.config.workgroup_count[1];
   auto grid = idevice->compute_with_storage_grid_size();
-  uint32_t mt = (m + 31) / 32, nt = (n + 31) / 32;
+  uint32_t mt = m / 32 + (m % 32 != 0), nt = n / 32 + (n % 32 != 0);
   if (!cols || !rows || cols > grid.x || rows > grid.y ||
       cmd.config.workgroup_count[2] != 1 ||
-      (matrix && (nt % cols || mt % rows)))
+      (matrix && (cols > nt || rows > mt)))
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "native grid cannot partition dispatch");
   try {
@@ -170,20 +170,36 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
         tt::tt_metal::CoreCoord core{c, r};
         auto core_args = args;
         if (matrix) {
-          core_args.insert(core_args.end(), {r * (mt / rows), c * (nt / cols),
-                                             mt / rows, nt / cols});
+          iree::hal::tenstorrent::NativeTileRectangle partition;
+          if (!iree::hal::tenstorrent::PartitionNativeMatrixTiles(
+                  mt, nt, r, c, rows, cols, &partition) ||
+              uint64_t(partition.m_count) * partition.n_count > UINT32_MAX)
+            return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                    "invalid native matrix tile partition");
+          core_args.insert(core_args.end(),
+                           {partition.m_begin, partition.n_begin,
+                            partition.m_count, partition.n_count});
           if (uses_tensix) {
             tt::tt_metal::SetRuntimeArgs(program, writer, core, core_args);
             tt::tt_metal::SetRuntimeArgs(
                 program, compute, core,
-                {(mt / rows) * (nt / cols), (k + 31) / 32});
+                {partition.m_count * partition.n_count,
+                 k / 32 + (k % 32 != 0)});
           }
         } else {
           uint32_t ordinal = r * cols + c, total = rows * cols;
-          uint32_t begin = static_cast<uint64_t>(elements) * ordinal / total;
-          uint32_t end =
-              static_cast<uint64_t>(elements) * (ordinal + 1) / total;
-          core_args.insert(core_args.end(), {begin, end - begin, ordinal});
+          const uint8_t kind = bf16_native ? ep.bf16_native.operation_kind
+                                           : ep.dispatch_kind;
+          uint32_t width = (t[2]->rank &&
+              (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+               kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY))
+                  ? t[2]->shape[t[2]->rank - 1] : 1;
+          iree::hal::tenstorrent::NativeElementRange partition;
+          if (!iree::hal::tenstorrent::PartitionNativeScalarRange(
+                  elements, width, ordinal, total, &partition))
+            return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                    "invalid native scalar row partition");
+          core_args.insert(core_args.end(), {partition.begin, partition.count, ordinal});
         }
         tt::tt_metal::SetRuntimeArgs(program, reader, core, core_args);
       }

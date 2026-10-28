@@ -26,6 +26,7 @@ struct TenstorrentTargetOptions {
   bool dumpTTEX = false;   // dump TTEX binary for debugging
   bool nativeF32UseTensix = false; // experimental INT8-digit v16 path
   bool nativeBF16UseTensix = false; // v18 HiFi4 contraction, IR epilogue
+  bool nativeBF16ReuseOutputTiles = false; // opt-in two-output operand reuse
 };
 
 //===----------------------------------------------------------------------===//

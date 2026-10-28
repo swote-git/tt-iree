@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/schema/tt_executable_builder_util.h"
+#include "iree/schema/tt_bf16_native_validation.h"
 
 #include <string.h>
 
@@ -159,6 +160,19 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
 
   for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
     const auto &ep = entry_points[i];
+    if (version == TT_IREE_TTEX_VERSION_20 &&
+        ep.dispatch_kind != TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "TTEX v20 is reserved for BF16 native dispatches");
+    if (ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
+      IREE_RETURN_IF_ERROR(
+          tt_iree_validate_bf16_layout_version(&ep.bf16_native, version));
+      if (version == TT_IREE_TTEX_VERSION_20) {
+        IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_native_v20(
+            &ep.bf16_native, ep.builtin_program, ep.binding_count,
+            ep.constant_count));
+      }
+    }
     if ((ep.spatial_plan != nullptr) != (version == TT_IREE_TTEX_VERSION_19)) {
       return iree_make_status(
           IREE_STATUS_INVALID_ARGUMENT,
@@ -356,7 +370,7 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
     if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
       bool tensix = ep->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
       if ((version < TT_IREE_TTEX_VERSION_17 ||
-           version > TT_IREE_TTEX_VERSION_19) ||
+           version > TT_IREE_TTEX_MAX_KNOWN_VERSION) ||
           (tensix && (version < TT_IREE_TTEX_VERSION_18 ||
                       !(ep->bf16_native.operation_kind ==
                             TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
@@ -366,7 +380,7 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
                             TT_IREE_TTEX_DISPATCH_KIND_LINEAR)))) {
         flatcc_builder_clear(&builder);
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17-v19; Tensix requires "
+                                "BF16 native requires v17-v20; Tensix requires "
                                 "v18+ matrix dispatch");
       }
     }

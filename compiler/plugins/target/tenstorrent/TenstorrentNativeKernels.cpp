@@ -3,6 +3,7 @@
 #include "TenstorrentNativeKernels.h"
 
 #include "iree/schema/tt_native_dispatch.h"
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -87,12 +88,53 @@ constexpr auto accessor_0 = TensorAccessorArgs<0>();
 
 std::string coords(const tt_iree_ttex_tensor_desc_t &d, const std::string &m,
                    const std::string &n) {
+  if (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW)
+    return m + "/" + std::to_string(uint64_t(d.shape[2]) * d.shape[3]) +
+           "u," + n + ",(" + m + "/" + std::to_string(d.shape[3]) +
+           "u)%" + std::to_string(d.shape[2]) + "u," + m + "%" +
+           std::to_string(d.shape[3]) + "u";
+  if (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)
+    return m + "/" + std::to_string(d.shape[2]) + "u," + n + "," +
+           m + "%" + std::to_string(d.shape[2]) + "u";
   if (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW)
     return n + "," + m + "/" + std::to_string(d.shape[2]) + "u," + m + "%" +
            std::to_string(d.shape[2]) + "u";
   if (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR)
     return n + "," + m;
   return m + "," + n;
+}
+
+std::string coordinatePadding(const tt_iree_ttex_tensor_desc_t &d) {
+  std::string padding;
+  for (unsigned i = d.rank; i < 4; ++i)
+    padding += ",0";
+  return padding;
+}
+
+bool isSpatial(const tt_iree_ttex_tensor_desc_t &d) {
+  return (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW && d.rank == 3) ||
+         (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW && d.rank == 4);
+}
+
+// Geometry M flattens batch and spatial positions, never the channel reduction.
+void convolutionCoordinates(const tt_iree_ttex_conv2d_desc_t &c,
+                            uint32_t &m, uint32_t &n, uint32_t &k,
+                            std::string &lhs) {
+  const bool batched = c.input.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW;
+  unsigned channel = batched ? 1 : 0;
+  uint32_t height = c.output.shape[channel + 1];
+  uint32_t width = c.output.shape[channel + 2];
+  m = height * width * (batched ? c.output.shape[0] : 1);
+  n = c.output.shape[channel];
+  k = c.input.shape[channel] * c.kernel_h * c.kernel_w;
+  lhs = batched ? "m/" + std::to_string(uint64_t(height) * width) + "u," : "";
+  lhs += "ic,(m/" + std::to_string(width) + "u)";
+  if (batched)
+    lhs += "%" + std::to_string(height) + "u";
+  lhs += "*" + std::to_string(c.stride_h) + "u+kh*" +
+         std::to_string(c.dilation_h) + "u,(m%" + std::to_string(width) +
+         "u)*" + std::to_string(c.stride_w) + "u+kw*" +
+         std::to_string(c.dilation_w) + "u";
 }
 
 bool unitStride(const tt_iree_ttex_tensor_desc_t &d, unsigned axis) {
@@ -169,9 +211,10 @@ void emitNativeInputLoads(std::ostringstream &s,
         << "u,kw=k%" << ep.conv2d.kernel_w << "u;\n";
   };
   s << "for(uint32_t i=0;i<1024;++i) { a[i]=0.0f; b[i]=0.0f; }\n";
-  bool spatial = lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW && lhs.rank == 3;
+  bool spatial = isSpatial(lhs);
   bool channel =
-      lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR && lhs.rank == 2;
+      (lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR && lhs.rank == 2) ||
+      (lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR && lhs.rank == 3);
   bool rowMajor =
       lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR && lhs.rank == 2;
   if ((spatial || channel) && unitStride(lhs, lhs.rank - 1) &&
@@ -181,13 +224,14 @@ void emitNativeInputLoads(std::ostringstream &s,
     convIndices();
     s << "for(uint32_t row=0;row<valid_m;) {\n"
       << "uint32_t m=m_base+row, chunk=valid_m-row;\n";
-    if (spatial) {
-      uint32_t width = convolution ? ep.conv2d.output.shape[2] : lhs.shape[2];
+    if (spatial || lhs.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR) {
+      uint32_t width = convolution ? ep.conv2d.output.shape[lhs.rank - 1]
+                                   : lhs.shape[lhs.rank - 1];
       s << "uint32_t row_remaining=" << width << "u-m%" << width << "u;\n"
         << "if(chunk>row_remaining) chunk=row_remaining;\n";
     }
     s << "read_span_0(scratch,lhs.get_write_ptr()+(row*32+col)*4u,byte_0("
-      << lhsCoords << (spatial ? ",0" : ",0,0")
+      << lhsCoords << coordinatePadding(lhs)
       << "),chunk,128u);\nrow+=chunk;\n}\n}\n";
   } else if (rowMajor && !convolution && unitStride(lhs, 1)) {
     s << "for(uint32_t row=0;row<valid_m;++row) {\n"
@@ -225,23 +269,184 @@ void emitNativeInputLoads(std::ostringstream &s,
   }
 }
 
+uint64_t bf16SpatialStep(const tt_iree_ttex_entry_point_desc_t &ep,
+                         const tt_iree_ttex_tensor_desc_t &input) {
+  if (!input.rank || input.rank > 4)
+    return 0;
+  uint64_t step = input.stride[input.rank - 1];
+  if (!step)
+    step = 1;
+  if (ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION)
+    step *= ep.conv2d.stride_w;
+  return step;
+}
+
+bool supportsBF16Prefetch(const tt_iree_ttex_entry_point_desc_t &ep,
+                          const tt_iree_ttex_tensor_desc_t *const *t) {
+  const auto &a = *t[0];
+  const auto &b = *t[1];
+  if (a.element_type != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
+      b.element_type != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 || !a.rank ||
+      a.rank > 4)
+    return false;
+  uint64_t step = bf16SpatialStep(ep, a);
+  if (!step || step > 32)
+    return false;
+  if (ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION)
+    return isSpatial(a) &&
+           b.rank == 4 && unitStride(b, 1) && unitStride(b, 2) &&
+           unitStride(b, 3) && b.offset[2] == 0 && b.offset[3] == 0 &&
+           b.storage_shape[2] == ep.conv2d.kernel_h &&
+           b.storage_shape[3] == ep.conv2d.kernel_w;
+  return (isSpatial(a) ||
+          (a.rank == 3 && a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR) ||
+          (a.rank == 2 &&
+           (a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR ||
+            (a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR &&
+             unitStride(a, 1))))) &&
+         b.rank == 2 && unitStride(b, 1);
+}
+
+std::string bf16PrefetchSource() {
+  std::ostringstream s;
+  s << R"kernel(
+// Each existing 4KiB CB holds 32 independent 128B windows. The offset
+// matches NoC address bits even when the CB base itself is not 64B aligned.
+inline uint16_t transport_bf16(uint16_t v) {
+  return (v & 0x7fffu) > 0x7f80u ? uint16_t(v | 0x40u) : v;
+}
+)kernel";
+  for (unsigned slot : {0, 1})
+    s << "inline uint32_t prefetch_bf16_" << slot
+      << "(uint32_t window,uint32_t byte,uint32_t count) {\n"
+      << "const auto buffer=TensorAccessor(accessor_" << slot
+      << ",get_arg_val<uint32_t>(" << slot * 2
+      << "));\n"
+         "uint32_t "
+         "first=window+((byte-window)&63u),ptr=first,remaining=count*2u;\n"
+         "while(remaining) {\n"
+         "uint32_t size=2048u-byte%2048u; if(size>remaining) size=remaining;\n"
+         "noc_async_read(buffer.get_noc_addr(byte/"
+         "2048u,byte%2048u),ptr,size);\n"
+         "byte+=size;ptr+=size;remaining-=size;\n}\nreturn first;\n}\n";
+  return s.str();
+}
+
+void emitBF16PrefetchLoads(std::ostringstream &s,
+                           const tt_iree_ttex_entry_point_desc_t &ep,
+                           const tt_iree_ttex_tensor_desc_t *const *t,
+                           const std::string &lhsCoords,
+                           const std::string &rhsCoords,
+                           bool reuse_pair = false) {
+  const bool convolution =
+      ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
+  const bool spatial = isSpatial(*t[0]) ||
+      t[0]->layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR;
+  const uint32_t step = static_cast<uint32_t>(bf16SpatialStep(ep, *t[0]));
+  auto convIndices = [&]() {
+    if (convolution)
+      s << "uint32_t ic=k/" << ep.conv2d.kernel_h * ep.conv2d.kernel_w
+        << "u,kh=(k/" << ep.conv2d.kernel_w << "u)%" << ep.conv2d.kernel_h
+        << "u,kw=k%" << ep.conv2d.kernel_w << "u;\n";
+  };
+  if (!reuse_pair) {
+    s << R"kernel(
+// Initialize masked lanes directly in BF16; publish only after all DMA completes.
+tile_a.reserve_back(1); tile_b.reserve_back(1);
+auto ta=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_a.get_write_ptr());
+auto tb=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_b.get_write_ptr());
+for(uint32_t i=0;i<1024;++i) { ta[i]=0; tb[i]=0; }
+uint32_t ptrs[32];
+)kernel";
+  } else {
+    s << R"kernel(
+uint32_t ptrs[32];
+if(reuse_a) {
+  copy_operand_tile(saved_tile_a,tile_a_base);
+} else {
+for(uint32_t i=0;i<1024;++i) ta[i]=0;
+)kernel";
+  }
+  if (t[0]->layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR) {
+    s << "for(uint32_t row=0;row<valid_m;++row) {\n"
+         "uint32_t m=m_base+row,k=block*32;\n"
+         "ptrs[row]=prefetch_bf16_0(lhs.get_write_ptr()+row*128u,byte_0(m,k,0,"
+         "0),valid_k);\n}\n"
+         "noc_async_read_barrier();\n"
+         "for(uint32_t row=0;row<valid_m;++row) for(uint32_t "
+         "col=0;col<valid_k;++col)\n"
+         "ta[face_index(row,col)]=transport_bf16(reinterpret_cast<volatile "
+         "tt_l1_ptr uint16_t*>(ptrs[row])[col]);\n";
+  } else {
+    s << "for(uint32_t first=0;first<valid_m;) {\n"
+         "uint32_t chunk=valid_m-first,m=m_base+first;\n";
+    if (spatial) {
+      uint32_t width = convolution ? ep.conv2d.output.shape[t[0]->rank - 1]
+                                   : t[0]->shape[t[0]->rank - 1];
+      s << "uint32_t row_remaining=" << width << "u-m%" << width
+        << "u; if(chunk>row_remaining) chunk=row_remaining;\n";
+    }
+    // Include stride gaps without growing the 64B span in each 128B window.
+    if (step != 1)
+      s << "if(chunk>" << 1 + 31 / step << "u) chunk=" << 1 + 31 / step
+        << "u;\n";
+    s << "for(uint32_t col=0;col<valid_k;++col) {\nuint32_t k=block*32+col;\n";
+    convIndices();
+    s << "ptrs[col]=prefetch_bf16_0(lhs.get_write_ptr()+col*128u,byte_0("
+      << lhsCoords << coordinatePadding(*t[0])
+      << (step == 1 ? "),chunk);\n}\n"
+                    : "),(chunk-1u)*" + std::to_string(step) + "u+1u);\n}\n")
+      << "noc_async_read_barrier();\n"
+         "for(uint32_t col=0;col<valid_k;++col) "
+         "for(uint32_t j=0;j<chunk;++j)\n"
+         "ta[face_index(first+j,col)]=transport_bf16("
+         "reinterpret_cast<volatile "
+         "tt_l1_ptr uint16_t*>(ptrs[col])["
+      << (step == 1 ? "j" : "j*" + std::to_string(step) + "u")
+      << "]);\n"
+         "first+=chunk;\n}\n";
+  }
+  if (reuse_pair)
+    s << R"kernel(
+}
+if(reuse_b) {
+  copy_operand_tile(saved_tile_b,tile_b_base);
+} else {
+for(uint32_t i=0;i<1024;++i) tb[i]=0;
+)kernel";
+  s << "for(uint32_t col=0;col<valid_n;++col) {\n"
+       "uint32_t n=n_base+col,k=block*32;\n";
+  convIndices();
+  s << "ptrs[col]=prefetch_bf16_1(rhs.get_write_ptr()+col*128u,byte_1("
+    << rhsCoords << (convolution ? "" : ",0,0")
+    << "),valid_k);\n}\n"
+       "noc_async_read_barrier();\n"
+       "for(uint32_t col=0;col<valid_n;++col) for(uint32_t "
+       "row=0;row<valid_k;++row)\n"
+       "tb[face_index(row,col)]=transport_bf16(reinterpret_cast<volatile "
+       "tt_l1_ptr uint16_t*>(ptrs[col])[row]);\n";
+  if (reuse_pair)
+    s << "}\n";
+}
+
 void emitNativeOutputStores(std::ostringstream &s,
                             const tt_iree_ttex_tensor_desc_t &d) {
-  bool spatial = d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW && d.rank == 3;
+  bool spatial = isSpatial(d);
   bool channel =
-      d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR && d.rank == 2;
+      (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR && d.rank == 2) ||
+      (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR && d.rank == 3);
   if ((spatial || channel) && unitStride(d, d.rank - 1)) {
     s << "for(uint32_t col=0;col<valid_n;++col) {\n"
       << "uint32_t n=n_base+col;\n"
       << "for(uint32_t row=0;row<valid_m;) {\n"
       << "uint32_t m=m_base+row,chunk=valid_m-row;\n";
-    if (spatial)
-      s << "uint32_t row_remaining=" << d.shape[2] << "u-m%" << d.shape[2]
+    if (spatial || d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)
+      s << "uint32_t row_remaining=" << d.shape[d.rank - 1] << "u-m%" << d.shape[d.rank - 1]
         << "u;\nif(chunk>row_remaining) chunk=row_remaining;\n";
     s << "write_span_2(scratch,accumulator.get_write_ptr()+(row*32+col)*4u,"
          "byte_2("
       << coords(d, "m", "n");
-    s << (spatial ? ",0" : ",0,0") << "),chunk,128u);\nrow+=chunk;\n}\n}\n";
+    s << coordinatePadding(d) << "),chunk,128u);\nrow+=chunk;\n}\n}\n";
   } else if (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR && d.rank == 2 &&
              unitStride(d, 1)) {
     s << "for(uint32_t row=0;row<valid_m;++row) {\n"
@@ -464,15 +669,7 @@ void kernel_main() {
   bool convolution = ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
   if (convolution) {
     const auto &c = ep.conv2d;
-    m = c.output.shape[1] * c.output.shape[2];
-    n = c.output.shape[0];
-    k = c.input.shape[0] * c.kernel_h * c.kernel_w;
-    lhsCoords = "ic,(m/" + std::to_string(c.output.shape[2]) + "u)*" +
-                std::to_string(c.stride_h) + "u+kh*" +
-                std::to_string(c.dilation_h) + "u,(m%" +
-                std::to_string(c.output.shape[2]) + "u)*" +
-                std::to_string(c.stride_w) + "u+kw*" +
-                std::to_string(c.dilation_w) + "u";
+    convolutionCoordinates(c, m, n, k, lhsCoords);
     rhsCoords = "n,ic,kh,kw";
   } else if (ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
     m = ep.linear.m;
@@ -734,10 +931,145 @@ std::string generateBF16NativeCommon(
   return "#pragma GCC optimize (\"no-fast-math\", \"fp-contract=off\")\n" + source;
 }
 
-TenstorrentNativeSources generateBF16NativeMatrix(
-    const tt_iree_ttex_entry_point_desc_t &geometry,
-    const tt_iree_ttex_tensor_desc_t *const *tensors,
-    const std::string &epilogue, bool use_tensix) {
+std::string
+generateBF16NativeSpatial(uint8_t kind,
+                          const tt_iree_ttex_tensor_desc_t *const *tensors) {
+  const auto *input = tensors[0];
+  const auto *output = tensors[2];
+  if (!input || !output || !isSpatial(*input) || !isSpatial(*output) ||
+      input->rank != output->rank || input->layout != output->layout ||
+      input->element_type != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
+      output->element_type != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
+      !unitStride(*input, input->rank - 1) ||
+      !unitStride(*output, output->rank - 1))
+    return {};
+  const bool batched = input->rank == 4;
+  const unsigned c = batched ? 1 : 0, h = c + 1, w = c + 2;
+  if (batched && input->shape[0] != output->shape[0])
+    return {};
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) {
+    if (input->shape[c] != output->shape[c] || input->shape[h] < 3 ||
+        input->shape[w] < 3 ||
+        (input->shape[h] - 3) / 2 + 1 != output->shape[h] ||
+        (input->shape[w] - 3) / 2 + 1 != output->shape[w])
+      return {};
+  } else if (kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {
+    for (unsigned i = 0; i < input->rank; ++i)
+      if (input->shape[i] != output->shape[i])
+        return {};
+  } else
+    return {};
+  std::ostringstream s;
+  s << generateBF16NativeCommon(tensors) << R"kernel(
+// Spatial-v1: retain the existing 128B CB and element-range runtime args.
+inline uint32_t window_ptr(uint32_t scratch, uint32_t byte) {
+  return ((scratch + 63u) & ~63u) + byte % 64u;
+}
+inline uint32_t window_bytes(uint32_t scratch, uint32_t byte, uint32_t size) {
+  uint32_t capacity = scratch + 128u - window_ptr(scratch, byte);
+  if (size > capacity) size = capacity;
+  uint32_t page = 2048u - byte % 2048u;
+  return size < page ? size : page;
+}
+)kernel";
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL)
+    s << R"kernel(
+inline void read_window(uint32_t scratch, uint32_t byte, uint32_t count, float* row) {
+  const auto input = TensorAccessor(accessor_0, get_arg_val<uint32_t>(0));
+  while (count) {
+    uint32_t ptr = window_ptr(scratch, byte);
+    uint32_t size = window_bytes(scratch, byte, count * 2u);
+    noc_async_read(input.get_noc_addr(byte/2048u, byte%2048u), ptr, size);
+    noc_async_read_barrier();
+    auto values = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptr);
+    for (uint32_t j=0; j<size/2u; ++j) row[j] = from_bits(uint32_t(values[j]) << 16);
+    row += size/2u; count -= size/2u; byte += size;
+  }
+}
+inline float maximum_exact(float value, float v) {
+  if ((to_bits(value)&0x7fffffffu)>0x7f800000u || (to_bits(v)&0x7fffffffu)>0x7f800000u)
+    return from_bits(0x7fc00000u);
+  if (v > value) return v;
+  if (v == 0.0f && value == 0.0f) return from_bits(to_bits(v)&to_bits(value));
+  return value;
+}
+)kernel";
+  s << "void kernel_main() {\nCircularBuffer cb(tt::CBIndex::c_2); "
+       "cb.reserve_back(1);\n"
+       "uint32_t scratch=cb.get_write_ptr(), i=get_arg_val<uint32_t>(28), "
+       "end=i+get_arg_val<uint32_t>(29);\n"
+       "const auto input=TensorAccessor(accessor_0,get_arg_val<uint32_t>(0));\n"
+       "const auto "
+       "output=TensorAccessor(accessor_2,get_arg_val<uint32_t>(4));\n"
+       "while(i<end) {\n";
+  if (batched)
+    s << "uint32_t batch=i/"
+      << uint64_t(output->shape[c]) * output->shape[h] * output->shape[w]
+      << "u;\n";
+  s << "uint32_t c=(i/" << uint64_t(output->shape[h]) * output->shape[w]
+    << "u)%" << output->shape[c] << "u,h=(i/" << output->shape[w]
+    << "u)%" << output->shape[h] << "u,w=i%" << output->shape[w] << "u;\n"
+    << "uint32_t count=" << output->shape[w]
+    << "u-w;\n"
+       "if(count>end-i) count=end-i;\n";
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) {
+    s << R"kernel(
+    if(count>8u) count=8u;
+)kernel"
+      << "uint32_t byte=byte_2(" << (batched ? "batch,c,h,w" : "c,h,w,0")
+      << ");\n" << R"kernel(
+    uint32_t size=window_bytes(scratch,byte,count*2u);
+    count=size/2u;
+    float value[8], row[17];
+    for(uint32_t j=0;j<count;++j) value[j]=from_bits(0xff800000u);
+    for(uint32_t kh=0;kh<3;++kh) {
+)kernel"
+      << "read_window(scratch,byte_0("
+      << (batched ? "batch,c,h*2u+kh,w*2u" : "c,h*2u+kh,w*2u,0")
+      << "),count*2u+1u,row);\n" << R"kernel(
+      for(uint32_t j=0;j<count;++j) for(uint32_t kw=0;kw<3;++kw)
+        value[j]=maximum_exact(value[j],row[j*2u+kw]);
+    }
+    uint32_t ptr=window_ptr(scratch,byte);
+    auto values=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptr);
+    for(uint32_t j=0;j<count;++j) values[j]=bf16_bits(value[j]);
+    noc_async_write(ptr,output.get_noc_addr(byte/2048u,byte%2048u),size);
+    noc_async_write_barrier();
+)kernel";
+  } else {
+    s << R"kernel(
+    if(count>16u) count=16u;
+)kernel"
+      << "uint32_t source_byte=byte_0(" << (batched ? "batch,c,h,w" : "c,h,w,0")
+      << "),target_byte=byte_2(" << (batched ? "batch,c,h,w" : "c,h,w,0")
+      << ");\n" << R"kernel(
+    uint32_t size=window_bytes(scratch,source_byte,count*2u);
+    size=window_bytes(scratch,target_byte,size);
+    count=size/2u;
+    uint32_t source_ptr=window_ptr(scratch,source_byte);
+    uint32_t target_ptr=window_ptr(scratch,target_byte);
+    noc_async_read(input.get_noc_addr(source_byte/2048u,source_byte%2048u),source_ptr,size);
+    noc_async_read_barrier();
+    // Repack via bounded private storage when NoC low-address bits differ.
+    // Copy bits, not floats: identity copies must retain NaN payloads as well.
+    uint16_t values[16];
+    for(uint32_t j=0;j<count;++j)
+      values[j]=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(source_ptr)[j];
+    for(uint32_t j=0;j<count;++j)
+      reinterpret_cast<volatile tt_l1_ptr uint16_t*>(target_ptr)[j]=values[j];
+    noc_async_write(target_ptr,output.get_noc_addr(target_byte/2048u,target_byte%2048u),size);
+    noc_async_write_barrier();
+)kernel";
+  }
+  s << "i+=count;\n}\n}\n";
+  return s.str();
+}
+
+TenstorrentNativeSources
+generateBF16NativeMatrix(const tt_iree_ttex_entry_point_desc_t &geometry,
+                         const tt_iree_ttex_tensor_desc_t *const *tensors,
+                         const std::string &epilogue, bool use_tensix,
+                         bool prefetch_bf16_inputs, bool reuse_output_tiles) {
   if (use_tensix) {
     if (!tt_iree_ttex_is_native_matrix_kind(geometry.dispatch_kind))
       throw std::invalid_argument("BF16 Tensix codegen requires a matrix geometry");
@@ -746,13 +1078,7 @@ TenstorrentNativeSources generateBF16NativeMatrix(
     std::string lhsCoords, rhsCoords;
     if (geometry.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION) {
       const auto &c = geometry.conv2d;
-      m = c.output.shape[1] * c.output.shape[2];
-      n = c.output.shape[0];
-      k = c.input.shape[0] * c.kernel_h * c.kernel_w;
-      lhsCoords = "ic,(m/" + std::to_string(c.output.shape[2]) + "u)*" +
-          std::to_string(c.stride_h) + "u+kh*" + std::to_string(c.dilation_h) +
-          "u,(m%" + std::to_string(c.output.shape[2]) + "u)*" +
-          std::to_string(c.stride_w) + "u+kw*" + std::to_string(c.dilation_w) + "u";
+      convolutionCoordinates(c, m, n, k, lhsCoords);
       rhsCoords = "n,ic,kh,kw";
     } else if (geometry.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
       m = geometry.linear.m; n = geometry.linear.n; k = geometry.linear.k;
@@ -762,8 +1088,22 @@ TenstorrentNativeSources generateBF16NativeMatrix(
       lhsCoords = coords(*tensors[0], "m", "k"); rhsCoords = "n,k";
     }
     auto common = generateBF16NativeCommon(tensors) + bulkTransferSource(tensors);
+    const bool prefetch =
+        prefetch_bf16_inputs && supportsBF16Prefetch(geometry, tensors);
+    const bool reuse = reuse_output_tiles && prefetch && (m > 32 || n > 32);
     std::ostringstream reader;
-    reader << common << R"kernel(
+    reader << common << (prefetch ? bf16PrefetchSource() : "");
+    if (reuse)
+      reader << R"kernel(
+// Only this reader writes the input CBs. A popped page stays unchanged until
+// this producer cycles back; copy it to the other page before that next write.
+inline void copy_operand_tile(uint32_t source,uint32_t target) {
+  auto src=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(source);
+  auto dst=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(target);
+  for(uint32_t i=0;i<512;++i) dst[i]=src[i];
+}
+)kernel";
+    reader << R"kernel(
 // native-v18: device tilization, BF16 operands, no host packing/fallback.
 void kernel_main() {
   CircularBuffer lhs(tt::CBIndex::c_8), rhs(tt::CBIndex::c_9), scratch_cb(tt::CBIndex::c_2);
@@ -774,15 +1114,49 @@ void kernel_main() {
   auto b=reinterpret_cast<volatile tt_l1_ptr float*>(rhs.get_write_ptr());
   uint32_t m_start=get_arg_val<uint32_t>(28), n_start=get_arg_val<uint32_t>(29);
   uint32_t m_count=get_arg_val<uint32_t>(30), n_count=get_arg_val<uint32_t>(31);
+)kernel";
+    if (reuse)
+      reader << R"kernel(
+  uint32_t tiles=m_count*n_count;
+  for(uint32_t first=0;first<tiles;) {
+    uint32_t group=tiles-first; if(group>2) group=2;
+)kernel";
+    else
+      reader << R"kernel(
   for(uint32_t tm=0;tm<m_count;++tm) for(uint32_t tn=0;tn<n_count;++tn) {
+)kernel";
+    if (reuse)
+      reader << "for(uint32_t block=0;block<" << k / 32 + (k % 32 != 0)
+             << R"kernel(u;++block) {
+    uint32_t saved_tile_a=0,saved_tile_b=0;
+    for(uint32_t lane=0;lane<group;++lane) {
+      tile_a.reserve_back(1); tile_b.reserve_back(1);
+      uint32_t tile_a_base=tile_a.get_write_ptr(),tile_b_base=tile_b.get_write_ptr();
+      if(!lane) { saved_tile_a=tile_a_base; saved_tile_b=tile_b_base; }
+      uint32_t tm=(first+lane)/n_count,tn=(first+lane)%n_count;
+      bool reuse_a=lane && tm==first/n_count;
+      bool reuse_b=lane && tn==first%n_count;
+      auto ta=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_a_base);
+      auto tb=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_b_base);
+)kernel";
+    reader << R"kernel(
     uint32_t m_base=(m_start+tm)*32,n_base=(n_start+tn)*32;
 )kernel"
-      << "uint32_t valid_m=" << m << "u-m_base; if(valid_m>32) valid_m=32;\n"
-      << "uint32_t valid_n=" << n << "u-n_base; if(valid_n>32) valid_n=32;\n"
-      << "for(uint32_t block=0;block<" << (k+31)/32 << "u;++block) {\n"
-      << "uint32_t valid_k=" << k << "u-block*32; if(valid_k>32) valid_k=32;\n";
-    emitNativeInputLoads(reader, geometry, tensors, lhsCoords, rhsCoords);
-    reader << R"kernel(
+           << "uint32_t valid_m=" << m
+           << "u-m_base; if(valid_m>32) valid_m=32;\n"
+           << "uint32_t valid_n=" << n
+           << "u-n_base; if(valid_n>32) valid_n=32;\n";
+    if (!reuse)
+      reader << "for(uint32_t block=0;block<" << (k + 31) / 32
+             << "u;++block) {\n";
+    reader << "uint32_t valid_k=" << k
+           << "u-block*32; if(valid_k>32) valid_k=32;\n";
+    if (prefetch) {
+      emitBF16PrefetchLoads(reader, geometry, tensors, lhsCoords, rhsCoords,
+                           reuse);
+    } else {
+      emitNativeInputLoads(reader, geometry, tensors, lhsCoords, rhsCoords);
+      reader << R"kernel(
     tile_a.reserve_back(1); tile_b.reserve_back(1);
     auto ta=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_a.get_write_ptr());
     auto tb=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_b.get_write_ptr());
@@ -790,6 +1164,19 @@ void kernel_main() {
       ta[face_index(row,col)]=bf16_bits(a[row*32+col]);
       tb[face_index(row,col)]=bf16_bits(b[row*32+col]);
     }
+)kernel";
+    }
+    if (reuse)
+      reader << R"kernel(
+    tile_a.push_back(1); tile_b.push_back(1);
+    }
+  }
+    first+=group;
+  }
+}
+)kernel";
+    else
+      reader << R"kernel(
     tile_a.push_back(1); tile_b.push_back(1);
   }
   }
@@ -817,6 +1204,37 @@ void kernel_main() {
     tile_regs_commit(); tile_regs_wait();
     out.reserve_back(1); pack_tile(0,tt::CBIndex::c_16); out.push_back(1);
     tile_regs_release();
+  }
+}
+)kernel";
+    if (reuse)
+      sources.compute = R"kernel(
+// Two independent FP32 Dst accumulators; each retains the original K order.
+#include <cstdint>
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/dataflow/circular_buffer.h"
+void kernel_main() {
+  uint32_t tiles=get_arg_val<uint32_t>(0),blocks=get_arg_val<uint32_t>(1);
+  CircularBuffer lhs(tt::CBIndex::c_0),rhs(tt::CBIndex::c_1),out(tt::CBIndex::c_16);
+  compute_kernel_hw_startup<SrcOrder::Reverse>(tt::CBIndex::c_0,tt::CBIndex::c_1,tt::CBIndex::c_16);
+  matmul_init(tt::CBIndex::c_0,tt::CBIndex::c_1);
+  for(uint32_t tile=0;tile<tiles;) {
+    uint32_t group=tiles-tile; if(group>2) group=2;
+    tile_regs_acquire();
+    for(uint32_t block=0;block<blocks;++block) {
+      for(uint32_t lane=0;lane<group;++lane) {
+        lhs.wait_front(1); rhs.wait_front(1);
+        matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,lane);
+        lhs.pop_front(1); rhs.pop_front(1);
+      }
+    }
+    tile_regs_commit(); tile_regs_wait();
+    out.reserve_back(group);
+    for(uint32_t lane=0;lane<group;++lane) pack_tile(lane,tt::CBIndex::c_16);
+    out.push_back(group);
+    tile_regs_release();
+    tile+=group;
   }
 }
 )kernel";

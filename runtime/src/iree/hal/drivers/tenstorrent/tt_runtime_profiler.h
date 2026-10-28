@@ -50,6 +50,7 @@ struct RuntimeProfileRecord {
   uint32_t m_tiles = 0;
   uint32_t n_tiles = 0;
   uint32_t k_tiles = 0;
+  uint32_t scalar_elements = 0, scalar_row_width = 1;
   uint64_t flop_count = 0;
   uint64_t host_start_ns = 0;
   uint64_t host_end_ns = 0;

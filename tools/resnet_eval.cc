@@ -1,13 +1,16 @@
 // Copyright 2026 The tt-iree Authors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Static B1 BF16 dataset runners share session and buffer lifetime handling.
+// Static-batch BF16 dataset runners share session and buffer lifetime handling.
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -26,9 +29,9 @@ constexpr iree_hal_dim_t kOutputClasses = 10;
 constexpr iree_hal_dim_t kInputShape[] = {1, 3, 224, 224};
 constexpr iree_hal_dim_t kOutputClasses = 1000;
 #endif
-constexpr size_t kInputBytes = kInputShape[0] * kInputShape[1] *
-                               kInputShape[2] * kInputShape[3] * 2;
-constexpr size_t kOutputBytes = kOutputClasses * 2;
+constexpr size_t kInputSampleBytes =
+    kInputShape[1] * kInputShape[2] * kInputShape[3] * 2;
+constexpr size_t kOutputSampleBytes = kOutputClasses * 2;
 using Clock = std::chrono::steady_clock;
 double Seconds(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
@@ -36,7 +39,12 @@ double Seconds(Clock::time_point start) {
 
 iree_status_t Evaluate(iree_runtime_session_t *session,
                        const std::string &input, const std::string &output,
-                       size_t index, std::ostream &timings) {
+                       size_t index, iree_hal_dim_t batch_size,
+                       std::ostream &timings) {
+  const iree_hal_dim_t input_shape[] = {
+      batch_size, kInputShape[1], kInputShape[2], kInputShape[3]};
+  const size_t input_bytes = kInputSampleBytes * batch_size;
+  const size_t output_bytes = kOutputSampleBytes * batch_size;
 #ifdef TT_IREE_EVAL_PROFILER
   auto *profiler =
       iree_hal_tt_device_runtime_profiler(iree_runtime_session_device(session));
@@ -52,14 +60,14 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
   } invocation_scope{profiler};
 #endif
   auto start = Clock::now();
-  std::vector<uint8_t> input_data(kInputBytes);
+  std::vector<uint8_t> input_data(input_bytes);
   std::ifstream input_stream(input, std::ios::binary);
   if (!input_stream.read(reinterpret_cast<char *>(input_data.data()),
                          input_data.size()) ||
       input_stream.peek() != std::ifstream::traits_type::eof()) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "expected exactly %zu BF16 input bytes: %s",
-                            kInputBytes, input.c_str());
+                            input_bytes, input.c_str());
   }
   iree_runtime_call_t call;
   IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
@@ -71,7 +79,7 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
   params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
   iree_hal_buffer_view_t *arg = nullptr;
   iree_status_t status = iree_hal_buffer_view_allocate_buffer_copy(
-      device, iree_runtime_session_device_allocator(session), 4, kInputShape,
+      device, iree_runtime_session_device_allocator(session), 4, input_shape,
       IREE_HAL_ELEMENT_TYPE_BFLOAT_16, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
       params, iree_make_const_byte_span(input_data.data(), input_data.size()),
       &arg);
@@ -102,18 +110,19 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
   if (iree_status_is_ok(status) &&
       (iree_vm_list_size(iree_runtime_call_outputs(&call)) != 0 ||
        iree_hal_buffer_view_shape_rank(result) != 2 ||
-       iree_hal_buffer_view_shape_dim(result, 0) != 1 ||
+       iree_hal_buffer_view_shape_dim(result, 0) != batch_size ||
        iree_hal_buffer_view_shape_dim(result, 1) != kOutputClasses ||
        iree_hal_buffer_view_element_type(result) !=
            IREE_HAL_ELEMENT_TYPE_BFLOAT_16 ||
        iree_hal_buffer_view_encoding_type(result) !=
            IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR ||
-       iree_hal_buffer_view_byte_length(result) != kOutputBytes)) {
+       iree_hal_buffer_view_byte_length(result) != output_bytes)) {
     status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "expected one dense 1x%dxbf16 output",
+                              "expected one dense %dx%dxbf16 output",
+                              static_cast<int>(batch_size),
                               static_cast<int>(kOutputClasses));
   }
-  std::vector<uint8_t> output_data(kOutputBytes);
+  std::vector<uint8_t> output_data(output_bytes);
   if (iree_status_is_ok(status)) {
     status = iree_hal_device_transfer_d2h(
         device, iree_hal_buffer_view_buffer(result), 0, output_data.data(),
@@ -143,8 +152,9 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
     timings.flush();
     if (!timings)
       return iree_make_status(IREE_STATUS_DATA_LOSS, "timing write failed");
-    std::printf("sample %zu completed (invoke %.6f s)\n", index,
-                invoke_seconds);
+    std::printf("%s %zu completed (batch %d, invoke %.6f s)\n",
+                batch_size == 1 ? "sample" : "batch", index,
+                static_cast<int>(batch_size), invoke_seconds);
     std::fflush(stdout);
   }
   return status;
@@ -152,13 +162,51 @@ iree_status_t Evaluate(iree_runtime_session_t *session,
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc < 4 || argc > 5) {
+  if (argc < 4) {
     std::fprintf(
         stderr,
-        "usage: %s module.vmfb inputs.tsv timings.csv [device=tenstorrent]\n"
+        "usage: %s module.vmfb inputs.tsv timings.csv [device=tenstorrent] "
+        "[--batch-size N | --batch-size=N]\n"
+        "Static batch size: 1 through 16 (default: 1).\n"
         "TSV rows: absolute_input_path<TAB>absolute_output_path\n",
         argv[0]);
     return 1;
+  }
+  iree_hal_dim_t batch_size = 1;
+  const char *device_name = "tenstorrent";
+  bool has_batch_size = false, has_device = false;
+  for (int i = 4; i < argc; ++i) {
+    std::string_view argument(argv[i]);
+    if (argument == "--batch-size" ||
+        argument.substr(0, 13) == "--batch-size=") {
+      std::string_view value;
+      if (argument == "--batch-size") {
+        if (++i == argc) {
+          std::fprintf(stderr, "missing --batch-size value\n");
+          return 1;
+        }
+        value = argv[i];
+      } else {
+        value = argument.substr(13);
+      }
+      unsigned parsed = 0;
+      auto result = std::from_chars(value.data(), value.data() + value.size(),
+                                    parsed);
+      if (has_batch_size || result.ec != std::errc() ||
+          result.ptr != value.data() + value.size() || parsed < 1 ||
+          parsed > 16) {
+        std::fprintf(stderr, "expected one --batch-size integer in [1, 16]\n");
+        return 1;
+      }
+      batch_size = static_cast<iree_hal_dim_t>(parsed);
+      has_batch_size = true;
+    } else if (!argument.empty() && argument[0] != '-' && !has_device) {
+      device_name = argv[i];
+      has_device = true;
+    } else {
+      std::fprintf(stderr, "unexpected argument: %s\n", argv[i]);
+      return 1;
+    }
   }
   std::vector<std::pair<std::string, std::string>> samples;
   std::ifstream manifest(argv[2]);
@@ -176,7 +224,8 @@ int main(int argc, char **argv) {
         output(line.substr(tab + 1));
     std::error_code error;
     if (!input.is_absolute() || !output.is_absolute() ||
-        std::filesystem::file_size(input, error) != kInputBytes || error ||
+        std::filesystem::file_size(input, error) !=
+            kInputSampleBytes * batch_size || error ||
         std::filesystem::exists(output) ||
         std::filesystem::is_symlink(output) ||
         !std::filesystem::is_directory(output.parent_path()) ||
@@ -223,7 +272,7 @@ int main(int argc, char **argv) {
   iree_hal_device_t *device = nullptr;
   if (iree_status_is_ok(status)) {
     status = iree_runtime_instance_try_create_default_device(
-        instance, iree_make_cstring_view(argc == 5 ? argv[4] : "tenstorrent"),
+        instance, iree_make_cstring_view(device_name),
         &device);
   }
   iree_runtime_session_options_t session_options;
@@ -238,10 +287,11 @@ int main(int argc, char **argv) {
     status =
         iree_runtime_session_append_bytecode_module_from_file(session, argv[1]);
   }
-  std::printf("session setup %.6f s; %zu distinct calls\n",
-              Seconds(setup_start), samples.size());
+  std::printf("session setup %.6f s; %zu distinct calls; static batch %d\n",
+              Seconds(setup_start), samples.size(), static_cast<int>(batch_size));
   for (size_t i = 0; i < samples.size() && iree_status_is_ok(status); ++i) {
-    status = Evaluate(session, samples[i].first, samples[i].second, i, timings);
+    status = Evaluate(session, samples[i].first, samples[i].second, i, batch_size,
+                      timings);
   }
   iree_runtime_session_release(session);
   iree_runtime_instance_release(instance);

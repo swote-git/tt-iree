@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
+#include <initializer_list>
 
 #include "iree/base/api.h"
+#include "iree/schema/tt_bf16_native_validation.h"
 #include "iree/schema/tt_executable_builder_util.h"
 #include "iree/schema/tt_native_dispatch.h"
 #include "iree/testing/gtest.h"
@@ -367,6 +370,384 @@ TEST(TtexSchemaTest, Bf16TensixRequiresV18MatrixAndThreeRoles) {
       TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)), 1);
 }
 
+static tt_iree_ttex_tensor_desc_t
+BatchTensor(uint16_t binding, uint8_t layout,
+            std::initializer_list<uint32_t> shape) {
+  tt_iree_ttex_tensor_desc_t t = {};
+  t.binding = binding;
+  t.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  t.layout = layout;
+  t.rank = shape.size();
+  std::copy(shape.begin(), shape.end(), t.shape);
+  std::copy(shape.begin(), shape.end(), t.storage_shape);
+  return t;
+}
+
+static tt_iree_ttex_entry_point_desc_t
+MakeBatchMatrix(uint8_t layout = TT_IREE_TTEX_TENSOR_LAYOUT_NCHW,
+                bool conv = false) {
+  tt_iree_ttex_entry_point_desc_t ep = {};
+  ep.name = "bf16_batch16";
+  ep.binding_count = 14;
+  ep.workgroup_size[0] = ep.workgroup_size[1] = ep.workgroup_size[2] = 1;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE;
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+  auto &d = ep.bf16_native;
+  d.operation_kind = conv ? TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION
+                          : TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+  d.m = 16 * 5 * 7;
+  d.n = 32;
+  d.k = conv ? 64 * 3 * 3 : 64;
+  if (layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW) {
+    d.tensors[0] =
+        BatchTensor(0, layout, {16, 64, conv ? 7u : 5u, conv ? 9u : 7u});
+    d.tensors[2] = BatchTensor(2, layout, {16, 32, 5, 7});
+  } else {
+    d.tensors[0] = BatchTensor(0, layout, {16, 64, 35});
+    d.tensors[2] = BatchTensor(2, layout, {16, 32, 35});
+  }
+  d.tensors[1] =
+      conv ? BatchTensor(1, TT_IREE_TTEX_TENSOR_LAYOUT_OIHW, {32, 64, 3, 3})
+           : BatchTensor(1, TT_IREE_TTEX_TENSOR_LAYOUT_OI, {32, 64});
+  return ep;
+}
+
+static tt_iree_ttex_entry_point_desc_t MakeBatchScalar(uint8_t kind,
+                                                       bool flat = true) {
+  auto ep = MakeBatchMatrix();
+  auto &d = ep.bf16_native;
+  d = {};
+  d.operation_kind = kind;
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
+    d.tensors[0] =
+        flat ? BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {32768})
+             : BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {16, 2048});
+    d.tensors[2] = d.tensors[0];
+    d.tensors[2].binding = 2;
+  } else if (kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM) {
+    d.tensors[0] =
+        BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, {16, 2048, 8, 8});
+    d.tensors[2] =
+        flat ? BatchTensor(2, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {32768})
+             : BatchTensor(2, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {16, 2048});
+  } else {
+    d.tensors[0] =
+        BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, {16, 3, 5, 7});
+    d.tensors[2] =
+        BatchTensor(2, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW,
+                    kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL
+                        ? std::initializer_list<uint32_t>{16, 3, 2, 3}
+                        : std::initializer_list<uint32_t>{16, 3, 5, 7});
+  }
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
+      kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV)
+    d.tensors[1] = BatchTensor(1, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {1});
+  return ep;
+}
+
+static void ExpectBatchBuild(const tt_iree_ttex_entry_point_desc_t &ep,
+                             bool valid,
+                             uint32_t version = TT_IREE_TTEX_VERSION_20) {
+  iree_byte_span_t data = {};
+  auto status = tt_iree_build_ttex_executable_def_with_version(
+      iree_allocator_system(), version, 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status),
+            valid ? IREE_STATUS_OK : IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+  if (valid && data.data) {
+    EXPECT_EQ(
+        ttex_ns(ExecutableDef_verify_as_root(data.data, data.data_length)), 0);
+    auto root = ttex_ns(ExecutableDef_as_root(data.data));
+    EXPECT_EQ(ttex_ns(ExecutableDef_version(root)), version);
+    auto entry = ttex_ns(
+        EntryPointDef_vec_at(ttex_ns(ExecutableDef_entry_points(root)), 0));
+    EXPECT_EQ(ttex_ns(EntryPointDef_spatial_plan(entry)), nullptr);
+    auto tensors = ttex_ns(
+        BF16NativeDef_tensors(ttex_ns(EntryPointDef_bf16_native(entry))));
+    ASSERT_EQ(ttex_ns(TensorDesc_vec_len(tensors)), 14u);
+    for (unsigned i = 0; i < 14; ++i) {
+      auto t = ttex_ns(TensorDesc_vec_at(tensors, i));
+      EXPECT_EQ(ttex_ns(TensorDesc_layout(t)),
+                ep.bf16_native.tensors[i].layout);
+      EXPECT_EQ(ttex_ns(TensorDesc_rank(t)), ep.bf16_native.tensors[i].rank);
+    }
+  } else if (!valid) {
+    EXPECT_EQ(data.data, nullptr);
+    EXPECT_EQ(data.data_length, 0u);
+  }
+  iree_allocator_free(iree_allocator_system(), data.data);
+}
+
+TEST(TtexSchemaTest, Bf16BatchV20OptInKeepsV18DefaultAndRoleSets) {
+  EXPECT_EQ(TT_IREE_TTEX_CURRENT_VERSION, 18u);
+  EXPECT_EQ(ttex_ns(TensorLayout_NCHW), 6);
+  EXPECT_EQ(ttex_ns(TensorLayout_BATCH_CHANNEL_MAJOR), 7);
+  EXPECT_EQ(ttex_ns(TensorLayout_CHW), 2);
+  for (auto builtin : {TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE,
+                       TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX}) {
+    for (auto layout : {TT_IREE_TTEX_TENSOR_LAYOUT_NCHW,
+                        TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR}) {
+      auto ep = MakeBatchMatrix(layout);
+      ep.builtin_program = builtin;
+      ExpectBatchBuild(ep, true);
+    }
+    auto ep = MakeBatchMatrix(TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, true);
+    ep.builtin_program = builtin;
+    ExpectBatchBuild(ep, true);
+    EXPECT_EQ(
+        __builtin_popcount(tt_iree_ttex_required_aot_kernel_roles_for_version(
+            20, builtin, TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)),
+        builtin == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE ? 1 : 3);
+  }
+}
+
+TEST(TtexSchemaTest, Bf16BatchLayoutsRejectedBeforeV20EvenForGenericScalar) {
+  for (uint32_t version : {17u, 18u}) {
+    for (auto layout : {TT_IREE_TTEX_TENSOR_LAYOUT_NCHW,
+                        TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR}) {
+      ExpectBatchBuild(MakeBatchMatrix(layout), false, version);
+    }
+    ExpectBatchBuild(MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY),
+                     false, version);
+    ExpectBatchBuild(
+        MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM, true), false,
+        version);
+    auto ep = MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV, true);
+    // The legacy flat vector/scalar ABI remains valid without new layouts.
+    ExpectBatchBuild(ep, true, version);
+    ep.bf16_native.tensors[13].layout = TT_IREE_TTEX_TENSOR_LAYOUT_NCHW;
+    ExpectBatchBuild(ep, false, version);
+    auto status =
+        tt_iree_validate_bf16_layout_version(&ep.bf16_native, version);
+    EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+    iree_status_ignore(status);
+  }
+  auto ep = MakeBatchMatrix();
+  iree_byte_span_t data = {};
+  auto status =
+      tt_iree_build_ttex_executable_def(iree_allocator_system(), 1, &ep, &data);
+  EXPECT_EQ(iree_status_code(status), IREE_STATUS_INVALID_ARGUMENT);
+  iree_status_ignore(status);
+}
+
+TEST(TtexSchemaTest, Bf16BatchMatrixRejectsGeometryAndDtypeMismatches) {
+  const std::function<void(tt_iree_ttex_bf16_native_desc_t &)> mutations[] = {
+      [](auto &d) { --d.m; },
+      [](auto &d) { ++d.n; },
+      [](auto &d) { ++d.k; },
+      [](auto &d) { d.m = 0; },
+      [](auto &d) { d.m = UINT32_MAX; },
+      [](auto &d) { d.tensors[0].rank = 0; },
+      [](auto &d) { d.tensors[1].rank = 0; },
+      [](auto &d) { d.tensors[2].rank = 0; },
+      [](auto &d) { d.tensors[0].shape[0] = 8; },
+      [](auto &d) { d.tensors[2].shape[0] = 8; },
+      [](auto &d) { d.tensors[2].shape[1] = 16; },
+      [](auto &d) { d.tensors[1].shape[1] = 32; },
+      [](auto &d) { d.tensors[0].rank = 3; },
+      [](auto &d) {
+        d.tensors[1].layout = TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR;
+      },
+      [](auto &d) { d.tensors[2].layout = TT_IREE_TTEX_TENSOR_LAYOUT_CHW; },
+      [](auto &d) {
+        d.tensors[0].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+      },
+      [](auto &d) {
+        d.tensors[1].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+      },
+      [](auto &d) {
+        d.tensors[2].element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+      },
+  };
+  for (bool conv : {false, true}) {
+    for (const auto &mutate : mutations) {
+      auto ep = MakeBatchMatrix(TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, conv);
+      mutate(ep.bf16_native);
+      ExpectBatchBuild(ep, false);
+    }
+  }
+  auto ep = MakeBatchMatrix(TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR);
+  ep.bf16_native.tensors[2].shape[2] = 34;
+  ExpectBatchBuild(ep, false);
+  ep = MakeBatchMatrix(TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR);
+  ep.bf16_native.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
+  ExpectBatchBuild(ep, false);
+}
+
+TEST(TtexSchemaTest, Bf16BatchScalarCopyPoolGapAndDivision) {
+  for (auto kind : {TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY,
+                    TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL,
+                    TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM,
+                    TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV}) {
+    auto ep = MakeBatchScalar(kind);
+    ExpectBatchBuild(ep, true);
+    ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+    ExpectBatchBuild(ep, false);
+    ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE;
+    ep.bf16_native.m = 1;
+    ExpectBatchBuild(ep, false);
+    ep = MakeBatchScalar(kind);
+    ep.bf16_native.tensors[2].shape[0] = 15;
+    ExpectBatchBuild(ep, false);
+    ep = MakeBatchScalar(kind);
+    ep.bf16_native.tensors[0].rank = 0;
+    ExpectBatchBuild(ep, false);
+    ep = MakeBatchScalar(kind);
+    ep.bf16_native.tensors[2].element_type =
+        TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+    ExpectBatchBuild(ep, false);
+  }
+  for (auto kind : {TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM,
+                    TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV}) {
+    ExpectBatchBuild(MakeBatchScalar(kind, false), false);
+    ExpectBatchBuild(MakeBatchScalar(kind, true), true);
+    for (const auto &mutate : std::initializer_list<
+             std::function<void(tt_iree_ttex_tensor_desc_t &)>>{
+             [](auto &t) { t.rank = 0; },
+             [](auto &t) { t.shape[0] = t.storage_shape[0] = 2; },
+             [](auto &t) {
+               t.rank = 2;
+               t.shape[1] = t.storage_shape[1] = 1;
+             },
+             [](auto &t) {
+               t.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32;
+             }}) {
+      auto ep = MakeBatchScalar(kind);
+      mutate(ep.bf16_native.tensors[1]);
+      ExpectBatchBuild(ep, false);
+    }
+  }
+  auto ep = MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM, true);
+  ep.bf16_native.tensors[2].shape[0] = 32767;
+  ExpectBatchBuild(ep, false);
+  ep = MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM);
+  ep.bf16_native.tensors[0].shape[2] = 7;
+  ExpectBatchBuild(ep, false);
+  ep = MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL);
+  ep.bf16_native.tensors[2].shape[2] = 1;
+  ExpectBatchBuild(ep, false);
+  ep = MakeBatchScalar(TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY);
+  ep.bf16_native.tensors[1] =
+      BatchTensor(1, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {1});
+  ExpectBatchBuild(ep, false);
+}
+
+TEST(TtexSchemaTest, Bf16BatchEpilogueSlotsRetainGenericDescriptorRules) {
+  auto ep = MakeBatchMatrix();
+  for (unsigned i = 3; i < 14; ++i) {
+    ep.bf16_native.tensors[i] =
+        BatchTensor(i, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {5});
+    ep.bf16_native.tensors[i].element_type =
+        i % 2 ? TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_F32
+              : TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  }
+  ExpectBatchBuild(ep, true);
+  const std::function<void(tt_iree_ttex_tensor_desc_t &)> mutations[] = {
+      [](auto &t) { t.binding = 14; },
+      [](auto &t) { t.byte_offset_constant = 1; },
+      [](auto &t) { t.shape[0] = 0; },
+      [](auto &t) { t.offset[0] = 5; },
+      [](auto &t) { t.stride[0] = 2; },
+      [](auto &t) {
+        t.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_UNKNOWN;
+      },
+      [](auto &t) { t.rank = 5; },
+      [](auto &t) { t.byte_offset = 1; },
+      [](auto &t) { t.byte_offset = UINT64_MAX - 3; },
+      [](auto &t) { t.layout = TT_IREE_TTEX_TENSOR_LAYOUT_NCHW; },
+      [](auto &t) { t.layout = 0; },
+      [](auto &t) { t.layout = 99; },
+      [](auto &t) { t.layout = TT_IREE_TTEX_TENSOR_LAYOUT_OI; },
+  };
+  for (const auto &mutate : mutations) {
+    auto invalid = ep;
+    mutate(invalid.bf16_native.tensors[13]);
+    ExpectBatchBuild(invalid, false);
+  }
+  ep.bf16_native.tensors[13] =
+      BatchTensor(13, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW,
+                  {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX});
+  ExpectBatchBuild(ep, false);
+  auto &o = ep.bf16_native.tensors[2];
+  o.shape[0] = o.storage_shape[0] = UINT32_MAX;
+  o.shape[2] = o.storage_shape[2] = UINT32_MAX;
+  o.shape[3] = o.storage_shape[3] = UINT32_MAX;
+  ExpectBatchBuild(ep, false);
+}
+
+TEST(TtexSchemaTest, Bf16BatchV20AcceptsLegacyChwAndRank2FcAnyM) {
+  auto ep = MakeBatchMatrix();
+  auto &d = ep.bf16_native;
+  d.tensors[0] = BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_CHW, {64, 5, 7});
+  d.tensors[2] = BatchTensor(2, TT_IREE_TTEX_TENSOR_LAYOUT_CHW, {32, 5, 7});
+  d.m = 35;
+  ExpectBatchBuild(ep, true);
+  for (uint32_t m : {1u, 16u, 33u}) {
+    d.m = m;
+    d.tensors[0] =
+        BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {m, 64});
+    d.tensors[2] =
+        BatchTensor(2, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, {m, 32});
+    for (auto kind : {TT_IREE_TTEX_DISPATCH_KIND_LINEAR,
+                      TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE}) {
+      d.operation_kind = kind;
+      ExpectBatchBuild(ep, true, TT_IREE_TTEX_VERSION_18);
+      ExpectBatchBuild(ep, true);
+      EXPECT_TRUE(tt_iree_bf16_matrix_geometry_is_valid(&d));
+    }
+  }
+}
+
+TEST(TtexSchemaTest, Bf16BatchV20NeverAcceptsSpatialPlan) {
+  auto ep = MakeBatchMatrix();
+  tt_iree_spatial_plan_t plan = {};
+  ep.spatial_plan = &plan;
+  ExpectBatchBuild(ep, false);
+  ep.spatial_plan = nullptr;
+  ExpectBatchBuild(ep, false, TT_IREE_TTEX_VERSION_19);
+  ExpectBatchBuild(ep, false, 99);
+}
+
+TEST(TtexSchemaTest, Bf16BatchV20RejectsNonBf16Capability) {
+  auto ep = MakeBatchMatrix();
+  ep.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_BUILTIN;
+  ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD;
+  ExpectBatchBuild(ep, false);
+  ep = MakeMatmulLikeEntry();
+  ExpectBatchBuild(ep, false);
+}
+
+TEST(TtexSchemaTest, Bf16BatchV20ConvolutionRequiresSupportedSpatialGeometry) {
+  auto ep = MakeBatchMatrix(TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, true);
+  auto &d = ep.bf16_native;
+  // 3x3 stride 2 with an even-sized input, retaining the floor in valid
+  // pooling.
+  d.tensors[0] =
+      BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, {16, 64, 12, 16});
+  ExpectBatchBuild(ep, true);
+  d.tensors[0] =
+      BatchTensor(0, TT_IREE_TTEX_TENSOR_LAYOUT_NCHW, {16, 64, 15, 19});
+  d.tensors[1] =
+      BatchTensor(1, TT_IREE_TTEX_TENSOR_LAYOUT_OIHW, {32, 64, 7, 7});
+  d.k = 64 * 7 * 7;
+  ExpectBatchBuild(ep, true);
+  const std::function<void(tt_iree_ttex_bf16_native_desc_t &)> mutations[] = {
+      [](auto &d) { d.tensors[0].shape[2] = 6; },
+      [](auto &d) { d.tensors[0].shape[3] = 7; },
+      [](auto &d) {
+        d.tensors[1].shape[2] = 5;
+        d.k = 64 * 5 * 7;
+      },
+      [](auto &d) { d.tensors[1].shape[3] = 0; },
+      [](auto &d) { d.tensors[0].shape[2] = 14; },
+  };
+  for (const auto &mutate : mutations) {
+    auto invalid = ep;
+    mutate(invalid.bf16_native);
+    ExpectBatchBuild(invalid, false);
+  }
+}
+
 TEST(TtexSchemaTest, BuiltinDispatchPairContract) {
   EXPECT_TRUE(tt_iree_ttex_builtin_matches_dispatch_kind(
       TT_IREE_TTEX_BUILTIN_PROGRAM_CUSTOM_SFPI_ADD,
@@ -417,7 +798,7 @@ TEST(TtexSchemaTest, BuildExplicitVersion) {
   ep.workgroup_size[2] = 1;
   ep.builtin_program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED;
 
-  constexpr uint32_t kFutureVersion = TT_IREE_TTEX_VERSION_19 + 1;
+  constexpr uint32_t kFutureVersion = 99;
   iree_byte_span_t data = {0};
   IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
       alloc, kFutureVersion, 1, &ep, &data));

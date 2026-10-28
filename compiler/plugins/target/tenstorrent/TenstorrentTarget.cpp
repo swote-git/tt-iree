@@ -3,9 +3,9 @@
 
 #include "TenstorrentTarget.h"
 #include "TenstorrentPreprocessingPass.h"
+#include "TenstorrentNativeKernels.h"
 #ifdef TT_IREE_ENABLE_AOT
 #include "TenstorrentAOTCompiler.h"
-#include "TenstorrentNativeKernels.h"
 #endif
 
 #include <algorithm>
@@ -76,6 +76,9 @@ inferExecutableTargetArch(IREE::HAL::ExecutableTargetAttr targetAttr,
   if (DictionaryAttr config = targetAttr.getConfiguration()) {
     if (auto targetArch = config.getAs<StringAttr>("target_arch")) {
       return inferTargetArch(targetArch.getValue());
+    }
+    if (auto deviceId = config.getAs<StringAttr>("device_id")) {
+      return inferTargetArch(deviceId.getValue());
     }
   }
   return inferTargetArch(fallbackDeviceId);
@@ -1976,8 +1979,9 @@ static FailureOr<BuiltinSelection> inferF32LinearProgram(func::FuncOp funcOp) {
 #include "TenstorrentBF16Lowering.inc"
 
 static FailureOr<BuiltinSelection> inferBuiltinProgram(func::FuncOp funcOp,
-                                                       bool bf16Tensix = false) {
-  auto bf16Selection = inferBF16NativeProgram(funcOp, bf16Tensix);
+                                                       bool bf16Tensix = false,
+                                                       bool bf16Reuse = false) {
+  auto bf16Selection = inferBF16NativeProgram(funcOp, bf16Tensix, bf16Reuse);
   if (succeeded(bf16Selection)) return bf16Selection;
   FailureOr<BuiltinSelection> paddedCopySelection =
       inferF32PaddedCopyProgram(funcOp);
@@ -2086,9 +2090,23 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
       MaterializeMatmulWorkgroupCountPass)
 
+  MaterializeMatmulWorkgroupCountPass() = default;
+  explicit MaterializeMatmulWorkgroupCountPass(StringRef fallbackDeviceId)
+      : fallbackDeviceId_(fallbackDeviceId.str()) {}
+
   void runOnOperation() override {
     auto variantOp = getOperation();
     ModuleOp innerModuleOp = variantOp.getInnerModule();
+    auto targetArch =
+        inferExecutableTargetArch(variantOp.getTarget(), fallbackDeviceId_);
+    if (!targetArch) {
+      variantOp.emitError("unsupported Tenstorrent target architecture; expected "
+                          "blackhole/p100a or wormhole_b0");
+      return signalPassFailure();
+    }
+    const bool blackhole = *targetArch == TT_IREE_TTEX_TARGET_ARCH_BLACKHOLE;
+    const uint32_t maxGridX = blackhole ? 11 : 8;
+    const uint32_t maxGridY = blackhole ? 10 : 8;
 
     for (auto exportOp : variantOp.getExportOps()) {
       auto funcOp =
@@ -2127,20 +2145,53 @@ public:
       builder.setInsertionPoint(funcOp.getBody().front().getTerminator());
       SmallVector<OpFoldResult, 2> workgroupCount;
 
-      if ((selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
-           !tt_iree_ttex_is_native_matrix_kind(selection->bf16Native.operation_kind)) ||
-          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
-          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
-          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
+      const uint8_t scalarKind =
+          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE
+              ? selection->bf16Native.operation_kind
+              : selection->dispatchKind;
+      if (scalarKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+          (selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
+           scalarKind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY)) {
+        const auto &output =
+            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE
+                ? selection->bf16Native.tensors[2]
+                : selection->maxPool.output;
+        uint64_t outputRows = 1;
+        for (unsigned i = 0; i + 1 < output.rank; ++i)
+          outputRows *= output.shape[i];
+        auto grid = selectNativeScalarGrid(outputRows, maxGridX, maxGridY);
+        workgroupCount.push_back(builder.getIndexAttr(grid.x));
+        workgroupCount.push_back(builder.getIndexAttr(grid.y));
+      } else if ((selection->dispatchKind ==
+                      TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
+                  !tt_iree_ttex_is_native_matrix_kind(
+                      selection->bf16Native.operation_kind)) ||
+                 selection->dispatchKind ==
+                     TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+                 selection->dispatchKind ==
+                     TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
+                 selection->dispatchKind ==
+                     TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
         workgroupCount.push_back(builder.getIndexAttr(1));
         workgroupCount.push_back(builder.getIndexAttr(1));
       } else if (selection->mTiles != 0 && selection->nTiles != 0) {
         uint32_t gridX = selection->nTiles;
         uint32_t gridY = selection->mTiles;
-        if (selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE ||
-            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
-            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
-            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
+        bool nativeMatrix =
+            selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
+#ifdef TT_IREE_ENABLE_AOT
+        nativeMatrix |=
+            tt_iree_ttex_is_native_matrix_kind(selection->dispatchKind);
+#endif
+        if (nativeMatrix) {
+          // Native start/count arguments support unequal, nonempty rectangles.
+          gridX = std::min(gridX, maxGridX);
+          gridY = std::min(gridY, maxGridY);
+        } else if (selection->dispatchKind ==
+                       TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+                   selection->dispatchKind ==
+                       TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+                   selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR) {
           constexpr uint32_t kPortableGridLimit = 8;
           gridX = std::min(gridX, kPortableGridLimit);
           while (selection->nTiles % gridX != 0)
@@ -2198,6 +2249,9 @@ public:
   StringRef getDescription() const final {
     return "Maps tiled matmul output tiles to the Tenstorrent core grid";
   }
+
+private:
+  std::string fallbackDeviceId_ = "p100a";
 };
 
 } // namespace
@@ -2259,7 +2313,8 @@ void TenstorrentTargetBackend::getDefaultExecutableTargets(
 
 void TenstorrentTargetBackend::buildTranslationPassPipeline(
     IREE::HAL::ExecutableTargetAttr targetAttr, OpPassManager &passManager) {
-  passManager.addPass(std::make_unique<MaterializeMatmulWorkgroupCountPass>());
+  passManager.addPass(
+      std::make_unique<MaterializeMatmulWorkgroupCountPass>(options_.deviceId));
   // Lower dispatch.workgroup_count_from_slice to concrete workgroup counts.
   // IREE v3.11 split hint resolution out of ReconcileTranslationInfo.
   passManager.addPass(createReconcileTranslationInfoPass());
@@ -2282,6 +2337,10 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
     const SerializationOptions &serOptions,
     IREE::HAL::ExecutableVariantOp variantOp, OpBuilder &executableBuilder) {
   auto loc = variantOp.getLoc();
+  if (options_.nativeBF16ReuseOutputTiles && !options_.nativeBF16UseTensix)
+    return variantOp.emitError(
+        "BF16 output-tile reuse requires "
+        "--iree-tenstorrent-native-bf16-use-tensix=true");
   ModuleOp innerModuleOp = variantOp.getInnerModule();
   std::optional<uint8_t> targetArch =
       inferExecutableTargetArch(variantOp.getTarget(), options_.deviceId);
@@ -2333,7 +2392,8 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       return exportOp.emitError("missing inner function for executable export");
     }
 
-    FailureOr<BuiltinSelection> builtinSelection = inferBuiltinProgram(funcOp, options_.nativeBF16UseTensix);
+    FailureOr<BuiltinSelection> builtinSelection = inferBuiltinProgram(
+        funcOp, options_.nativeBF16UseTensix, options_.nativeBF16ReuseOutputTiles);
     if (failed(builtinSelection)) {
       linalg::MatmulOp supportedMatmulOp;
       int supportedMatmulCount = 0;
@@ -2478,7 +2538,15 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       iree_allocator_system(),
       llvm::any_of(entryDescs, [](const auto &d) {
         return d.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
-      }) ? (options_.nativeBF16UseTensix ? TT_IREE_TTEX_VERSION_18 : TT_IREE_TTEX_VERSION_17)
+      }) ? (llvm::any_of(entryDescs, [](const auto &d) {
+              for (const auto &tensor : d.bf16_native.tensors)
+                if (tensor.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW ||
+                    tensor.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)
+                  return true;
+              return false;
+            }) ? TT_IREE_TTEX_VERSION_20
+               : options_.nativeBF16UseTensix ? TT_IREE_TTEX_VERSION_18
+                                             : TT_IREE_TTEX_VERSION_17)
          : options_.nativeF32UseTensix ? TT_IREE_TTEX_VERSION_16
                                  : TT_IREE_TTEX_VERSION_15,
       entryDescs.size(), entryDescs.data(), &ttexData);

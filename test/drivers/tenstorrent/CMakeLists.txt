@@ -178,6 +178,24 @@ tt_iree_hal_test(
 # Physical dispatch tests exercise the same compiler-generated AOT bundles as
 # production VMFBs instead of relying on tt-metal example/test kernel paths.
 if(TARGET TenstorrentAOTCompiler)
+  if(NOT TT_IREE_ENABLE_MOCK)
+    tt_iree_hal_test(NAME native_spatial_test SRCS native_spatial_test.cc
+      DEPS TenstorrentAOTCompiler tt_executable_builder_util)
+    target_compile_features(native_spatial_test PRIVATE cxx_std_20)
+    set_property(TARGET native_spatial_test PROPERTY CXX_SCAN_FOR_MODULES OFF)
+    target_include_directories(native_spatial_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent)
+    set_tests_properties(tt_native_spatial_test PROPERTIES
+      LABELS "tt-iree;hal;device-native;spatial" RUN_SERIAL TRUE)
+    tt_iree_hal_test(NAME native_reader_test SRCS native_reader_test.cc
+      DEPS TenstorrentAOTCompiler tt_executable_builder_util)
+    target_compile_features(native_reader_test PRIVATE cxx_std_20)
+    set_property(TARGET native_reader_test PROPERTY CXX_SCAN_FOR_MODULES OFF)
+    target_include_directories(native_reader_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent)
+    set_tests_properties(tt_native_reader_test PROPERTIES
+      LABELS "tt-iree;hal;device-native;bf16;reader" RUN_SERIAL TRUE TIMEOUT 600)
+  endif()
   tt_iree_hal_test(NAME aot_artifact_test SRCS aot_artifact_test.cc
     DEPS TenstorrentAOTCompiler tt_executable_builder_util)
   target_compile_features(aot_artifact_test PRIVATE cxx_std_20)

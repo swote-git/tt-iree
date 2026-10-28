@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
+#include "iree/hal/drivers/tenstorrent/tt_native_partition.h"
 
 #include <chrono>
 #include <cstdio>
@@ -48,7 +49,7 @@ thread_local RuntimeTransferStage *current_stage = nullptr;
 
 constexpr char kCoreMappingHeader[] =
     "GLOBAL CALL COUNT,OP CODE,CORE X,CORE Y,M TILE BEGIN,M TILE END,N TILE "
-    "BEGIN,N TILE END,K TILE COUNT\n";
+    "BEGIN,N TILE END,K TILE COUNT,ELEMENT BEGIN,ELEMENT END,PARTITION UNIT\n";
 
 constexpr char kPreparationHeader[] =
     "EVENT,HOST START TS [ns],HOST END TS [ns],HOST DURATION [ns],STATUS CODE,"
@@ -292,9 +293,9 @@ RuntimeProfiler::AppendOperationLocked(const RuntimeProfileRecord &record) {
 iree_status_t
 RuntimeProfiler::AppendCoreMappingLocked(const RuntimeProfileRecord &record) {
   if (record.grid_x == 0 || record.grid_y == 0 || record.grid_z != 1 ||
-      record.m_tiles == 0 || record.n_tiles == 0 ||
-      record.m_tiles % record.grid_y != 0 ||
-      record.n_tiles % record.grid_x != 0) {
+      (!record.scalar_elements && (record.m_tiles == 0 || record.n_tiles == 0 ||
+                                   record.grid_y > record.m_tiles ||
+                                   record.grid_x > record.n_tiles))) {
     return iree_ok_status();
   }
 
@@ -307,16 +308,37 @@ RuntimeProfiler::AppendCoreMappingLocked(const RuntimeProfileRecord &record) {
                             path.c_str());
   }
 
-  const uint32_t per_core_m_tiles = record.m_tiles / record.grid_y;
-  const uint32_t per_core_n_tiles = record.n_tiles / record.grid_x;
+  if (record.scalar_elements) {
+    for (uint32_t y = 0; y < record.grid_y; ++y)
+      for (uint32_t x = 0; x < record.grid_x; ++x) {
+        NativeElementRange range;
+        if (!PartitionNativeScalarRange(
+                record.scalar_elements, record.scalar_row_width,
+                y * record.grid_x + x, record.grid_x * record.grid_y, &range))
+          return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                  "invalid scalar core mapping");
+        output << record.global_call_count << ',' << CsvEscape(record.op_code)
+               << ',' << x << ',' << y << ",,,,,," << range.begin << ','
+               << uint64_t(range.begin) + range.count << ",rows\n";
+      }
+    return CheckOutputStream(output, path);
+  }
+
   for (uint32_t core_y = 0; core_y < record.grid_y; ++core_y) {
     for (uint32_t core_x = 0; core_x < record.grid_x; ++core_x) {
-      const uint32_t m_begin = core_y * per_core_m_tiles;
-      const uint32_t n_begin = core_x * per_core_n_tiles;
+      NativeTileRectangle partition;
+      if (!PartitionNativeMatrixTiles(record.m_tiles, record.n_tiles, core_y,
+                                       core_x, record.grid_y, record.grid_x,
+                                       &partition))
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "invalid matrix core mapping");
       output << record.global_call_count << ',' << CsvEscape(record.op_code)
-             << ',' << core_x << ',' << core_y << ',' << m_begin << ','
-             << m_begin + per_core_m_tiles << ',' << n_begin << ','
-             << n_begin + per_core_n_tiles << ',' << record.k_tiles << '\n';
+             << ',' << core_x << ',' << core_y << ',' << partition.m_begin << ','
+             << uint64_t(partition.m_begin) + partition.m_count << ','
+             << partition.n_begin << ','
+             << uint64_t(partition.n_begin) + partition.n_count << ','
+             << record.k_tiles
+             << ",,,tiles\n";
     }
   }
   return CheckOutputStream(output, path);

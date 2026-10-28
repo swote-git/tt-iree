@@ -23,6 +23,7 @@
 #include "iree/hal/drivers/tenstorrent/tt_command_buffer.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
 #include "iree/hal/drivers/tenstorrent/tt_executable_cache.h"
+#include "iree/hal/drivers/tenstorrent/tt_native_partition.h"
 #include "iree/hal/drivers/tenstorrent/tt_runtime_checkpoint.h"
 #include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
 #include "iree/hal/drivers/tenstorrent/tt_semaphore.h"
@@ -3669,6 +3670,16 @@ static iree_status_t iree_hal_tt_make_profile_record(
     record.m = params->bf16_native.m;
     record.n = params->bf16_native.n;
     record.k = params->bf16_native.k;
+    if (params->bf16_native.operation_kind ==
+            TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+        params->bf16_native.operation_kind ==
+            TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {
+      const auto &out = params->bf16_native.tensors[2];
+      record.scalar_elements = 1;
+      for (unsigned axis = 0; axis < out.rank; ++axis)
+        record.scalar_elements *= out.shape[axis];
+      record.scalar_row_width = out.shape[out.rank - 1];
+    }
     break;
   case TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_32X32X32:
     record.m = record.n = record.k = TT_TILE_HEIGHT;

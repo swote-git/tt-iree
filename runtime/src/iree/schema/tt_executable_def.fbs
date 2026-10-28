@@ -93,6 +93,10 @@ enum TensorLayout : uint8 {
   OI = 3,
   OIHW = 4,
   CHANNEL_MAJOR = 5,
+  // v20: batch-major [B, C, H, W]; CHW remains unbatched [C, H, W].
+  NCHW = 6,
+  // v20: [B, C, spatial], with contiguous spatial positions per channel.
+  BATCH_CHANNEL_MAJOR = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +310,12 @@ table LinearDef {
 
 // v17 static BF16 ResNet kernels. Absent slots have rank zero; slot 2 is output.
 // Matrix operands use slots 0/1. Scalar epilogues preserve explicit IR casts.
+// v20 adds static batch layouts without changing the 14 address/base pairs.
+// Matrix M flattens B*Hout*Wout (NCHW) or B*spatial (BATCH_CHANNEL_MAJOR).
+// N is Cout; K is Cin*Kh*Kw for convolution, otherwise Cin. Weights remain
+// OIHW/OI. Scalar programs retain builtin 11; matrix programs may use 11 or 12.
+// Batched global sum reduces the leading 7x7 of [B,C,8,8], returning flattened
+// [B*C] and a BF16 scalar divisor of 49 in slot 1. Scalar division stays flat.
 table BF16NativeDef {
   operation_kind:uint8;
   m:uint32;
@@ -432,7 +442,7 @@ table EntryPointDef {
   linear:LinearDef;
   bf16_native:BF16NativeDef;
 
-  // Append-only v19 execution contract; never valid on v1-v18 payloads.
+  // Append-only v19 execution contract; valid only on v19 payloads, not v20.
   spatial_plan:SpatialPlanDef;
 
   // --- Phase C extension point (TTNN high-level op) ---
@@ -446,7 +456,8 @@ table EntryPointDef {
 table ExecutableDef {
   // Schema version. Keep the default at 0 forever so old blobs with an absent
   // field remain distinguishable. The compiler emits v15 for F32 and v17 for
-  // native BF16. Execution supports v1-v18; v19 spatial plans are validated
+  // native BF16. Execution supports v1-v18 and opt-in v20 static BF16 batches;
+  // v19 spatial plans are validated
   // but rejected until a spatial executor is implemented. v13 adds specialized
   // native matrix kernels and single-reader pooling/reduction/division kernels.
   // v14 adds BF16 component CBs 4-7 and six-product FP32 accumulation/output.

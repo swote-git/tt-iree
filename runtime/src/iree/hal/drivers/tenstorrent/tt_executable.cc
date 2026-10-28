@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/hal/drivers/tenstorrent/tt_executable.h"
+#include "iree/schema/tt_bf16_native_validation.h"
 #include "iree/schema/tt_native_dispatch.h"
 
 #include <string.h>
@@ -1775,11 +1776,12 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       version != TT_IREE_TTEX_VERSION_16 &&
       version != TT_IREE_TTEX_VERSION_17 &&
       version != TT_IREE_TTEX_VERSION_18 &&
-      version != TT_IREE_TTEX_VERSION_19) {
+      version != TT_IREE_TTEX_VERSION_19 &&
+      version != TT_IREE_TTEX_VERSION_20) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
         "unsupported TTEX version %u (runtime supports versions %u-%u)",
-        version, TT_IREE_TTEX_VERSION_1, TT_IREE_TTEX_CURRENT_VERSION);
+        version, TT_IREE_TTEX_VERSION_1, TT_IREE_TTEX_MAX_KNOWN_VERSION);
   }
 
   ttex_ns(EntryPointDef_vec_t) eps = ttex_ns(ExecutableDef_entry_points(def));
@@ -1815,6 +1817,11 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
     ttex_ns(EntryPointDef_table_t) fb_ep =
         ttex_ns(EntryPointDef_vec_at(eps, i));
     uint32_t builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
+    if (version == TT_IREE_TTEX_VERSION_20 &&
+        ttex_ns(EntryPointDef_dispatch_kind(fb_ep)) !=
+            TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "TTEX v20 is reserved for BF16 native dispatches");
     if (!iree_hal_tt_is_supported_builtin(builtin_program)) {
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "TTEX entry point %zu uses unsupported builtin "
@@ -1860,12 +1867,15 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
     } else if (dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
       auto native = ttex_ns(EntryPointDef_bf16_native(fb_ep));
       bool tensix = builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
-      if ((version != TT_IREE_TTEX_VERSION_17 && version != TT_IREE_TTEX_VERSION_18) || !native ||
+      if ((version != TT_IREE_TTEX_VERSION_17 &&
+           version != TT_IREE_TTEX_VERSION_18 &&
+           version != TT_IREE_TTEX_VERSION_20) || !native ||
           (builtin_program != TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE && !tensix) ||
-          (tensix && version != TT_IREE_TTEX_VERSION_18) ||
+          (tensix && version != TT_IREE_TTEX_VERSION_18 &&
+           version != TT_IREE_TTEX_VERSION_20) ||
           !ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep)))
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17/v18 descriptor and AOT; Tensix requires v18");
+                                "BF16 native requires v17/v18/v20 descriptor and AOT; Tensix requires v18/v20");
       auto tensors = ttex_ns(BF16NativeDef_tensors(native));
       uint8_t kind = ttex_ns(BF16NativeDef_operation_kind(native));
       if (tensix && !tt_iree_ttex_is_native_matrix_kind(kind))
@@ -1873,20 +1883,34 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
                                 "BF16 Tensix requires a matrix operation");
       if (ttex_ns(TensorDesc_vec_len(tensors)) != TT_IREE_BF16_NATIVE_TENSOR_COUNT ||
           kind < TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
-          kind > TT_IREE_TTEX_DISPATCH_KIND_LINEAR ||
-          !ttex_ns(TensorDesc_rank(ttex_ns(TensorDesc_vec_at(tensors, 2)))))
+          kind > TT_IREE_TTEX_DISPATCH_KIND_LINEAR)
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                                 "invalid BF16 native tensor slots or operation");
       bool has_bf16 = false;
+      tt_iree_ttex_bf16_native_desc_t desc = {};
+      desc.operation_kind = kind;
+      desc.m = ttex_ns(BF16NativeDef_m(native));
+      desc.n = ttex_ns(BF16NativeDef_n(native));
+      desc.k = ttex_ns(BF16NativeDef_k(native));
       for (unsigned j = 0; j < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++j) {
         auto tensor = ttex_ns(TensorDesc_vec_at(tensors, j));
-        if (!tensor || !ttex_ns(TensorDesc_rank(tensor))) continue;
+        if (!tensor)
+          return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                  "BF16 native tensor slot is missing");
+        iree_hal_tt_copy_tensor_desc(tensor, &desc.tensors[j]);
+        if (!ttex_ns(TensorDesc_rank(tensor))) continue;
         IREE_RETURN_IF_ERROR(iree_hal_tt_validate_tensor_desc(
             tensor, ttex_ns(EntryPointDef_binding_count(fb_ep)),
             ttex_ns(EntryPointDef_constant_count(fb_ep)), "BF16-native", "slot", true));
         has_bf16 |= ttex_ns(TensorDesc_element_type(tensor)) == TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
       }
-      if (!has_bf16 || (tt_iree_ttex_is_native_matrix_kind(kind) &&
+      IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_layout_version(&desc, version));
+      if (version == TT_IREE_TTEX_VERSION_20) {
+        IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_native_v20(
+            &desc, builtin_program, ttex_ns(EntryPointDef_binding_count(fb_ep)),
+            ttex_ns(EntryPointDef_constant_count(fb_ep))));
+      }
+      if (!desc.tensors[2].rank || !has_bf16 || (tt_iree_ttex_is_native_matrix_kind(kind) &&
           (!ttex_ns(BF16NativeDef_m(native)) || !ttex_ns(BF16NativeDef_n(native)) ||
            !ttex_ns(BF16NativeDef_k(native)) || !ttex_ns(TensorDesc_rank(ttex_ns(TensorDesc_vec_at(tensors, 0)))) ||
            !ttex_ns(TensorDesc_rank(ttex_ns(TensorDesc_vec_at(tensors, 1)))))))
@@ -1917,31 +1941,7 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
             ttex_ns(TensorDesc_element_type(rhs)) != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
             ttex_ns(TensorDesc_shape_0(rhs)) != n)
           return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native matrix shape/dtype contract mismatch");
-        bool valid_geometry = false;
-        if (kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION) {
-          valid_geometry = ttex_ns(TensorDesc_rank(lhs)) == 3 &&
-              ttex_ns(TensorDesc_rank(rhs)) == 4 && ttex_ns(TensorDesc_rank(output)) == 3 &&
-              ttex_ns(TensorDesc_layout(lhs)) == TT_IREE_TTEX_TENSOR_LAYOUT_CHW &&
-              ttex_ns(TensorDesc_layout(rhs)) == TT_IREE_TTEX_TENSOR_LAYOUT_OIHW &&
-              ttex_ns(TensorDesc_layout(output)) == TT_IREE_TTEX_TENSOR_LAYOUT_CHW &&
-              ttex_ns(TensorDesc_shape_0(lhs)) == ttex_ns(TensorDesc_shape_1(rhs)) &&
-              static_cast<uint64_t>(ttex_ns(TensorDesc_shape_0(lhs))) *
-                  ttex_ns(TensorDesc_shape_2(rhs)) * ttex_ns(TensorDesc_shape_3(rhs)) == k;
-        } else {
-          bool row_major = kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR;
-          uint8_t lhs_layout = ttex_ns(TensorDesc_layout(lhs));
-          valid_geometry = ttex_ns(TensorDesc_rank(rhs)) == 2 &&
-              ttex_ns(TensorDesc_layout(rhs)) == TT_IREE_TTEX_TENSOR_LAYOUT_OI &&
-              ttex_ns(TensorDesc_shape_1(rhs)) == k &&
-              (row_major ? (lhs_layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR &&
-                 ttex_ns(TensorDesc_rank(lhs)) == 2 && ttex_ns(TensorDesc_shape_0(lhs)) == m &&
-                 ttex_ns(TensorDesc_shape_1(lhs)) == k) :
-                ((lhs_layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW || lhs_layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR) &&
-                 ttex_ns(TensorDesc_shape_0(lhs)) == k)) &&
-              ttex_ns(TensorDesc_layout(output)) == lhs_layout &&
-              ttex_ns(TensorDesc_rank(output)) == ttex_ns(TensorDesc_rank(lhs));
-        }
-        if (!valid_geometry)
+        if (!tt_iree_bf16_matrix_geometry_is_valid(&desc))
           return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native matrix layout/K contract mismatch");
       } else if (ttex_ns(BF16NativeDef_m(native)) || ttex_ns(BF16NativeDef_n(native)) || ttex_ns(BF16NativeDef_k(native))) {
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 scalar dispatch cannot have matrix dimensions");

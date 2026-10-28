@@ -369,5 +369,113 @@ TEST(RuntimeProfilerTest, DisabledTransfersDoNotCreateRecords) {
   IREE_ASSERT_OK(profiler.Flush());
 }
 
+TEST(RuntimeProfilerTest, MatrixCoreMapReportsAll110BalancedTileRectangles) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_matrix_mapping_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "Blackhole"));
+  RuntimeProfileRecord record;
+  record.op_code = "balanced_matrix";
+  record.execution_domain = "device_native";
+  record.grid_x = 11;
+  record.grid_y = 10;
+  record.grid_z = 1;
+  record.m_tiles = 33;
+  record.n_tiles = 32;
+  record.k_tiles = 4;
+  IREE_ASSERT_OK(profiler.Record(record));
+  std::istringstream lines(ReadFile(directory / "core_mapping.csv"));
+  std::string header, line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(lines, header)));
+  std::vector<uint32_t> coverage(33 * 32);
+  size_t count = 0;
+  while (std::getline(lines, line)) {
+    EXPECT_EQ(CsvColumnCount(header), CsvColumnCount(line));
+    std::istringstream fields(line);
+    std::vector<std::string> columns;
+    for (std::string field; std::getline(fields, field, ',');)
+      columns.push_back(field);
+    ASSERT_EQ(columns.size(), 12u);
+    const auto x = std::stoul(columns[2]), y = std::stoul(columns[3]);
+    const auto mb = std::stoul(columns[4]), me = std::stoul(columns[5]);
+    const auto nb = std::stoul(columns[6]), ne = std::stoul(columns[7]);
+    EXPECT_EQ(x, count % 11);
+    EXPECT_EQ(y, count / 11);
+    EXPECT_EQ(mb, 33 * y / 10);
+    EXPECT_EQ(me, 33 * (y + 1) / 10);
+    EXPECT_EQ(nb, 32 * x / 11);
+    EXPECT_EQ(ne, 32 * (x + 1) / 11);
+    ASSERT_LT(mb, me);
+    ASSERT_LT(nb, ne);
+    ASSERT_LE(me, 33u);
+    ASSERT_LE(ne, 32u);
+    EXPECT_EQ(columns[8], "4");
+    EXPECT_EQ(columns[11], "tiles");
+    for (auto m = mb; m < me; ++m)
+      for (auto n = nb; n < ne; ++n)
+        ++coverage[m * 32 + n];
+    ++count;
+  }
+  EXPECT_EQ(count, 110u);
+  for (auto tiles : coverage)
+    EXPECT_EQ(tiles, 1u);
+  std::filesystem::remove_all(directory);
+}
+
+TEST(RuntimeProfilerTest, MatrixCoreMapSkipsGridsWithIdleCores) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_idle_matrix_mapping_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "Blackhole"));
+  RuntimeProfileRecord record;
+  record.op_code = "idle_matrix";
+  record.execution_domain = "device_native";
+  record.grid_x = 11;
+  record.grid_y = 10;
+  record.grid_z = 1;
+  record.m_tiles = 9;
+  record.n_tiles = 32;
+  IREE_ASSERT_OK(profiler.Record(record));
+  record.m_tiles = 32;
+  record.n_tiles = 10;
+  IREE_ASSERT_OK(profiler.Record(record));
+  std::istringstream lines(ReadFile(directory / "core_mapping.csv"));
+  std::string line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(lines, line)));
+  EXPECT_FALSE(static_cast<bool>(std::getline(lines, line)));
+  std::filesystem::remove_all(directory);
+}
+
+TEST(RuntimeProfilerTest, ScalarCoreMapReportsRowRangesIncludingIdleCores) {
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      ("tt_iree_scalar_mapping_" + std::to_string(RuntimeProfiler::NowNs()));
+  RuntimeProfiler profiler;
+  IREE_ASSERT_OK(profiler.Initialize(directory.string(), 0, "mock"));
+  RuntimeProfileRecord record;
+  record.op_code = "pool";
+  record.execution_domain = "device_native";
+  record.grid_x = record.grid_y = 8;
+  record.grid_z = 1;
+  record.scalar_elements = 15 * 19;
+  record.scalar_row_width = 19;
+  IREE_ASSERT_OK(profiler.Record(record));
+  const auto mapping = ReadFile(directory / "core_mapping.csv");
+  EXPECT_NE(mapping.find("1,pool,0,0,,,,,,0,0,rows"), std::string::npos);
+  EXPECT_NE(mapping.find("1,pool,7,7,,,,,,266,285,rows"), std::string::npos);
+  std::istringstream lines(mapping);
+  std::string header, line;
+  ASSERT_TRUE(static_cast<bool>(std::getline(lines, header)));
+  size_t count = 0;
+  while (std::getline(lines, line)) {
+    EXPECT_EQ(CsvColumnCount(header), CsvColumnCount(line));
+    ++count;
+  }
+  EXPECT_EQ(count, 64u);
+  std::filesystem::remove_all(directory);
+}
+
 } // namespace
 } // namespace iree::hal::tenstorrent

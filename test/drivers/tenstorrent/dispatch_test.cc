@@ -642,7 +642,7 @@ TEST_F(DispatchTest, RejectsUnsupportedTtexVersion) {
 
   iree_byte_span_t data = {0};
   IREE_ASSERT_OK(tt_iree_build_ttex_executable_def_with_version(
-      host_allocator(), TT_IREE_TTEX_VERSION_19 + 1, 1, &ep, &data));
+      host_allocator(), TT_IREE_TTEX_MAX_KNOWN_VERSION + 1, 1, &ep, &data));
 
   iree_hal_executable_params_t exec_params;
   iree_hal_executable_params_initialize(&exec_params);

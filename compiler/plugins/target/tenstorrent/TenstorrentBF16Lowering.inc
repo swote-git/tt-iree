@@ -1,11 +1,23 @@
 // Copyright 2026 The tt-iree Authors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-// Static batch-one ResNet BF16 patterns, not a general MLIR interpreter.
+// Static ResNet BF16 patterns, not a general MLIR interpreter.
 
 static std::string bf16FloatLiteral(float value) {
   uint32_t raw;
   memcpy(&raw, &value, 4);
   return "from_bits(" + std::to_string(raw) + "u)";
+}
+
+static bool bf16MatrixProduct(uint32_t &result,
+                              std::initializer_list<int64_t> dimensions) {
+  uint64_t product = 1;
+  for (int64_t dimension : dimensions) {
+    if (dimension <= 0 || uint64_t(dimension) > (UINT32_MAX - 31u) / product)
+      return false;
+    product *= dimension;
+  }
+  result = product;
+  return true;
 }
 
 static LogicalResult bf16LoadDesc(Value value, uint8_t layout,
@@ -159,6 +171,54 @@ static bool bf16ContractionBody(linalg::GenericOp op) {
          source(mul.getRhs()) == body.getArgument(1);
 }
 
+static bool bf16BatchedProjection(linalg::GenericOp op, bool spatial) {
+  unsigned loops = spatial ? 5 : 4;
+  auto *ctx = op.getContext();
+  SmallVector<AffineExpr> d;
+  for (unsigned i = 0; i < loops; ++i)
+    d.push_back(getAffineDimExpr(i, ctx));
+  SmallVector<AffineExpr> input = {d[0], d.back(), d[2]};
+  SmallVector<AffineExpr> output = {d[0], d[1], d[2]};
+  if (spatial) {
+    input.push_back(d[3]);
+    output.push_back(d[3]);
+  }
+  SmallVector<utils::IteratorType> iterators(loops,
+                                             utils::IteratorType::parallel);
+  iterators.back() = utils::IteratorType::reduction;
+  return op.getIteratorTypesArray() == iterators &&
+         op.getIndexingMapsArray() ==
+             SmallVector<AffineMap>{
+                 AffineMap::get(loops, 0, input, ctx),
+                 AffineMap::get(loops, 0, {d[1], d.back()}, ctx),
+                 AffineMap::get(loops, 0, output, ctx)};
+}
+
+static std::optional<uint32_t> bf16ConvolutionStride(linalg::GenericOp op) {
+  if (auto stride = inferConv2DStride(op))
+    return stride;
+  auto *ctx = op.getContext();
+  auto b = getAffineDimExpr(0, ctx), n = getAffineDimExpr(1, ctx),
+       h = getAffineDimExpr(2, ctx), w = getAffineDimExpr(3, ctx),
+       k = getAffineDimExpr(4, ctx), kh = getAffineDimExpr(5, ctx),
+       kw = getAffineDimExpr(6, ctx);
+  if (op.getIteratorTypesArray() !=
+      SmallVector<utils::IteratorType>{
+          utils::IteratorType::parallel, utils::IteratorType::parallel,
+          utils::IteratorType::parallel, utils::IteratorType::parallel,
+          utils::IteratorType::reduction, utils::IteratorType::reduction,
+          utils::IteratorType::reduction})
+    return std::nullopt;
+  for (uint32_t stride : {1u, 2u})
+    if (op.getIndexingMapsArray() ==
+        SmallVector<AffineMap>{
+            AffineMap::get(7, 0, {b, k, h * stride + kh, w * stride + kw}, ctx),
+            AffineMap::get(7, 0, {n, k, kh, kw}, ctx),
+            AffineMap::get(7, 0, {b, n, h, w}, ctx)})
+      return stride;
+  return std::nullopt;
+}
+
 static bool bf16GlobalSumBody(linalg::GenericOp op, tensor::ExtractOp extract) {
   auto &block = op.getRegion().front();
   auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
@@ -166,7 +226,7 @@ static bool bf16GlobalSumBody(linalg::GenericOp op, tensor::ExtractOp extract) {
       !block.getArgument(0).use_empty() ||
       !block.getArgument(1).getType().isBF16() ||
       getConstantFloat(yield.getValues()[1]) != std::optional<double>(49.0) ||
-      extract.getIndices().size() != 3)
+      (extract.getIndices().size() != 3 && extract.getIndices().size() != 4))
     return false;
   auto add = yield.getValues()[0].getDefiningOp<arith::AddFOp>();
   if (!add)
@@ -182,12 +242,31 @@ static bool bf16GlobalSumBody(linalg::GenericOp op, tensor::ExtractOp extract) {
         constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
     return attr && attr.getInt() == 7;
   };
-  auto channel = extract.getIndices()[0].getDefiningOp<linalg::IndexOp>();
-  auto height = extract.getIndices()[1].getDefiningOp<arith::DivSIOp>();
-  auto width = extract.getIndices()[2].getDefiningOp<arith::RemSIOp>();
-  if (!channel || channel.getDim() != 0 || !height || !width ||
-      height.getLhs() != width.getLhs() || !isSeven(height.getRhs()) ||
-      !isSeven(width.getRhs()))
+  unsigned first = extract.getIndices().size() == 4 ? 1 : 0;
+  if (first) {
+    auto batch = extract.getIndices()[0].getDefiningOp<arith::DivSIOp>();
+    auto channel = extract.getIndices()[1].getDefiningOp<arith::RemSIOp>();
+    auto type = cast<RankedTensorType>(extract.getTensor().getType());
+    auto constant = batch ? batch.getRhs().getDefiningOp<arith::ConstantOp>()
+                          : arith::ConstantOp{};
+    auto channels =
+        constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
+    if (!batch || !channel || batch.getLhs() != channel.getLhs() ||
+        batch.getRhs() != channel.getRhs() || !channels ||
+        channels.getInt() != type.getDimSize(1))
+      return false;
+    auto index = batch.getLhs().getDefiningOp<linalg::IndexOp>();
+    if (!index || index.getDim() != 0)
+      return false;
+  } else {
+    auto channel = extract.getIndices()[0].getDefiningOp<linalg::IndexOp>();
+    if (!channel || channel.getDim() != 0)
+      return false;
+  }
+  auto height = extract.getIndices()[first + 1].getDefiningOp<arith::DivSIOp>();
+  auto width = extract.getIndices()[first + 2].getDefiningOp<arith::RemSIOp>();
+  if (!height || !width || height.getLhs() != width.getLhs() ||
+      !isSeven(height.getRhs()) || !isSeven(width.getRhs()))
     return false;
   auto index = height.getLhs().getDefiningOp<linalg::IndexOp>();
   if (!index || index.getDim() != 1)
@@ -221,6 +300,10 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
   if (!maps.back().isIdentity() || !maps[0].isIdentity())
     return failure();
   BF16ScalarEmitter emitter;
+  const bool nchw = layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW;
+  const bool ncm = layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR;
+  unsigned channelAxis =
+      (nchw || ncm || layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR) ? 1 : 0;
   auto &body = op.getRegion().front();
   emitter.values[body.getArgument(0)] = "value";
   std::ostringstream constants;
@@ -231,14 +314,24 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
       return failure();
     std::string coords;
     if (maps[i].isIdentity() && inputType.getShape() == type.getShape()) {
-      coords = layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW
-                   ? "n,m/" + std::to_string(type.getDimSize(2)) + "u,m%" +
-                         std::to_string(type.getDimSize(2)) + "u"
-               : layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR ? "n,m"
-                                                                    : "m,n";
+      if (nchw) {
+        coords = "m/" +
+                 std::to_string(type.getDimSize(2) * type.getDimSize(3)) +
+                 "u,n,(m/" + std::to_string(type.getDimSize(3)) + "u)%" +
+                 std::to_string(type.getDimSize(2)) + "u,m%" +
+                 std::to_string(type.getDimSize(3)) + "u";
+      } else if (ncm) {
+        coords = "m/" + std::to_string(type.getDimSize(2)) + "u,n,m%" +
+                 std::to_string(type.getDimSize(2)) + "u";
+      } else
+        coords = layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW
+                     ? "n,m/" + std::to_string(type.getDimSize(2)) + "u,m%" +
+                           std::to_string(type.getDimSize(2)) + "u"
+                 : layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR ? "n,m"
+                                                                      : "m,n";
     } else if (inputType.getRank() == 1 && maps[i].getNumResults() == 1 &&
-               maps[i].getResult(0) == getAffineDimExpr(0, op.getContext()) &&
-               layout != TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR)
+               maps[i].getResult(0) ==
+                   getAffineDimExpr(channelAxis, op.getContext()))
       coords = "n";
     else
       return failure();
@@ -298,7 +391,8 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
 }
 
 static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
-                                                         bool useTensix) {
+                                                          bool useTensix,
+                                                          bool reuseOutputTiles) {
   bool hasBF16 = false;
   func.walk([&](IREE::TensorExt::DispatchTensorLoadOp load) {
     auto type = dyn_cast<RankedTensorType>(load.getType());
@@ -370,11 +464,15 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
       geometry.linear.m = d.m;
       geometry.linear.n = d.n;
       geometry.linear.k = d.k;
-    } else if (auto stride = inferConv2DStride(contraction)) {
-      if (lhsType.getRank() != 3 || rhsType.getRank() != 4 ||
-          resultType.getRank() != 3)
+    } else if (auto stride = bf16ConvolutionStride(contraction)) {
+      bool batched = lhsType.getRank() == 4;
+      unsigned channel = batched ? 1 : 0;
+      if (lhsType.getRank() != (batched ? 4 : 3) || rhsType.getRank() != 4 ||
+          resultType.getRank() != lhsType.getRank() ||
+          (batched && lhsType.getDimSize(0) != resultType.getDimSize(0)))
         return failure();
-      layout = TT_IREE_TTEX_TENSOR_LAYOUT_CHW;
+      layout = batched ? TT_IREE_TTEX_TENSOR_LAYOUT_NCHW
+                       : TT_IREE_TTEX_TENSOR_LAYOUT_CHW;
       d.operation_kind = geometry.dispatch_kind =
           TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
       auto &c = geometry.conv2d;
@@ -385,35 +483,71 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
       if (!((c.kernel_h == 3 && c.kernel_w == 3) ||
             (c.kernel_h == 7 && c.kernel_w == 7 && *stride == 2)))
         return failure();
-      d.m = resultType.getDimSize(1) * resultType.getDimSize(2);
-      d.n = resultType.getDimSize(0);
-      d.k = lhsType.getDimSize(0) * c.kernel_h * c.kernel_w;
-      if (rhsType.getDimSize(1) != lhsType.getDimSize(0) ||
-          (lhsType.getDimSize(1) - c.kernel_h) / *stride + 1 !=
-              resultType.getDimSize(1) ||
-          (lhsType.getDimSize(2) - c.kernel_w) / *stride + 1 !=
-              resultType.getDimSize(2))
+      if (!bf16MatrixProduct(d.m, {resultType.getDimSize(channel + 1),
+                                   resultType.getDimSize(channel + 2),
+                                   batched ? resultType.getDimSize(0) : 1}) ||
+          !bf16MatrixProduct(
+              d.k, {lhsType.getDimSize(channel), c.kernel_h, c.kernel_w}))
+        return failure();
+      d.n = resultType.getDimSize(channel);
+      if (rhsType.getDimSize(1) != lhsType.getDimSize(channel) ||
+          lhsType.getDimSize(channel + 1) < c.kernel_h ||
+          lhsType.getDimSize(channel + 2) < c.kernel_w ||
+          (lhsType.getDimSize(channel + 1) - c.kernel_h) / *stride + 1 !=
+              resultType.getDimSize(channel + 1) ||
+          (lhsType.getDimSize(channel + 2) - c.kernel_w) / *stride + 1 !=
+              resultType.getDimSize(channel + 2))
         return failure();
     } else {
-      bool spatial = matchesProjectionIndexingMaps(contraction);
-      if (!spatial && !matchesFlattenedProjectionIndexingMaps(contraction))
+      bool batchedSpatial = bf16BatchedProjection(contraction, true);
+      bool batchedFlat = bf16BatchedProjection(contraction, false);
+      bool batched = batchedSpatial || batchedFlat;
+      bool spatial =
+          batchedSpatial || matchesProjectionIndexingMaps(contraction);
+      if (!batched && !spatial &&
+          !matchesFlattenedProjectionIndexingMaps(contraction))
         return failure();
-      if (rhsType.getRank() != 2 || lhsType.getRank() != (spatial ? 3 : 2))
+      if (rhsType.getRank() != 2 ||
+          lhsType.getRank() != (spatial ? 3 : 2) + (batched ? 1 : 0) ||
+          resultType.getRank() != lhsType.getRank() ||
+          (batched && lhsType.getDimSize(0) != resultType.getDimSize(0)))
         return failure();
-      layout = spatial ? TT_IREE_TTEX_TENSOR_LAYOUT_CHW
-                       : TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR;
+      layout = batched
+                   ? (spatial ? TT_IREE_TTEX_TENSOR_LAYOUT_NCHW
+                              : TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)
+               : spatial ? TT_IREE_TTEX_TENSOR_LAYOUT_CHW
+                         : TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR;
       d.operation_kind = geometry.dispatch_kind =
           TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
-      d.k = lhsType.getDimSize(0);
+      unsigned channel = batched ? 1 : 0;
+      d.k = lhsType.getDimSize(channel);
       d.n = rhsType.getDimSize(0);
-      d.m = spatial ? lhsType.getDimSize(1) * lhsType.getDimSize(2)
-                    : lhsType.getDimSize(1);
+      if (!bf16MatrixProduct(d.m,
+                             {lhsType.getDimSize(channel + 1),
+                              spatial ? lhsType.getDimSize(channel + 2) : 1,
+                              batched ? lhsType.getDimSize(0) : 1}))
+        return failure();
+      for (unsigned axis = channel + 1; axis < lhsType.getRank(); ++axis)
+        if (lhsType.getDimSize(axis) != resultType.getDimSize(axis))
+          return failure();
       geometry.matmul_like.m = d.m;
       geometry.matmul_like.n = d.n;
       geometry.matmul_like.k = d.k;
     }
-    if (!d.m || !d.n || !d.k ||
-        rhsType.getDimSize(1) != lhsType.getDimSize(named ? 1 : 0) ||
+    unsigned outputChannel =
+        named || layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW ||
+                layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR
+            ? 1
+            : 0;
+    if (!d.m || !d.n || !d.k || d.m > UINT32_MAX - 31 ||
+        d.n > UINT32_MAX - 31 || d.k > UINT32_MAX - 31 ||
+        resultType.getDimSize(outputChannel) != d.n ||
+        rhsType.getDimSize(1) !=
+            lhsType.getDimSize(
+                named || layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW ||
+                        layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR
+                    ? 1
+                    : 0) ||
         failed(bf16LoadDesc(lhs, layout, d.tensors[0])) ||
         failed(bf16LoadDesc(rhs,
                             named ? TT_IREE_TTEX_TENSOR_LAYOUT_OI
@@ -446,7 +580,9 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
       t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
 #ifdef TT_IREE_ENABLE_AOT
-    selection.bf16Sources = generateBF16NativeMatrix(geometry, t, *body, useTensix);
+    selection.bf16Sources =
+        generateBF16NativeMatrix(geometry, t, *body, useTensix, true,
+                                reuseOutputTiles);
     selection.bf16Source = selection.bf16Sources.reader;
     if (useTensix)
       selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
@@ -458,23 +594,35 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
   }
   // Scalar families remain deliberately limited to the exact ResNet patterns.
   std::ostringstream body;
-  uint8_t layout = TT_IREE_TTEX_TENSOR_LAYOUT_CHW;
+  uint8_t layout =
+      cast<RankedTensorType>(stores[0].getValue().getType()).getRank() == 4
+          ? TT_IREE_TTEX_TENSOR_LAYOUT_NCHW
+          : TT_IREE_TTEX_TENSOR_LAYOUT_CHW;
   if (generics.empty() && stores.size() == 1) {
     auto load = stores[0]
                     .getValue()
                     .getDefiningOp<IREE::TensorExt::DispatchTensorLoadOp>();
-    if (!load || cast<RankedTensorType>(load.getType()).getRank() != 3 ||
+    if (!load ||
+        (cast<RankedTensorType>(load.getType()).getRank() != 3 &&
+         cast<RankedTensorType>(load.getType()).getRank() != 4) ||
         failed(bf16LoadDesc(load.getResult(), layout, d.tensors[0])) ||
         failed(bf16StoreDesc(stores[0], layout, d.tensors[2])))
       return failure();
     d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY;
     auto &o = d.tensors[2];
-    body << "uint32_t c=i/" << o.shape[1] * o.shape[2] << "u,h=(i/"
-         << o.shape[2] << "u)%" << o.shape[1] << "u,w=i%" << o.shape[2]
-         << "u;\n"
-         << "write_2(scratch,read_0(scratch,c,h,w),c,h,w);\n";
+    bool batched = o.rank == 4;
+    unsigned c = batched ? 1 : 0;
+    if (batched)
+      body << "uint32_t b=i/" << uint64_t(o.shape[1]) * o.shape[2] * o.shape[3]
+           << "u;\n";
+    body << "uint32_t c=(i/" << uint64_t(o.shape[c + 1]) * o.shape[c + 2]
+         << "u)%" << o.shape[c] << "u,h=(i/" << o.shape[c + 2] << "u)%"
+         << o.shape[c + 1] << "u,w=i%" << o.shape[c + 2] << "u;\n"
+         << "write_2(scratch,read_0(scratch," << (batched ? "b," : "")
+         << "c,h,w)," << (batched ? "b," : "") << "c,h,w);\n";
   } else if (generics.size() == 1 && stores.size() == 1 &&
-             generics[0].getNumLoops() == 5) {
+             (generics[0].getNumLoops() == 5 ||
+              generics[0].getNumLoops() == 6)) {
     auto op = generics[0];
     if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
         !op.getDpsInputs()[1].getDefiningOp<tensor::EmptyOp>() ||
@@ -485,22 +633,35 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     auto &o = d.tensors[2];
     auto &in = d.tensors[0];
     auto *ctx = func.getContext();
-    auto a = getAffineDimExpr(0, ctx), b = getAffineDimExpr(1, ctx),
-         c = getAffineDimExpr(2, ctx), h = getAffineDimExpr(3, ctx),
-         w = getAffineDimExpr(4, ctx);
+    bool batched = o.rank == 4;
+    unsigned channel = batched ? 1 : 0;
+    unsigned loops = batched ? 6 : 5;
+    auto batch = getAffineDimExpr(0, ctx);
+    auto a = getAffineDimExpr(channel, ctx),
+         b = getAffineDimExpr(channel + 1, ctx),
+         c = getAffineDimExpr(channel + 2, ctx),
+         h = getAffineDimExpr(channel + 3, ctx),
+         w = getAffineDimExpr(channel + 4, ctx);
+    SmallVector<AffineExpr> inputMap = {a, b * 2 + h, c * 2 + w};
+    SmallVector<AffineExpr> outputMap = {a, b, c};
+    if (batched) {
+      inputMap.insert(inputMap.begin(), batch);
+      outputMap.insert(outputMap.begin(), batch);
+    }
+    SmallVector<utils::IteratorType> iterators(loops,
+                                               utils::IteratorType::parallel);
+    iterators[loops - 1] = iterators[loops - 2] =
+        utils::IteratorType::reduction;
     if (op.getIndexingMapsArray() !=
-            SmallVector<AffineMap>{
-                AffineMap::get(5, 0, {a, b * 2 + h, c * 2 + w}, ctx),
-                AffineMap::get(5, 0, {h, w}, ctx),
-                AffineMap::get(5, 0, {a, b, c}, ctx)} ||
-        op.getIteratorTypesArray() !=
-            SmallVector<utils::IteratorType>{
-                utils::IteratorType::parallel, utils::IteratorType::parallel,
-                utils::IteratorType::parallel, utils::IteratorType::reduction,
-                utils::IteratorType::reduction} ||
-        o.rank != 3 || in.rank != 3 || in.shape[0] != o.shape[0] ||
-        (in.shape[1] - 3) / 2 + 1 != o.shape[1] ||
-        (in.shape[2] - 3) / 2 + 1 != o.shape[2])
+            SmallVector<AffineMap>{AffineMap::get(loops, 0, inputMap, ctx),
+                                   AffineMap::get(loops, 0, {h, w}, ctx),
+                                   AffineMap::get(loops, 0, outputMap, ctx)} ||
+        op.getIteratorTypesArray() != iterators ||
+        o.rank != (batched ? 4 : 3) || in.rank != o.rank ||
+        (batched && in.shape[0] != o.shape[0]) ||
+        in.shape[channel] != o.shape[channel] ||
+        (in.shape[channel + 1] - 3) / 2 + 1 != o.shape[channel + 1] ||
+        (in.shape[channel + 2] - 3) / 2 + 1 != o.shape[channel + 2])
       return failure();
     auto &block = op.getRegion().front();
     auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
@@ -518,18 +679,23 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
         !block.getArgument(1).use_empty())
       return failure();
     d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL;
-    body << "uint32_t c=i/" << o.shape[1] * o.shape[2] << "u,h=(i/"
-         << o.shape[2] << "u)%" << o.shape[1] << "u,w=i%" << o.shape[2]
-         << "u;\n"
+    if (batched)
+      body << "uint32_t b=i/" << uint64_t(o.shape[1]) * o.shape[2] * o.shape[3]
+           << "u;\n";
+    body << "uint32_t c=(i/"
+         << uint64_t(o.shape[channel + 1]) * o.shape[channel + 2] << "u)%"
+         << o.shape[channel] << "u,h=(i/" << o.shape[channel + 2] << "u)%"
+         << o.shape[channel + 1] << "u,w=i%" << o.shape[channel + 2] << "u;\n"
          << "float value=from_bits(0xff800000u);\nfor(uint32_t kh=0;kh<3;++kh) "
             "for(uint32_t kw=0;kw<3;++kw) {\n"
-         << "float v=read_0(scratch,c,h*2+kh,w*2+kw);\n"
+         << "float v=read_0(scratch," << (batched ? "b," : "")
+         << "c,h*2+kh,w*2+kw);\n"
          << "if((to_bits(v)&0x7fffffffu)>0x7f800000u || "
             "(to_bits(value)&0x7fffffffu)>0x7f800000u) "
             "value=from_bits(0x7fc00000u); else if(v>value) value=v; else "
             "if(v==0.0f && value==0.0f) "
             "value=from_bits(to_bits(v)&to_bits(value));\n}\nwrite_2(scratch,"
-            "value,c,h,w);\n";
+         << "value," << (batched ? "b," : "") << "c,h,w);\n";
   } else if (generics.size() == 1 && stores.size() == 2) {
     auto op = generics[0];
     if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 2 ||
@@ -543,6 +709,9 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
       extract = v;
       ++extractCount;
     });
+    if (extract &&
+        cast<RankedTensorType>(extract.getTensor().getType()).getRank() == 4)
+      layout = TT_IREE_TTEX_TENSOR_LAYOUT_NCHW;
     if (extractCount != 1 || !extract ||
         failed(bf16LoadDesc(extract.getTensor(), layout, d.tensors[0])))
       return failure();
@@ -553,8 +722,11 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
       if (store.getValue() == op.getResult(1))
         divisor = store;
     }
-    if (!sum || !divisor || d.tensors[0].rank != 3 ||
-        d.tensors[0].shape[1] != 8 || d.tensors[0].shape[2] != 8 ||
+    bool batched = d.tensors[0].rank == 4;
+    unsigned channel = batched ? 1 : 0;
+    if (!sum || !divisor || d.tensors[0].rank != (batched ? 4 : 3) ||
+        d.tensors[0].shape[channel + 1] != 8 ||
+        d.tensors[0].shape[channel + 2] != 8 ||
         failed(bf16StoreDesc(sum, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
                              d.tensors[2])) ||
         failed(bf16StoreDesc(divisor, TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
@@ -562,25 +734,30 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
       return failure();
     auto yield = cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
     auto *ctx = func.getContext();
-    auto channel = getAffineDimExpr(0, ctx),
+    auto outputChannel = getAffineDimExpr(0, ctx),
          position = getAffineDimExpr(1, ctx);
     if (!bf16GlobalSumBody(op, extract) ||
         op.getIndexingMapsArray() !=
             SmallVector<AffineMap>{AffineMap::get(2, 0, {position}, ctx),
-                                   AffineMap::get(2, 0, {channel}, ctx),
+                                   AffineMap::get(2, 0, {outputChannel}, ctx),
                                    AffineMap::get(2, 0, {}, ctx)} ||
         op.getIteratorTypesArray() !=
             SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                              utils::IteratorType::reduction} ||
         d.tensors[2].rank != 1 ||
-        d.tensors[2].shape[0] != d.tensors[0].shape[0] ||
+        d.tensors[2].shape[0] != uint64_t(d.tensors[0].shape[channel]) *
+                                     (batched ? d.tensors[0].shape[0] : 1) ||
         d.tensors[1].shape[0] != 1)
       return failure();
     d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM;
     body << "float value=0.0f;\nfor(uint32_t h=0;h<7;++h) for(uint32_t "
-            "w=0;w<7;++w) "
-            "value=round_bf16(value+read_0(scratch,i,h,w));\nwrite_2(scratch,"
-            "value,i);\n";
+            "w=0;w<7;++w) value=round_bf16(value+read_0(scratch,";
+    if (batched)
+      body << "i/" << d.tensors[0].shape[1] << "u,i%" << d.tensors[0].shape[1]
+           << "u";
+    else
+      body << "i";
+    body << ",h,w));\nwrite_2(scratch,value,i);\n";
   } else if (generics.size() == 1 && stores.size() == 1 &&
              generics[0].getNumLoops() == 1) {
     auto op = generics[0];
@@ -621,18 +798,20 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
   for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
     t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
 #ifdef TT_IREE_ENABLE_AOT
-  selection.bf16Source =
-      generateBF16NativeCommon(t) +
-      "void kernel_main() {\nCircularBuffer cb(tt::CBIndex::c_2); "
-      "cb.reserve_back(1); uint32_t scratch=cb.get_write_ptr();\n"
-      "uint32_t "
-      "start=get_arg_val<uint32_t>(28),count=get_arg_val<uint32_t>(29);\nfor("
-      "uint32_t i=start;i<start+count;++i) {\n" +
-      body.str() + "}\n" +
-      (d.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM
-           ? "if(get_arg_val<uint32_t>(30)==0) write_1(scratch,49.0f,0);\n"
-           : "") +
-      "}\n";
+  selection.bf16Source = generateBF16NativeSpatial(d.operation_kind, t);
+  if (selection.bf16Source.empty())
+    selection.bf16Source =
+        generateBF16NativeCommon(t) +
+        "void kernel_main() {\nCircularBuffer cb(tt::CBIndex::c_2); "
+        "cb.reserve_back(1); uint32_t scratch=cb.get_write_ptr();\n"
+        "uint32_t "
+        "start=get_arg_val<uint32_t>(28),count=get_arg_val<uint32_t>(29);\nfor("
+        "uint32_t i=start;i<start+count;++i) {\n" +
+        body.str() + "}\n" +
+        (d.operation_kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM
+             ? "if(get_arg_val<uint32_t>(30)==0) write_1(scratch,49.0f,0);\n"
+             : "") +
+        "}\n";
 #endif
   return selection;
 }

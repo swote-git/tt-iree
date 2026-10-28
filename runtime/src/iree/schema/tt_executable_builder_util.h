@@ -41,7 +41,10 @@ extern "C" {
 // Opt-in metadata contract. Production emission stays at the executable v18
 // baseline until the runtime can honor spatial resource/dataflow requirements.
 #define TT_IREE_TTEX_VERSION_19 19u
+// Opt-in static BF16 batches. This is independent of v19 spatial contracts.
+#define TT_IREE_TTEX_VERSION_20 20u
 #define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_18
+#define TT_IREE_TTEX_MAX_KNOWN_VERSION TT_IREE_TTEX_VERSION_20
 
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
 // Must stay in sync with BuiltinProgram in tt_executable_def.fbs.
@@ -121,6 +124,8 @@ typedef enum tt_iree_ttex_tensor_layout_e {
   TT_IREE_TTEX_TENSOR_LAYOUT_OI = 3,
   TT_IREE_TTEX_TENSOR_LAYOUT_OIHW = 4,
   TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR = 5,
+  TT_IREE_TTEX_TENSOR_LAYOUT_NCHW = 6,
+  TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR = 7,
 } tt_iree_ttex_tensor_layout_e;
 
 typedef enum tt_iree_ttex_kernel_role_e {
@@ -362,7 +367,7 @@ iree_status_t tt_iree_build_ttex_executable_def(
     iree_byte_span_t *out_data);
 
 // Builds a TTEX blob with an explicit version, including opt-in v19 spatial
-// contracts. Existing serializers retain their operation-specific v15-v18 ABIs.
+// contracts or v20 BF16 batches. The default remains v18.
 iree_status_t tt_iree_build_ttex_executable_def_with_version(
     iree_allocator_t allocator, uint32_t version,
     iree_host_size_t entry_point_count,

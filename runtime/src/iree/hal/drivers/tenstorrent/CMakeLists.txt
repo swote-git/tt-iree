@@ -26,6 +26,7 @@ set(TT_HAL_DRIVER_HDRS
   tt_driver.h
   tt_device.h
   tt_native_dispatch.inc
+  tt_native_partition.h
   tt_allocator.h
   tt_buffer.h
   tt_buffer_transfer.h

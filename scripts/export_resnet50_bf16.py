@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 The tt-iree Authors
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Export the immutable ResNet golden as an actual static batch-one BF16 graph.
+"""Export the immutable ResNet golden as an actual static-batch BF16 graph.
 
 Requires torch, torchvision and IREE Turbine. The upstream BF16 NumPy bridge
 workaround is process-local and retains raw BF16 bits, not a dtype fallback.
@@ -19,6 +19,16 @@ import subprocess
 from build_resnet50_precision_golden import (
     file_record, require_new_directory, write_json,
 )
+
+
+def batch_size(value):
+    try:
+        size = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("batch size must be an integer in [1, 16]") from error
+    if not 1 <= size <= 16:
+        raise argparse.ArgumentTypeError("batch size must be an integer in [1, 16]")
+    return size
 
 
 def verify_record(filename, record):
@@ -58,6 +68,8 @@ def main():
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     parser.add_argument("--iree-compile", required=True, type=pathlib.Path,
                         help="tt-iree compiler; the frontend wheel only lowers Torch to input IR")
+    parser.add_argument("--batch-size", type=batch_size, default=1,
+                        help="static graph batch size, 1 through 16 (default: 1)")
     args = parser.parse_args()
     import json
     import torch
@@ -77,7 +89,7 @@ def main():
     model = torchvision.models.resnet50(weights=None).eval()
     model.load_state_dict(torch.load(weights["path"], map_location="cpu", weights_only=True))
     model.to(torch.bfloat16)
-    example = torch.zeros((1, 3, 224, 224), dtype=torch.bfloat16)
+    example = torch.zeros((args.batch_size, 3, 224, 224), dtype=torch.bfloat16)
     with bf16_resource_bridge(ir_utils, torch):
         exported = aot.export(model, args=(example,))
         exported.verify()
@@ -99,9 +111,9 @@ def main():
     write_json(out / "manifest.json", {
         "golden_dir": str(golden), "source": manifest["source"],
         "state_dict": weights, "input": inputs, "bf16_reference": reference,
-        "precision_policy": "bf16_module", "batch": 1,
-        "input_shape": [1, 3, 224, 224], "input_dtype": "bf16",
-        "output_shape": [1, 1000], "output_dtype": "bf16",
+        "precision_policy": "bf16_module", "batch": args.batch_size,
+        "input_shape": [args.batch_size, 3, 224, 224], "input_dtype": "bf16",
+        "output_shape": [args.batch_size, 1000], "output_dtype": "bf16",
         "torch": torch.__version__, "torchvision": torchvision.__version__,
         "iree_turbine": importlib.metadata.version("iree-turbine"),
         "iree_base_compiler": importlib.metadata.version("iree-base-compiler"),
