@@ -122,6 +122,8 @@ set_tests_properties(tt_e2e_check_resnet50_projection_workgroup_count PROPERTIES
   LABELS "tt-iree;e2e;compile;model"
 )
 
+# Native matrix dispatch: 2 N-tiles x 98 M-tiles clamped to the Blackhole
+# 11x10 grid, with unequal row partitions.
 add_test(
   NAME tt_e2e_check_resnet50_per_channel_projection_workgroup_count
   COMMAND ${CMAKE_COMMAND}
@@ -129,7 +131,7 @@ add_test(
     -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/resnet50_per_channel_projection.mlir
     -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/resnet50_per_channel_projection_multicore_hal.mlir
     -DEXPECTED_X=2
-    -DEXPECTED_Y=7
+    -DEXPECTED_Y=10
     -P ${_TT_IREE_E2E_SOURCE_DIR}/compiler/check_multicore_workgroup_count.cmake
 )
 set_tests_properties(
