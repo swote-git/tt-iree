@@ -20,7 +20,7 @@ import struct
 import subprocess
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 SOURCE = Path(__file__).with_name("device_native_bf16_batch.mlir")
 STAGING = ("INPUT STAGING", "PACK", "UPLOAD", "DOWNLOAD", "UNPACK", "OUTPUT STAGING")
 COMPUTE = {11: "BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING",

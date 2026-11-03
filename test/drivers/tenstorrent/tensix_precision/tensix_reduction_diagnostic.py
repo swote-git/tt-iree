@@ -108,7 +108,7 @@ def main():
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     env = os.environ.copy()
-    env.setdefault("TT_METAL_RUNTIME_ROOT", str(Path(__file__).resolve().parents[3] / "third_party/tt-metal"))
+    env.setdefault("TT_METAL_RUNTIME_ROOT", str(Path(__file__).resolve().parents[4] / "third_party/tt-metal"))
     results = []
     for name, a, b, extra, family in cases():
         if args.select and name not in args.select:

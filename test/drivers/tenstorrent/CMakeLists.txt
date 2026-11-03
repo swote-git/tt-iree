@@ -277,7 +277,7 @@ set_tests_properties(tt_ttex_test PROPERTIES LABELS "tt-iree;unit")
 # Manual precision diagnostic: deliberately independent of IREE and TTEX.
 # Numerical discrepancies are recorded, not silently accepted as CI passes.
 if(TT_IREE_ENABLE_TTNN AND NOT TT_IREE_ENABLE_MOCK)
-  add_executable(tensix_precision_probe tensix_precision_probe.cc)
+  add_executable(tensix_precision_probe tensix_precision/tensix_precision_probe.cc)
   target_compile_features(tensix_precision_probe PRIVATE cxx_std_20)
   target_compile_options(tensix_precision_probe PRIVATE -ffp-contract=off)
   tt_metal_target_link_libraries(tensix_precision_probe)

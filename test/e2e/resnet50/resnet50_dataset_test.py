@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "scripts"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "scripts"))
 from build_resnet50_precision_golden import manifest_images, file_record
 from prepare_imagenet_validation_subset import select_rows
 from compare_resnet50_dataset import REPORT_TEMPLATE, classifier_accuracy, comparison, label_boundary
@@ -17,7 +17,7 @@ from compare_resnet50_dataset import REPORT_TEMPLATE, classifier_accuracy, compa
 
 class DatasetContractTest(unittest.TestCase):
     def test_report_template_is_a_tool_resource(self):
-        scripts = pathlib.Path(__file__).resolve().parents[2] / "scripts"
+        scripts = pathlib.Path(__file__).resolve().parents[3] / "scripts"
         self.assertEqual(REPORT_TEMPLATE.parent, scripts / "templates")
         self.assertTrue(REPORT_TEMPLATE.is_file())
         self.assertIn("{accuracy_table}", REPORT_TEMPLATE.read_text())
@@ -149,7 +149,7 @@ class DatasetContractTest(unittest.TestCase):
                 writer.writerows(rows)
             (native / "call_timings.csv").write_text("sample,invoke_seconds\n" + "".join(f"{i},1\n" for i in range(16)))
             analysis = root / "analysis"
-            script = pathlib.Path(__file__).resolve().parents[2] / "scripts/compare_resnet50_dataset.py"
+            script = pathlib.Path(__file__).resolve().parents[3] / "scripts/compare_resnet50_dataset.py"
             subprocess.run([sys.executable, str(script), "--golden-dir", str(golden),
                             "--ttiree-run", str(native), "--ttnn-run", str(nn),
                             "--output-dir", str(analysis)], check=True, capture_output=True)

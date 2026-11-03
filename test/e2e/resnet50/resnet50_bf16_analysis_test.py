@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
 import analyze_resnet50_bf16 as tool
 from build_resnet50_precision_golden import error_metrics, file_record

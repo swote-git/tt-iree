@@ -38,7 +38,7 @@ def main():
     args = parser.parse_args()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    root = pathlib.Path(__file__).resolve().parents[2]
+    root = pathlib.Path(__file__).resolve().parents[3]
     a = [bf16(((i * 13) % 71 - 35) / 32) for i in range(35 * 49)]
     b = [bf16(((i * 17) % 67 - 33) / 256) for i in range(33 * 35)]
     # The first two spatial positions separately probe even/odd BF16 ties.
@@ -63,7 +63,7 @@ def main():
                TT_METAL_RUNTIME_ROOT=str(root / "third_party/tt-metal"))
     env.pop("TT_METAL_SIMULATOR", None)
     commands = [
-        [args.iree_compile, str(root / "test/e2e/device_native_bf16_projection.mlir"),
+        [args.iree_compile, str(root / "test/e2e/native_bf16/device_native_bf16_projection.mlir"),
          "--iree-hal-target-backends=tenstorrent", "--iree-tenstorrent-device-id=p100a",
          "-o", str(out / "module.vmfb")],
         [args.iree_run_module, "--device=tenstorrent", f"--module={out / 'module.vmfb'}",
@@ -101,7 +101,7 @@ def main():
     assert sums[0] != bf16_bits(sum(values[:49]) / 49), "must exercise BF16 reduction rounding"
     write_bf16(average / "input.bin", values)
     env["TT_IREE_PROFILE_OUTPUT"] = str(average / "profile")
-    source = root / "test/e2e/device_native_bf16_average.mlir"
+    source = root / "test/e2e/native_bf16/device_native_bf16_average.mlir"
     for index, command in enumerate((
         [args.iree_compile, str(source), "--iree-hal-target-backends=tenstorrent",
          "-o", str(average / "module.vmfb")],
@@ -126,7 +126,7 @@ def main():
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
     (average / "negative.log").write_text(result.stdout)
     assert result.returncode != 0 and "unsupported Tenstorrent dispatch" in result.stdout
-    result = subprocess.run([args.iree_compile, str(root / "test/e2e/device_native_bf16_projection.mlir"),
+    result = subprocess.run([args.iree_compile, str(root / "test/e2e/native_bf16/device_native_bf16_projection.mlir"),
                              "--iree-hal-target-backends=tenstorrent", "--iree-tenstorrent-native-f32-use-tensix=true",
                              "-o", str(out / "invalid-f32-mode.vmfb")], env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)

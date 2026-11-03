@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--iree-run-module", required=True)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     args = parser.parse_args()
-    root = pathlib.Path(__file__).resolve().parents[2]
+    root = pathlib.Path(__file__).resolve().parents[3]
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -31,7 +31,7 @@ def main():
         environment.pop(name, None)
     environment.update(TT_IREE_REQUIRE_DEVICE_NATIVE="1",
                        TT_METAL_RUNTIME_ROOT=str(root / "third_party/tt-metal"))
-    command = [args.iree_compile, str(root / "test/e2e/device_native_bf16_projection.mlir"),
+    command = [args.iree_compile, str(root / "test/e2e/native_bf16/device_native_bf16_projection.mlir"),
                "--iree-hal-target-backends=tenstorrent",
                "--iree-tenstorrent-native-bf16-use-tensix=true", "-o", str(out / "module.vmfb")]
     with (out / "compile.log").open("w") as stream:

@@ -29,9 +29,9 @@ def main():
     args = parser.parse_args()
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[3]
     module = out / "spatial.vmfb"
-    source = root / "test/e2e/device_native_bf16_spatial.mlir"
+    source = root / "test/e2e/native_bf16/device_native_bf16_spatial.mlir"
     environment = dict(os.environ)
     for name in ("TT_METAL_SIMULATOR", "TT_METAL_DEVICE_PROFILER", "TT_IREE_CHECKPOINT_OUTPUT"):
         environment.pop(name, None)

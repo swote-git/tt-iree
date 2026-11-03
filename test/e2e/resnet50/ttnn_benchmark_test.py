@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 spec = importlib.util.spec_from_file_location("benchmark", SCRIPTS / "benchmark_ttnn_resnet50.py")
 benchmark = importlib.util.module_from_spec(spec)

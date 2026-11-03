@@ -8,8 +8,9 @@ import tempfile
 import types
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "test/e2e/native_bf16"))
 from export_resnet50_bf16 import bf16_resource_bridge, verify_record
 from build_resnet50_precision_golden import file_record
 from run_ttiree_resnet50_bf16 import decode_bf16, require_native_profile

@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--stress-dynamic-range", action="store_true",
                         help="include the cancellation stress diagnostic (not a supported v16 accuracy gate)")
     args = parser.parse_args()
-    root = pathlib.Path(__file__).resolve().parents[2]
+    root = pathlib.Path(__file__).resolve().parents[3]
     spec = importlib.util.spec_from_file_location("correctness", root / "scripts/check_resnet50_correctness.py")
     correctness = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = correctness
@@ -41,22 +41,22 @@ def main():
     correctness.write_f32_npy(precision_weights, (64, 64),
                              [math.cos(i * 0.07) * 0.021 + 0.003 for i in range(64 * 64)])
     cases = [
-        ("device_native_f32_matmul_tail", "device_native_f32_matmul_tail.mlir",
+        ("device_native_f32_matmul_tail", "native_f32/device_native_f32_matmul_tail.mlir",
          [f"@{precision_input}", f"@{precision_weights}"]),
-        ("device_native_f32_runtime_affine_matmul", "device_native_f32_runtime_affine_matmul.mlir", ["64x49xf32=1", "64x64xf32=0.015625", "64xf32=1", "64xf32=0.5", "64xf32=0.25"]),
-        ("resnet50_conv2d", "resnet50_conv2d.mlir", ["64x10x10xf32=1", "64x64x3x3xf32=0.015625"]),
-        ("resnet50_stem_conv", "resnet50_stem_conv.mlir", ["3x230x230xf32=1", "64x3x7x7xf32=0.015625"]),
-        ("resnet50_max_pool", "resnet50_max_pool.mlir", ["64x114x114xf32=1.25"]),
-        ("resnet50_per_channel_projection", "resnet50_per_channel_projection.mlir", ["64x56x56xf32=1", "64x64xf32=0.015625"]),
-        ("resnet50_bottleneck", "resnet50_bottleneck.mlir", ["64x8x8xf32=1", "64x64xf32=0.015625", "64x64x3x3xf32=0.015625", "256x64xf32=0.015625", "256x64xf32=0.015625"]),
-        ("device_native_average", "device_native_tail.mlir", ["4x7x7xf32=1.25"]),
-        ("device_native_linear", "device_native_tail.mlir", ["1x33xf32=1.25", "17x33xf32=0.03125", "1x17xf32=0.5"]),
+        ("device_native_f32_runtime_affine_matmul", "native_f32/device_native_f32_runtime_affine_matmul.mlir", ["64x49xf32=1", "64x64xf32=0.015625", "64xf32=1", "64xf32=0.5", "64xf32=0.25"]),
+        ("resnet50_conv2d", "resnet50/resnet50_conv2d.mlir", ["64x10x10xf32=1", "64x64x3x3xf32=0.015625"]),
+        ("resnet50_stem_conv", "resnet50/resnet50_stem_conv.mlir", ["3x230x230xf32=1", "64x3x7x7xf32=0.015625"]),
+        ("resnet50_max_pool", "resnet50/resnet50_max_pool.mlir", ["64x114x114xf32=1.25"]),
+        ("resnet50_per_channel_projection", "resnet50/resnet50_per_channel_projection.mlir", ["64x56x56xf32=1", "64x64xf32=0.015625"]),
+        ("resnet50_bottleneck", "resnet50/resnet50_bottleneck.mlir", ["64x8x8xf32=1", "64x64xf32=0.015625", "64x64x3x3xf32=0.015625", "256x64xf32=0.015625", "256x64xf32=0.015625"]),
+        ("device_native_average", "native_f32/device_native_tail.mlir", ["4x7x7xf32=1.25"]),
+        ("device_native_linear", "native_f32/device_native_tail.mlir", ["1x33xf32=1.25", "17x33xf32=0.03125", "1x17xf32=0.5"]),
     ]
     for name, shape_a, shape_b, source in (
             ("device_native_f32_matmul_page_tail", (35, 49), (33, 35),
-             "device_native_f32_matmul_page_tail.mlir"),
+             "native_f32/device_native_f32_matmul_page_tail.mlir"),
             ("nonuniform_conv2d", (64, 10, 10), (64, 64, 3, 3),
-             "resnet50_conv2d.mlir")):
+             "resnet50/resnet50_conv2d.mlir")):
         a_path, b_path = inputs_dir / f"{name}-a.npy", inputs_dir / f"{name}-b.npy"
         correctness.write_f32_npy(a_path, shape_a,
                                  [math.sin(i * 0.13) * 0.73 + 0.14 for i in range(math.prod(shape_a))])
@@ -65,11 +65,11 @@ def main():
         cases.append((name, source, [f"@{a_path}", f"@{b_path}"]))
     for name, channels, a_path, b_path, source in (
             ("nonuniform_runtime_affine", 64, precision_input, precision_weights,
-             "device_native_f32_runtime_affine_matmul.mlir"),
+             "native_f32/device_native_f32_runtime_affine_matmul.mlir"),
             ("nonuniform_runtime_affine_tail", 33,
              inputs_dir / "device_native_f32_matmul_page_tail-a.npy",
              inputs_dir / "device_native_f32_matmul_page_tail-b.npy",
-             "device_native_f32_runtime_affine_tail.mlir")):
+             "native_f32/device_native_f32_runtime_affine_tail.mlir")):
         # Dyadic coefficients exercise distinct channels, zero/negative scale,
         # and ReLU without introducing a new CPU reassociation accuracy gate.
         vectors = (
@@ -94,14 +94,14 @@ def main():
         a_path, b_path = inputs_dir / f"{name}-a.npy", inputs_dir / f"{name}-b.npy"
         correctness.write_f32_npy(a_path, (64, 49), a)
         correctness.write_f32_npy(b_path, (64, 64), b)
-        cases.append((name, "device_native_f32_matmul_tail.mlir", [f"@{a_path}", f"@{b_path}"]))
+        cases.append((name, "native_f32/device_native_f32_matmul_tail.mlir", [f"@{a_path}", f"@{b_path}"]))
     if args.stress_dynamic_range:
         a_path, b_path = inputs_dir / "stress-a.npy", inputs_dir / "stress-b.npy"
         correctness.write_f32_npy(a_path, (64, 49),
                                  [math.sin(i * 0.13) * (2.0 ** ((i % 17) - 8)) for i in range(64 * 49)])
         correctness.write_f32_npy(b_path, (64, 64),
                                  [math.cos(i * 0.07) * (2.0 ** ((i % 13) - 6)) for i in range(64 * 64)])
-        cases.append(("precision_dynamic_range", "device_native_f32_matmul_tail.mlir", [f"@{a_path}", f"@{b_path}"]))
+        cases.append(("precision_dynamic_range", "native_f32/device_native_f32_matmul_tail.mlir", [f"@{a_path}", f"@{b_path}"]))
     results = {}
     if args.case:
         cases = [case for case in cases if case[0] == args.case]

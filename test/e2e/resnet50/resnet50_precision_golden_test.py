@@ -10,7 +10,7 @@ import tempfile
 import types
 import unittest
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
 import build_resnet50_precision_golden as tool
 import run_ttnn_resnet50_golden as ttnn_tool

@@ -107,10 +107,10 @@ controls validate the comparator independently of matmul.
 
 # Use a NumPy-enabled Python environment. All hardware runs are sequential.
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/tensix_reduction_diagnostic.py \
+  test/drivers/tenstorrent/tensix_precision/tensix_reduction_diagnostic.py \
   --probe "$probe" --output-dir /tmp/reduction-bf16
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/analyze_tensix_reduction.py \
+  test/drivers/tenstorrent/tensix_precision/analyze_tensix_reduction.py \
   --input-dir /tmp/reduction-bf16 --output /tmp/reduction-model.json
 ```
 
@@ -139,19 +139,19 @@ With `--dst-check-bits`, the comparison still happens before commit/pack.
   --output-dir /tmp/prefilled-dst
 
 # First freeze the original model, not the post-hoc rounding/order hypotheses.
-cp test/drivers/tenstorrent/analyze_tensix_reduction.py /tmp/frozen-tensix-model.py
+cp test/drivers/tenstorrent/tensix_precision/analyze_tensix_reduction.py /tmp/frozen-tensix-model.py
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/tensix_precision_followup.py \
+  test/drivers/tenstorrent/tensix_precision/tensix_precision_followup.py \
   --probe "$probe" --model /tmp/frozen-tensix-model.py \
   --prior-report /home/swote/dev/report/tt-iree-matrix-reduction-20261007 \
   --output-dir /tmp/tensix-bit-rounding
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/analyze_tensix_precision_followup.py \
+  test/drivers/tenstorrent/tensix_precision/analyze_tensix_precision_followup.py \
   --model /tmp/frozen-tensix-model.py \
   --prior-report /home/swote/dev/report/tt-iree-matrix-reduction-20261007 \
   --experiments /tmp/tensix-bit-rounding --output /tmp/tensix-posthoc.json
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/tensix_precision_followup_test.py -v
+  test/drivers/tenstorrent/tensix_precision/tensix_precision_followup_test.py -v
 ```
 
 The follow-up runner checks a fixed model SHA256. It saves all input hashes
@@ -182,12 +182,12 @@ reference=/path/to/archived/measurement
 archived_probe=/path/to/the/probe-used-for-that-measurement
 simulator=/path/to/libttsim_bh.so
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/tensix_ttsim_compare.py \
+  test/drivers/tenstorrent/tensix_precision/tensix_ttsim_compare.py \
   --probe "$archived_probe" --reference-probe "$archived_probe" \
   --metal-root "$PWD/third_party/tt-metal" --simulator "$simulator" \
   --measurement "$reference" --output-dir /tmp/tensix-sim-comparison
 /home/swote/.tenstorrent-venv/bin/python \
-  test/drivers/tenstorrent/tensix_ttsim_compare_test.py -v
+  test/drivers/tenstorrent/tensix_precision/tensix_ttsim_compare_test.py -v
 ```
 
 `--measurement` can be repeated. The launcher validates the supplied host

@@ -219,7 +219,7 @@ def main():
     results = []
     rounding_rows = []
     env = os.environ.copy()
-    env.setdefault("TT_METAL_RUNTIME_ROOT", str(Path(__file__).resolve().parents[3] / "third_party/tt-metal"))
+    env.setdefault("TT_METAL_RUNTIME_ROOT", str(Path(__file__).resolve().parents[4] / "third_party/tt-metal"))
     for name, family, data_format, _, _, extra, details in plan:
         inputs = output / "inputs" / name
         directory = output / name

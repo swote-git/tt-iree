@@ -53,22 +53,23 @@ function(compile_and_check name source source_marker)
   set("${name}_ELF_PATH" "${elf_path}" PARENT_SCOPE)
 endfunction()
 
-compile_and_check(simple_add simple_add.mlir "binary_op_init_common")
-compile_and_check(simple_matmul simple_matmul.mlir
+compile_and_check(simple_add compiler/simple_add.mlir "binary_op_init_common")
+compile_and_check(simple_matmul compiler/simple_matmul.mlir
                   "out_subblock_num_tiles = get_arg_val")
-compile_and_check(simple_matmul_64 simple_matmul_64.mlir
+compile_and_check(simple_matmul_64 compiler/simple_matmul_64.mlir
                   "out_subblock_num_tiles = get_arg_val")
-compile_and_check(dynamic_matmul dynamic_matmul.mlir
+compile_and_check(dynamic_matmul compiler/dynamic_matmul.mlir
                   "out_subblock_num_tiles = get_arg_val")
-compile_and_check(resnet50_input_pad resnet50_input_pad.mlir
+compile_and_check(resnet50_input_pad resnet50/resnet50_input_pad.mlir
                   "write_scratch_offset = 4096")
-compile_and_check(device_native_f32_matmul device_native_f32_matmul.mlir
+compile_and_check(device_native_f32_matmul
+                  native_f32/device_native_f32_matmul.mlir
                   "native-v15 descriptor-specialized")
 compile_and_check(device_native_f32_matmul_tail
-                  device_native_f32_matmul_tail.mlir
+                  native_f32/device_native_f32_matmul_tail.mlir
                   "native-v15 descriptor-specialized")
 compile_and_check(device_native_f32_runtime_affine_matmul
-                  device_native_f32_runtime_affine_matmul.mlir
+                  native_f32/device_native_f32_runtime_affine_matmul.mlir
                   "native-v15 descriptor-specialized")
 
 if(NOT "${simple_matmul_ELF_PATH}" STREQUAL

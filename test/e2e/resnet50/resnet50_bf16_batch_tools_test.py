@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
 import export_resnet50_bf16 as exporter
 import run_ttiree_resnet50_bf16_batch as batch
