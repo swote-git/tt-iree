@@ -38,9 +38,11 @@ generateNativeSources(const tt_iree_ttex_entry_point_desc_t &entry,
 std::string generateBF16NativeCommon(
     const tt_iree_ttex_tensor_desc_t *const *tensors);
 
-// v22 SFPU epilogue operand. The writer streams one FP32 tile per output tile
-// into CB c_26+i, unpacked straight to the FP32 Dst (BF16 sources widen
-// exactly). The tile is oriented like the Dst accumulator.
+// v22 SFPU epilogue operand. Per output tile the writer streams operand tiles
+// into CBs c_26.., unpacked straight to the FP32 Dst and oriented like the
+// accumulator. An FP32 operand fills a tile; two BF16 operands share one as its
+// high and low halves (read back with raw INT32 loads), so six tiles carry up
+// to twelve operands.
 struct TenstorrentEpilogueOperand {
   // Per-output-channel vector broadcast over the tile, else a full tensor.
   bool channel = false;
@@ -51,9 +53,18 @@ struct TenstorrentEpilogueOperand {
   // FP32 source tensor elements; BF16 otherwise.
   bool f32 = false;
 };
-inline constexpr unsigned kTenstorrentMaxEpilogueOperands = 6;
+inline constexpr unsigned kTenstorrentMaxEpilogueTiles = 6;
+// Dst tile of each operand and its half: 0 the whole FP32 word, 1 the high and
+// 2 the low BF16 half.
+struct TenstorrentEpiloguePlacement {
+  unsigned tile = 0;
+  unsigned half = 0;
+};
+std::vector<TenstorrentEpiloguePlacement>
+placeEpilogueOperands(const std::vector<TenstorrentEpilogueOperand> &operands,
+                      unsigned &tiles);
 // SFPI statements over vFloat `value` (FP32 accumulator) and operand vectors
-// `x<i>`; the BF16-rounded result is left in `value`.
+// `TT_X<i>`; the BF16-rounded result is left in `value`.
 struct TenstorrentSfpuEpilogue {
   std::string body;
   std::vector<TenstorrentEpilogueOperand> operands;

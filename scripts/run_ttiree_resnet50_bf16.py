@@ -77,11 +77,13 @@ def main():
     parser.add_argument("--tt-metal-root", required=True, type=pathlib.Path)
     parser.add_argument("--indices", default="0", help="distinct source image indices; no batch padding")
     parser.add_argument("--checkpoints", action="store_true")
-    parser.add_argument("--use-tensix", action="store_true",
-                        help="opt into v18 BF16 HiFi4 matrix contractions; scalar dispatches/epilogues remain device RISC-V")
+    parser.add_argument("--engine", choices=("tensix", "riscv"), default="tensix",
+                        help="BF16 matrix engine: Tensix HiFi4 with SFPU epilogues (default) or the "
+                             "device-RISC-V FP32 reference; scalar dispatches stay on device RISC-V")
     parser.add_argument("--cpu-reference", action="store_true",
                         help="also compile/run identical BF16 IR on LLVM CPU; fail if that backend rejects it")
     args = parser.parse_args()
+    args.use_tensix = args.engine == "tensix"
     if args.session_runner and (args.checkpoints or args.cpu_reference):
         parser.error("session runner currently supports final-logits-only hardware evaluation")
     import numpy as np

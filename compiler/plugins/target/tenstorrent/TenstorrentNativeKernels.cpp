@@ -685,6 +685,20 @@ sfpi_inline sfpi::vInt tt_ugt(sfpi::vFloat x, sfpi::vFloat y) {
   } v_endif;
   return r;
 }
+// Raw INT32 Dst loads: an FP32 load flushes subnormal bit patterns, including
+// a pair of BF16 operands sharing one FP32 tile whose high half is +-0.
+sfpi_inline sfpi::vFloat tt_load(uint32_t index) {
+  sfpi::vInt x = sfpi::dst_reg[index];
+  return sfpi::as<sfpi::vFloat>(x);
+}
+sfpi_inline sfpi::vFloat tt_hi16(uint32_t index) {
+  sfpi::vInt x = sfpi::dst_reg[index];
+  return sfpi::as<sfpi::vFloat>((x >> 16u) << 16u);
+}
+sfpi_inline sfpi::vFloat tt_lo16(uint32_t index) {
+  sfpi::vInt x = sfpi::dst_reg[index];
+  return sfpi::as<sfpi::vFloat>(x << 16u);
+}
 sfpi_inline sfpi::vFloat tt_select(sfpi::vInt c, sfpi::vFloat t, sfpi::vFloat f) {
   v_if (c != 0) { f = t; } v_endif;
   return f;
@@ -783,10 +797,27 @@ inline void row_store(uint32_t tile, uint32_t r, uint32_t c, uint32_t len, uint3
     window+=n*2u; c+=n; len-=n;
   }
 }
-inline void fill_row(uint32_t tile, uint32_t r, uint32_t bits) {
+// Low-half operand of a shared tile: OR the BF16 bits under the high half
+// already written.
+inline void row_load_lo(uint32_t tile, uint32_t r, uint32_t c, uint32_t len,
+                        uint32_t window) {
+  auto s=reinterpret_cast<const uint16_t*>(window);
+  auto d=reinterpret_cast<uint32_t*>(tile);
+  for(uint32_t j=0;j<len;++j,++c)
+    d[((r/16u)*2u+c/16u)*256u+(r%16u)*16u+c%16u]|=s[j];
+}
+inline void fill_row(uint32_t tile, uint32_t r, uint32_t bits, bool lo) {
   for(uint32_t half=0;half<2u;++half) {
     auto d=reinterpret_cast<uint32_t*>(tile+(((r/16u)*2u+half)*256u+(r%16u)*16u)*4u);
-    for(uint32_t i=0;i<16u;++i) d[i]=bits;
+    if(lo) for(uint32_t i=0;i<16u;++i) d[i]|=bits;
+    else for(uint32_t i=0;i<16u;++i) d[i]=bits;
+  }
+}
+inline void row_or(uint32_t tile, uint32_t r, uint32_t row) {
+  auto s=reinterpret_cast<const uint32_t*>(row);
+  for(uint32_t half=0;half<2u;++half) {
+    auto d=reinterpret_cast<uint32_t*>(tile+(((r/16u)*2u+half)*256u+(r%16u)*16u)*4u);
+    for(uint32_t i=0;i<16u;++i) d[i]|=s[half*16u+i];
   }
 }
 // 32 row windows of 192B: up to 128B of data at the transfer's 64B offset.
@@ -799,6 +830,29 @@ bool isChannelLayout(const tt_iree_ttex_tensor_desc_t &d) {
          isSpatial(d);
 }
 
+} // namespace
+
+std::vector<TenstorrentEpiloguePlacement>
+placeEpilogueOperands(const std::vector<TenstorrentEpilogueOperand> &operands,
+                      unsigned &tiles) {
+  std::vector<TenstorrentEpiloguePlacement> placement(operands.size());
+  tiles = 0;
+  int open = -1;  // operand alone in the high half of the last tile
+  for (size_t i = 0; i < operands.size(); ++i) {
+    if (!operands[i].f32 && open >= 0) {
+      placement[open].half = 1;
+      placement[i] = {placement[open].tile, 2};
+      open = -1;
+      continue;
+    }
+    placement[i] = {tiles++, 0};
+    if (!operands[i].f32)
+      open = static_cast<int>(i);
+  }
+  return placement;
+}
+
+namespace {
 TenstorrentNativeSources
 sfpuEpilogueSources(const std::string &common,
                     const tt_iree_ttex_tensor_desc_t *const *t,
@@ -811,11 +865,13 @@ sfpuEpilogueSources(const std::string &common,
   if (!transposed && !(o.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR && o.rank == 2))
     throw std::invalid_argument("SFPU epilogue requires a row-major or channel output");
   const unsigned count = e.operands.size();
-  if (count > kTenstorrentMaxEpilogueOperands || group * (1 + count) > 8)
+  unsigned tiles = 0;
+  const auto placement = placeEpilogueOperands(e.operands, tiles);
+  if (tiles > kTenstorrentMaxEpilogueTiles || group * (1 + tiles) > 8)
     throw std::invalid_argument("SFPU epilogue exceeds the FP32 Dst tiles");
   // Operands always travel as FP32 tiles unpacked straight into Dst: the
   // Src register path would turn a BF16 NaN into infinity.
-  auto cbIndex = [](unsigned i) { return 26 + i; };
+  auto cbIndex = [](unsigned tile) { return 26 + tile; };
 
   TenstorrentNativeSources sources;
   std::ostringstream c;
@@ -833,19 +889,27 @@ sfpuEpilogueSources(const std::string &common,
 #include "sfpi.h"
 namespace ckernel::sfpu {
 )kernel" << kSfpuHelpers << R"kernel(
-// Called per face; operand tiles of this lane start at Dst tile |operands|.
-inline void tt_iree_epilogue_face(const uint32_t acc, const uint32_t operands, const uint32_t) {
-  for (uint32_t i = 0; i < 8u; ++i) {
-    sfpi::vFloat value = sfpi::dst_reg[acc * 32u + i];
+// Operands are reloaded from Dst at each use: the SFPU has eight registers and
+// the compiler cannot spill them, so operands must not stay live across the
+// whole epilogue.
 )kernel";
   for (unsigned i = 0; i < count; ++i)
-    c << "    sfpi::vFloat x" << i << " = sfpi::dst_reg[(operands + " << i
-      << "u) * 32u + i];\n";
+    c << "#define TT_X" << i << " "
+      << (placement[i].half == 1 ? "tt_hi16" : placement[i].half == 2 ? "tt_lo16" : "tt_load")
+      << "((operands + " << placement[i].tile << "u) * 32u + i)\n";
+  c << R"kernel(// Called per face; operand tiles of this lane start at Dst tile |operands|.
+inline void tt_iree_epilogue_face(const uint32_t acc, const uint32_t operands, const uint32_t) {
+  for (uint32_t i = 0; i < 8u; ++i) {
+    sfpi::vFloat value = tt_load(acc * 32u + i);
+)kernel";
   c << e.body << R"kernel(
-    sfpi::dst_reg[acc * 32u + i] = value;
+    sfpi::dst_reg[acc * 32u + i] = sfpi::as<sfpi::vInt>(value);
   }
 }
-} // namespace ckernel::sfpu
+)kernel";
+  for (unsigned i = 0; i < count; ++i)
+    c << "#undef TT_X" << i << "\n";
+  c << R"kernel(} // namespace ckernel::sfpu
 #endif
 void kernel_main() {
   uint32_t tiles=get_arg_val<uint32_t>(0), blocks=get_arg_val<uint32_t>(1);
@@ -867,9 +931,9 @@ void kernel_main() {
   if (transposed)
     c << "      transpose_dest_init<true,true>();\n"
          "      transpose_dest<true,true>(lane);\n";
-  c << "      uint32_t operands=" << group << "u+lane*" << count << "u;\n";
+  c << "      uint32_t operands=" << group << "u+lane*" << tiles << "u;\n";
   unsigned previous = 1;
-  for (unsigned i = 0; i < count; ++i) {
+  for (unsigned i = 0; i < tiles; ++i) {
     unsigned cb = cbIndex(i);
     c << "      {\n        CircularBuffer operand(" << cb << ");\n"
       << "        copy_tile_to_dst_init_short_with_dt(" << previous << "," << cb
@@ -961,57 +1025,70 @@ void kernel_main() {
     return s.str();
   };
   w << "for(uint32_t lane=0;lane<group;++lane) {\n" << tileCoordinates();
-  for (unsigned i = 0; i < count; ++i) {
-    const auto &op = e.operands[i];
-    // Source element size; constants are already FP32 bits.
-    const unsigned es = op.f32 || op.slot < 0 ? 4 : 2;
-    w << "{\nCircularBuffer operand(" << cbIndex(i) << ");\n"
+  for (unsigned tile = 0; tile < tiles; ++tile) {
+    w << "{\nCircularBuffer operand(" << cbIndex(tile) << ");\n"
       << "operand.reserve_back(1);\nuint32_t tile=operand.get_write_ptr();\n";
-    if (op.channel) {
-      // Channel vector: element j belongs to channel n_base+j.
-      std::string vector;
-      if (op.slot < 0) {
-        vector = "reinterpret_cast<uint32_t>(tt_k" + std::to_string(i) + "+n_base)";
+    // The high (or whole) operand writes every word; a low operand ORs in.
+    for (unsigned i = 0; i < count; ++i) {
+      if (placement[i].tile != tile)
+        continue;
+      const auto &op = e.operands[i];
+      const bool lo = placement[i].half == 2;
+      // Source element size; constants are already FP32 bits.
+      const unsigned es = op.f32 || op.slot < 0 ? 4 : 2;
+      // Word for element j of a channel vector at |vector|.
+      auto element = [&](const std::string &vector, const char *j) {
+        if (es == 4)
+          return "(reinterpret_cast<const uint32_t*>(" + vector + ")[" + j + "]" +
+                 (lo ? ">>16)" : ")");
+        return "(uint32_t(reinterpret_cast<const uint16_t*>(" + vector + ")[" + j +
+               "])" + (lo ? ")" : "<<16)");
+      };
+      w << "{\n";
+      if (op.channel) {
+        // Channel vector: element j belongs to channel n_base+j.
+        std::string vector;
+        if (op.slot < 0) {
+          vector = "reinterpret_cast<uint32_t>(tt_k" + std::to_string(i) + "+n_base)";
+        } else {
+          const auto &d = *t[op.slot];
+          if (d.rank != 1 || !unitStride(d, 0))
+            throw std::invalid_argument("SFPU channel operand must be contiguous");
+          w << "uint32_t byte=byte_" << op.slot << "(n_base,0,0,0);\n"
+            << "uint32_t vector=windows+byte%64u;\n"
+            << "read_bytes(buf_" << i << ",byte,vector,valid_n*" << es << "u);\n"
+            << "noc_async_read_barrier();\nasm volatile(\"\" ::: \"memory\");\n";
+          vector = "vector";
+        }
+        if (transposed) {
+          w << "for(uint32_t r=0;r<valid_n;++r) fill_row(tile,r," << element(vector, "r")
+            << "," << (lo ? "true" : "false") << ");\n";
+        } else {
+          // Widen the 32 channels once into window 1, then copy every row.
+          w << "uint32_t row=windows+kWindowBytes;\n"
+            << "auto d=reinterpret_cast<uint32_t*>(row);\n"
+            << "for(uint32_t j=0;j<32u;++j) d[j]=" << element(vector, "j") << ";\n"
+            << "for(uint32_t r=0;r<valid_m;++r) "
+            << (lo ? "row_or(tile,r,row);\n" : "row_copy(tile,4u,r,0,32u,row,true);\n");
+        }
       } else {
         const auto &d = *t[op.slot];
-        if (d.rank != 1 || !unitStride(d, 0))
-          throw std::invalid_argument("SFPU channel operand must be contiguous");
-        w << "uint32_t byte=byte_" << op.slot << "(n_base,0,0,0);\n"
-          << "uint32_t vector=windows+byte%64u;\n"
-          << "read_bytes(buf_" << i << ",byte,vector,valid_n*" << es << "u);\n"
-          << "noc_async_read_barrier();\nasm volatile(\"\" ::: \"memory\");\n";
-        vector = "vector";
+        w << "uint32_t pending=0;\n"
+          << "auto flush=[&]() {\nnoc_async_read_barrier();\n"
+             "asm volatile(\"\" ::: \"memory\");\n"
+          << "for(uint32_t p=0;p<pending;++p) "
+          << (lo ? "row_load_lo(tile,pr[p],pc[p],pl[p],pw[p]);\n"
+                 : "row_load(tile,pr[p],pc[p],pl[p],pw[p]," + std::to_string(es) + "u);\n")
+          << "pending=0;\n};\n"
+          << runLoop(d) << "uint32_t byte=byte_" << op.slot << "("
+          << coords(d, "m", "n") << coordinatePadding(d) << ");\n"
+          << "if(pending==kWindows) flush();\n"
+          << "uint32_t window=windows+pending*kWindowBytes+byte%64u;\n"
+          << "read_bytes(buf_" << i << ",byte,window,len*" << es << "u);\n"
+          << "pr[pending]=r; pc[pending]=c; pl[pending]=len; pw[pending]=window; ++pending;\n"
+          << "c+=len;\n}\nflush();\n";
       }
-      if (transposed) {
-        w << "for(uint32_t r=0;r<valid_n;++r) fill_row(tile,r,"
-          << (es == 4 ? "reinterpret_cast<const uint32_t*>(" + vector + ")[r]"
-                      : "uint32_t(reinterpret_cast<const uint16_t*>(" + vector +
-                            ")[r])<<16")
-          << ");\n";
-      } else {
-        // Widen the 32 channels once into window 1, then copy every row.
-        w << "{\nuint32_t row=windows+kWindowBytes;\n"
-          << "auto d=reinterpret_cast<uint32_t*>(row);\n"
-          << "for(uint32_t j=0;j<32u;++j) d[j]="
-          << (es == 4 ? "reinterpret_cast<const uint32_t*>(" + vector + ")[j]"
-                      : "uint32_t(reinterpret_cast<const uint16_t*>(" + vector +
-                            ")[j])<<16")
-          << ";\nfor(uint32_t r=0;r<valid_m;++r) row_copy(tile,4u,r,0,32u,row,true);\n}\n";
-      }
-    } else {
-      const auto &d = *t[op.slot];
-      w << "uint32_t pending=0;\n"
-        << "auto flush=[&]() {\nnoc_async_read_barrier();\n"
-           "asm volatile(\"\" ::: \"memory\");\n"
-        << "for(uint32_t p=0;p<pending;++p) row_load(tile,pr[p],pc[p],pl[p],pw[p],"
-        << es << "u);\npending=0;\n};\n"
-        << runLoop(d) << "uint32_t byte=byte_" << op.slot << "("
-        << coords(d, "m", "n") << coordinatePadding(d) << ");\n"
-        << "if(pending==kWindows) flush();\n"
-        << "uint32_t window=windows+pending*kWindowBytes+byte%64u;\n"
-        << "read_bytes(buf_" << i << ",byte,window,len*" << es << "u);\n"
-        << "pr[pending]=r; pc[pending]=c; pl[pending]=len; pw[pending]=window; ++pending;\n"
-        << "c+=len;\n}\nflush();\n";
+      w << "}\n";
     }
     w << "operand.push_back(1);\n}\n";
   }

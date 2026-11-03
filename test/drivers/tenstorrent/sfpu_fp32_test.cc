@@ -3,7 +3,8 @@
 //
 // Hardware characterization of SFPU FP32 arithmetic used by the v22 BF16
 // epilogue: FMA, mul, add/sub, statement-level contraction and the tt_div
-// helper, compared bit-for-bit with IEEE binary32 round-to-nearest-even.
+// helper, compared bit-for-bit with IEEE binary32 round-to-nearest-even, and
+// the raw INT32 Dst transport of paired BF16 operands.
 // NaN results follow the RISC-V soft-float reference (canonical 0x7fc00000).
 
 #include <gtest/gtest.h>
@@ -47,12 +48,17 @@ bool isNan(uint32_t b) { return (b & 0x7fffffffu) > 0x7f800000u; }
 bool isSub(uint32_t b) { return (b & 0x7f800000u) == 0 && (b & 0x7fffffu); }
 bool isSpecial(uint32_t b) { return (b & 0x7f800000u) == 0x7f800000u; }
 
-enum Op { kMad, kMul, kAdd, kSub, kSeparate, kDiv, kCopy, kCopyAfterBf16, kCopyAfterTranspose, kOpCount };
+enum Op { kMad, kMul, kAdd, kSub, kSeparate, kDiv, kCopy, kCopyAfterBf16, kCopyAfterTranspose,
+          kRawCopy, kHi16, kLo16, kOpCount };
 const char *kOpNames[] = {"sfpmad a*b+c", "tt_mul a*b", "add a+c", "sub a-c",
                           "tt_mul+add", "tt_div a/b", "copy c", "copy c (bf16 init)",
-                          "copy c (after transpose)"};
+                          "copy c (after transpose)", "int32 copy c", "tt_hi16 c",
+                          "tt_lo16 c"};
 const char *kOpExpr[] = {"a * b + c", "tt_mul(a, b)", "a + c", "a - c",
-                         "", "tt_div(a, b)", "c", "c", "c"};
+                         "", "tt_div(a, b)", "c", "c", "c", "", "", ""};
+// Integer ops on raw Dst bits: every input pattern must survive, subnormal
+// and NaN patterns included (two BF16 epilogue operands share one FP32 tile).
+bool isRaw(int op) { return op == kRawCopy || op == kHi16 || op == kLo16; }
 
 uint32_t reference(Op op, uint32_t a, uint32_t b, uint32_t c) {
   volatile float x = f(a), y = f(b), z = f(c), r;
@@ -62,7 +68,9 @@ uint32_t reference(Op op, uint32_t a, uint32_t b, uint32_t c) {
   case kAdd: r = x + z; break;
   case kSub: r = x - z; break;
   case kSeparate: { volatile float t = x * y; r = t + z; break; }
-  case kCopy: case kCopyAfterBf16: case kCopyAfterTranspose: return c;
+  case kCopy: case kCopyAfterBf16: case kCopyAfterTranspose: case kRawCopy: return c;
+  case kHi16: return c & 0xffff0000u;
+  case kLo16: return c << 16;
   default: r = x / y; break;
   }
   uint32_t bits = u(r);
@@ -72,6 +80,9 @@ uint32_t reference(Op op, uint32_t a, uint32_t b, uint32_t c) {
 std::string computeSource(Op op) {
   std::string body = op == kSeparate
       ? "sfpi::vFloat t = tt_mul(a, b);\n    sfpi::vFloat r = t + c;\n"
+      : op == kRawCopy ? "sfpi::vInt r = sfpi::dst_reg[64u + i];\n"
+      : op == kHi16 ? "sfpi::vInt r = sfpi::as<sfpi::vInt>(tt_hi16(64u + i));\n"
+      : op == kLo16 ? "sfpi::vInt r = sfpi::as<sfpi::vInt>(tt_lo16(64u + i));\n"
       : std::string("sfpi::vFloat r = ") + kOpExpr[op] + ";\n";
   return R"kernel(
 #include <cstdint>
@@ -321,8 +332,10 @@ TEST_F(SfpuFp32Test, MatchesIeeeBinary32) {
                     names[k], a[i], b[i], c[i], reference(Op(op), a[i], b[i], c[i]),
                     result[i]);
       }
+    if (isRaw(op))
+      EXPECT_EQ(wrong[0] + wrong[1] + wrong[2], 0u) << kOpNames[op] << " must keep raw bits";
     // SFPMAD is recorded only: it is not a correctly rounded fused multiply-add.
-    if (op != kMad)
+    else if (op != kMad)
       EXPECT_EQ(wrong[0], 0u) << kOpNames[op] << " must be IEEE RNE on normal values";
   }
 }

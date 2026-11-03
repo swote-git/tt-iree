@@ -2380,6 +2380,9 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
   // Keep std::string copies alive until FlatBuffer is built.
   std::vector<std::string> nameStorage;
   std::vector<tt_iree_ttex_entry_point_desc_t> entryDescs;
+  // The runtime selects the v22 Tensix CB/compute configuration per
+  // executable, so SFPU and writer epilogues cannot share one.
+  unsigned sfpuEntries = 0, writerTensixEntries = 0;
   std::vector<std::vector<float>> convScaleStorage;
   std::vector<std::vector<float>> convBiasStorage;
   std::vector<std::vector<float>> matmulScaleStorage;
@@ -2520,6 +2523,13 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
           static_cast<TenstorrentAOTTargetArch>(*targetArch);
       bool compiled = false;
       if (isBF16Native) {
+        if (desc.builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX)
+          ++(builtinSelection->bf16Sources.sfpuEpilogue ? sfpuEntries
+                                                         : writerTensixEntries);
+        if (sfpuEntries && writerTensixEntries)
+          return exportOp.emitError(
+              "BF16 Tensix entries with SFPU and writer epilogues cannot share "
+              "an executable");
         compiled = compileBF16NativeAOT(desc, builtinSelection->bf16Source,
                                         builtinSelection->bf16Sources,
                                         aotTargetArch, aot.bundle, aotError);
@@ -2553,10 +2563,7 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       iree_allocator_system(),
       llvm::any_of(entryDescs, [](const auto &d) {
         return d.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
-      }) ? (llvm::any_of(entryDescs, [](const auto &d) {
-              return d.builtin_program ==
-                     TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
-            }) ? TT_IREE_TTEX_VERSION_22
+      }) ? (sfpuEntries ? TT_IREE_TTEX_VERSION_22
             : llvm::any_of(entryDescs, [](const auto &d) {
               for (const auto &tensor : d.bf16_native.tensors)
                 if (tt_iree_ttex_is_tile_layout(tensor.layout))

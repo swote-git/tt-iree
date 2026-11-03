@@ -225,8 +225,10 @@ public:
     std::string name = "sv" + std::to_string(next), expr;
     bool round = scalar.getResult(0).getType().isBF16();
     if (isa<arith::ExtFOp>(scalar)) {
-      expr = args[0];
-      round = false;
+      // Alias, so an operand load stays at its use instead of becoming a
+      // long-lived register.
+      vectors[scalar.getResult(0)] = args[0];
+      return;
     } else if (isa<arith::TruncFOp>(scalar)) {
       expr = args[0];
     } else if (isa<arith::DivFOp, arith::MulFOp>(scalar)) {
@@ -477,7 +479,7 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
   emitter.vectors[body.getArgument(0)] = "value";
   std::vector<TenstorrentEpilogueOperand> operands;
   auto addOperand = [&](TenstorrentEpilogueOperand operand, Value arg) {
-    emitter.vectors[arg] = "x" + std::to_string(operands.size());
+    emitter.vectors[arg] = "TT_X" + std::to_string(operands.size());
     operands.push_back(std::move(operand));
   };
   std::ostringstream constants;
@@ -582,8 +584,9 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
     auto vector = emitter.getVector(yield.getOperand(0));
     sfpu->operands.clear();
     sfpu->body.clear();
-    if (emitter.vectorOk && vector &&
-        operands.size() <= kTenstorrentMaxEpilogueOperands) {
+    unsigned tiles = 0;
+    placeEpilogueOperands(operands, tiles);
+    if (emitter.vectorOk && vector && tiles <= kTenstorrentMaxEpilogueTiles) {
       sfpu->operands = std::move(operands);
       // A bare yield of the FP32 accumulator still rounds to the BF16 store.
       sfpu->body = emitter.vcode.str() + "    value = " +
@@ -845,12 +848,13 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     auto body = bf16Epilogue(epilogueOp, result, layout, selection, slot, &sfpu);
     if (failed(body))
       return failure();
-    // v22 Tensix runs the epilogue on the SFPU; any other epilogue keeps the
-    // RISC-V reference program.
-    if (sfpu.body.empty())
-      useTensix = false;
+    // v22 runs the epilogue on the SFPU. An epilogue the SFPI emitter cannot
+    // express keeps the Tensix contraction with the v18/v20 writer epilogue.
+    const bool sfpuEpilogue = useTensix && !sfpu.body.empty();
+    unsigned epilogueTiles = 0;
+    placeEpilogueOperands(sfpu.operands, epilogueTiles);
     // Each lane of a reused pair keeps its own operand tiles in FP32 Dst.
-    if (2 * (1 + sfpu.operands.size()) > 8)
+    if (sfpuEpilogue && 2 * (1 + epilogueTiles) > 8)
       reuseOutputTiles = false;
     geometry.matmul_like.lhs = geometry.linear.input = geometry.conv2d.input =
         d.tensors[0];
@@ -864,7 +868,7 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
 #ifdef TT_IREE_ENABLE_AOT
     selection.bf16Sources =
         generateBF16NativeMatrix(geometry, t, *body, useTensix, true,
-                                reuseOutputTiles, useTensix ? &sfpu : nullptr);
+                                reuseOutputTiles, sfpuEpilogue ? &sfpu : nullptr);
     selection.bf16Source = selection.bf16Sources.reader;
     if (useTensix)
       selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;

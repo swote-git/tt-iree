@@ -81,58 +81,86 @@ def main():
         assert mismatches == 0, f"{name}: {mismatches} BF16 bitwise mismatches"
         print(f"PASS: {name}, {len(expected)} BF16 values, 4 cores, M/N/K tails", flush=True)
 
-    # SFPU epilogue FP32 chain with division versus the device-RISC-V reference.
-    # Bounded integer contractions are exact in both engines, so the epilogue
-    # alone decides the bits. Channel 0 divides by zero, channel 1 by NaN.
-    target = out / "divide"
-    target.mkdir(exist_ok=True)
+    # SFPU epilogues versus the device-RISC-V reference. Bounded integer
+    # contractions are exact in both engines, so the epilogue alone decides
+    # the bits.
     a = [float((i * 13) % 5 - 2) for i in range(35 * 49)]
     b = [float((i * 17) % 5 - 2) for i in range(33 * 35)]
+
+    def channel(seed, scale, offset=0.0):
+        return [bf16((offset + scale * ((n * seed) % 11 - 5)) * (1.0 + n / 97.0)) for n in range(33)]
+
+    def compare_engines(name, mlir, function, operands):
+        target = out / name
+        target.mkdir(exist_ok=True)
+        inputs = [("35x49xbf16", "a", a, "bf16"), ("33x35xbf16", "b", b, "bf16")] + operands
+        for _, stem, values, kind in inputs:
+            if kind == "f32":
+                (target / f"{stem}.bin").write_bytes(struct.pack(f"<{len(values)}f", *values))
+            else:
+                write_bf16(target / f"{stem}.bin", values)
+        outputs = {}
+        for engine in ("tensix", "riscv"):
+            vmfb = target / f"{engine}.vmfb"
+            command = [args.iree_compile, str(root / "test/e2e/native_bf16" / mlir),
+                       "--iree-hal-target-backends=tenstorrent",
+                       f"--iree-tenstorrent-native-bf16-use-tensix={'true' if engine == 'tensix' else 'false'}",
+                       "-o", str(vmfb)]
+            with (target / f"{engine}.compile.log").open("w") as stream:
+                subprocess.run(command, env=environment, check=True, stdout=stream,
+                               stderr=subprocess.STDOUT, timeout=300)
+            environment["TT_IREE_PROFILE_OUTPUT"] = str(target / f"{engine}.profile")
+            command = [args.iree_run_module, "--device=tenstorrent", f"--module={vmfb}",
+                       f"--function={function}"]
+            command += [f"--input={shape}=@{target / (stem + '.bin')}" for shape, stem, _, _ in inputs]
+            command.append(f"--output=@{target / (engine + '.bin')}")
+            with (target / f"{engine}.run.log").open("w") as stream:
+                subprocess.run(command, env=environment, check=True, stdout=stream,
+                               stderr=subprocess.STDOUT, timeout=120)
+            with (target / f"{engine}.profile/ops_perf_results.csv").open() as stream:
+                records = list(csv.DictReader(stream))
+            assert [r["IREE BUILTIN PROGRAM"] for r in records] == \
+                (["12"] if engine == "tensix" else ["11"]), records
+            outputs[engine] = (target / f"{engine}.bin").read_bytes()
+        count = 33 * 49
+        tensix = struct.unpack("<" + "H" * count, outputs["tensix"])
+        riscv = struct.unpack("<" + "H" * count, outputs["riscv"])
+        mismatches = sum(x != y for x, y in zip(tensix, riscv))
+        results.append({"fixture": name, "elements": count,
+                        "bitwise_mismatches_vs_riscv": mismatches,
+                        "special_bits": [tensix[0], tensix[49]]})
+        (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        assert mismatches == 0, f"{name}: {mismatches} BF16 mismatches versus RISC-V"
+        print(f"PASS: {name}, {count} BF16 values equal to the RISC-V reference", flush=True)
+        return tensix
+
+    # FP32 chain with division; channel 0 divides by zero, channel 1 by NaN.
     scale = [bf16(0.37 + 0.731 * ((n * 7) % 11)) * (-1 if n % 3 == 0 else 1) for n in range(33)]
     divisor = [bf16(0.13 + 1.917 * ((n * 5) % 9)) for n in range(33)]
     divisor[0] = 0.0
     divisor[1] = float("nan")
     residual = [bf16(((i * 29) % 97 - 48) / 7.0) for i in range(33 * 49)]
-    for name, values in (("a", a), ("b", b), ("scale", scale), ("divisor", divisor),
-                         ("residual", residual)):
-        write_bf16(target / f"{name}.bin", values)
-    outputs = {}
-    for engine in ("tensix", "riscv"):
-        vmfb = target / f"{engine}.vmfb"
-        command = [args.iree_compile, str(root / "test/e2e/native_bf16/device_native_bf16_divide.mlir"),
-                   "--iree-hal-target-backends=tenstorrent",
-                   f"--iree-tenstorrent-native-bf16-use-tensix={'true' if engine == 'tensix' else 'false'}",
-                   "-o", str(vmfb)]
-        with (target / f"{engine}.compile.log").open("w") as stream:
-            subprocess.run(command, env=environment, check=True, stdout=stream,
-                           stderr=subprocess.STDOUT, timeout=300)
-        environment["TT_IREE_PROFILE_OUTPUT"] = str(target / f"{engine}.profile")
-        command = [args.iree_run_module, "--device=tenstorrent", f"--module={vmfb}",
-                   "--function=bf16_divide", f"--input=35x49xbf16=@{target / 'a.bin'}",
-                   f"--input=33x35xbf16=@{target / 'b.bin'}",
-                   f"--input=33xbf16=@{target / 'scale.bin'}",
-                   f"--input=33xbf16=@{target / 'divisor.bin'}",
-                   f"--input=33x49xbf16=@{target / 'residual.bin'}",
-                   f"--output=@{target / (engine + '.bin')}"]
-        with (target / f"{engine}.run.log").open("w") as stream:
-            subprocess.run(command, env=environment, check=True, stdout=stream,
-                           stderr=subprocess.STDOUT, timeout=120)
-        with (target / f"{engine}.profile/ops_perf_results.csv").open() as stream:
-            records = list(csv.DictReader(stream))
-        assert [r["IREE BUILTIN PROGRAM"] for r in records] == \
-            (["12"] if engine == "tensix" else ["11"]), records
-        outputs[engine] = (target / f"{engine}.bin").read_bytes()
-    count = 33 * 49
-    tensix = struct.unpack("<" + "H" * count, outputs["tensix"])
-    riscv = struct.unpack("<" + "H" * count, outputs["riscv"])
-    mismatches = sum(x != y for x, y in zip(tensix, riscv))
-    results.append({"fixture": "divide", "elements": count,
-                    "bitwise_mismatches_vs_riscv": mismatches,
-                    "special_bits": [tensix[0], tensix[49]]})
-    (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-    assert mismatches == 0, f"divide: {mismatches} BF16 mismatches versus RISC-V"
+    tensix = compare_engines("divide", "device_native_bf16_divide.mlir", "bf16_divide", [
+        ("33xbf16", "scale", scale, "bf16"), ("33xbf16", "divisor", divisor, "bf16"),
+        ("33x49xbf16", "residual", residual, "bf16")])
     assert tensix[49] == 0x7fc0, "NaN divisor must give the canonical NaN"
-    print(f"PASS: divide, {count} BF16 values equal to the RISC-V reference", flush=True)
+
+    # Nine operands (two batch norms, residual, ReLU) as ResNet's projection
+    # shortcut: BF16 operands share Dst tiles in pairs. Zero high halves (mean,
+    # beta) and a NaN low half (gamma) check the raw pair transport.
+    mean0, gamma0, beta0 = channel(3, 2.5), channel(5, 0.21, 1.0), channel(7, 1.3)
+    mean1, gamma1, beta1 = channel(4, 1.7), channel(2, 0.17, 0.9), channel(6, 0.9)
+    inv0 = [1.0 / (0.7 + 0.113 * n) for n in range(33)]
+    inv1 = [1.0 / (1.3 + 0.071 * n) for n in range(33)]
+    mean0[2], mean0[3], beta0[6], beta0[7] = 0.0, -0.0, 0.0, -0.0
+    gamma0[4] = float("nan")
+    other = [bf16(((i * 37) % 89 - 44) / 5.0) for i in range(33 * 49)]
+    compare_engines("shortcut", "device_native_bf16_shortcut.mlir", "bf16_shortcut", [
+        ("33xbf16", "mean0", mean0, "bf16"), ("33xf32", "inv0", inv0, "f32"),
+        ("33xbf16", "gamma0", gamma0, "bf16"), ("33xbf16", "beta0", beta0, "bf16"),
+        ("33x49xbf16", "other", other, "bf16"), ("33xbf16", "mean1", mean1, "bf16"),
+        ("33xf32", "inv1", inv1, "f32"), ("33xbf16", "gamma1", gamma1, "bf16"),
+        ("33xbf16", "beta1", beta1, "bf16")])
 
 
 if __name__ == "__main__":
