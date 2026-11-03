@@ -12,6 +12,12 @@
 #define TT_IREE_NATIVE_PARTITION_ARG 20u
 #define TT_IREE_NATIVE_MAX_TENSOR_COUNT TT_IREE_BF16_NATIVE_TENSOR_COUNT
 
+// v21 face-tiled layouts: logical [rows, cols] stored as 2KiB 32x32 tiles.
+static inline bool tt_iree_ttex_is_tile_layout(uint8_t layout) {
+  return layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE ||
+         layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN;
+}
+
 static inline bool tt_iree_ttex_is_native_matrix_kind(uint8_t kind) {
   return kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
          kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||

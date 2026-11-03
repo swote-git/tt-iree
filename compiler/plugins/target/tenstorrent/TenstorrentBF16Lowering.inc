@@ -70,6 +70,108 @@ static LogicalResult bf16StoreDesc(IREE::TensorExt::DispatchTensorStoreOp store,
                             layout, desc);
 }
 
+// v21 face tiles are [T0,T1,2,2,16,16] in IR and described as their padded
+// logical [rows, cols]. TILE_FACE has T0 row tiles; TILE_FACE_COLUMN has T0
+// column tiles.
+static LogicalResult bf16TileDesc(RankedTensorType type,
+                                  ArrayRef<int64_t> storageShape,
+                                  ArrayRef<OpFoldResult> offsets,
+                                  ArrayRef<OpFoldResult> strides,
+                                  uint16_t binding, InferredByteOffset offset,
+                                  uint8_t layout,
+                                  tt_iree_ttex_tensor_desc_t &desc) {
+  using tenstorrent::kFaceSize;
+  if (!type || !type.hasStaticShape() || !type.getElementType().isBF16() ||
+      type.getRank() != 6 || storageShape != type.getShape() ||
+      type.getShape().drop_front(2) !=
+          ArrayRef<int64_t>{2, 2, kFaceSize, kFaceSize})
+    return failure();
+  for (OpFoldResult v : offsets)
+    if (getConstantIntValue(v) != std::optional<int64_t>(0))
+      return failure();
+  for (OpFoldResult v : strides)
+    if (getConstantIntValue(v) != std::optional<int64_t>(1))
+      return failure();
+  const bool column = layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN;
+  uint64_t rows = uint64_t(type.getDimSize(column ? 1 : 0)) * 32;
+  uint64_t cols = uint64_t(type.getDimSize(column ? 0 : 1)) * 32;
+  if (rows > UINT32_MAX || cols > UINT32_MAX)
+    return failure();
+  desc = {};
+  desc.binding = binding;
+  desc.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  desc.layout = layout;
+  desc.rank = 2;
+  desc.shape[0] = desc.storage_shape[0] = rows;
+  desc.shape[1] = desc.storage_shape[1] = cols;
+  desc.stride[0] = desc.stride[1] = 1;
+  desc.byte_offset = offset.staticOffset;
+  desc.byte_offset_constant = offset.constantOrdinalPlusOne;
+  return success();
+}
+
+static LogicalResult bf16TileLoadDesc(Value value, uint8_t layout,
+                                      tt_iree_ttex_tensor_desc_t &desc) {
+  IREE::TensorExt::DispatchTensorLoadOp load;
+  auto binding = inferLoadBinding(value, load);
+  if (failed(binding) || !load)
+    return failure();
+  auto offset = inferByteOffset(
+      load.getSource().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>());
+  if (failed(offset))
+    return failure();
+  return bf16TileDesc(dyn_cast<RankedTensorType>(value.getType()),
+                      load.getSourceType().getShape(), load.getMixedOffsets(),
+                      load.getMixedStrides(), *binding, *offset, layout, desc);
+}
+
+static LogicalResult
+bf16TileStoreDesc(IREE::TensorExt::DispatchTensorStoreOp store, uint8_t layout,
+                  tt_iree_ttex_tensor_desc_t &desc) {
+  auto subspan =
+      store.getTarget().getDefiningOp<IREE::HAL::InterfaceBindingSubspanOp>();
+  auto offset = inferByteOffset(subspan);
+  if (!subspan || failed(offset) ||
+      subspan.getBinding().getZExtValue() > UINT16_MAX)
+    return failure();
+  return bf16TileDesc(dyn_cast<RankedTensorType>(store.getValue().getType()),
+                      store.getTargetType().getShape(),
+                      store.getMixedOffsets(), store.getMixedStrides(),
+                      subspan.getBinding().getZExtValue(), *offset, layout,
+                      desc);
+}
+
+// Face swizzle emitted by the tt_iree encoding between [T0,T1,2,16,2,16] and
+// [T0,T1,2,2,16,16]; the permutation is its own inverse.
+static bool bf16IsFaceTranspose(linalg::TransposeOp op) {
+  return op && op.getPermutation() == ArrayRef<int64_t>{0, 1, 2, 4, 3, 5};
+}
+
+static bool bf16IsTileReassociation(ArrayRef<ReassociationIndices> groups) {
+  return groups.size() == 4 && groups[0] == ReassociationIndices{0} &&
+         groups[1] == ReassociationIndices{1} &&
+         groups[2] == ReassociationIndices{2, 3} &&
+         groups[3] == ReassociationIndices{4, 5};
+}
+
+// Matches store(unpack(collapse(face-transpose(value)))) back to |value|.
+static Value bf16UntiledSource(IREE::TensorExt::DispatchTensorStoreOp store) {
+  auto unpack = store.getValue().getDefiningOp<linalg::UnPackOp>();
+  if (!unpack || unpack.getStaticInnerTiles() != ArrayRef<int64_t>{32, 32} ||
+      unpack.getInnerDimsPos() != ArrayRef<int64_t>{0, 1} ||
+      (!unpack.getOuterDimsPerm().empty() &&
+       unpack.getOuterDimsPerm() != ArrayRef<int64_t>{0, 1}))
+    return {};
+  auto collapse = unpack.getSource().getDefiningOp<tensor::CollapseShapeOp>();
+  if (!collapse ||
+      !bf16IsTileReassociation(collapse.getReassociationIndices()))
+    return {};
+  auto transpose = collapse.getSrc().getDefiningOp<linalg::TransposeOp>();
+  if (!bf16IsFaceTranspose(transpose))
+    return {};
+  return transpose.getInput();
+}
+
 // Every explicit BF16 arithmetic result/cast gets its own RNE boundary.
 // Keep scalar SSA order: folding BN into a single affine expression loses
 // the convolution/output and residual branch BF16 rounding boundaries.
@@ -418,6 +520,69 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
   selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE;
   selection.dispatchKind = TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
   auto &d = selection.bf16Native;
+  // v21 face-tiled matmul from the tt_iree data-tiling encoding:
+  // tile contraction -> BF16 epilogue -> unpack to row-major output.
+  linalg::GenericOp tileMatmul;
+  for (auto op : generics)
+    if (op->hasAttr(tenstorrent::kTileMatmulAttrName))
+      tileMatmul = op;
+  if (tileMatmul) {
+    // Tiled operands only feed the Tensix matrix engine.
+    if (stores.size() != 1 || generics.size() != 2 ||
+        !bf16ContractionBody(tileMatmul))
+      return failure();
+    auto fill = tileMatmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+    linalg::GenericOp epilogueOp =
+        generics[0] == tileMatmul ? generics[1] : generics[0];
+    if (!fill ||
+        getConstantFloat(fill.getInputs()[0]) != std::optional<double>(0.0) ||
+        bf16UntiledSource(stores[0]) != epilogueOp.getResult(0) ||
+        failed(bf16TileLoadDesc(tileMatmul.getDpsInputs()[0],
+                                TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE,
+                                d.tensors[0])) ||
+        failed(bf16TileLoadDesc(tileMatmul.getDpsInputs()[1],
+                                TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN,
+                                d.tensors[1])) ||
+        failed(bf16StoreDesc(stores[0], TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+                             d.tensors[2])) ||
+        d.tensors[2].rank != 2 || d.tensors[0].shape[1] != d.tensors[1].shape[0])
+      return failure();
+    d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+    d.m = d.tensors[2].shape[0];
+    d.n = d.tensors[2].shape[1];
+    // K includes the zero padding written by the tilize copy.
+    d.k = d.tensors[0].shape[1];
+    if ((d.m + 31) / 32 * 32 != d.tensors[0].shape[0] ||
+        (d.n + 31) / 32 * 32 != d.tensors[1].shape[1])
+      return failure();
+    unsigned slot = 3;
+    auto body = bf16Epilogue(epilogueOp, tileMatmul.getResult(0),
+                             TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, selection,
+                             slot);
+    if (failed(body) || slot != 3)
+      return failure();
+    tt_iree_ttex_entry_point_desc_t geometry = {};
+    geometry.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
+    geometry.matmul_like.m = d.m;
+    geometry.matmul_like.n = d.n;
+    geometry.matmul_like.k = d.k;
+    geometry.matmul_like.lhs = d.tensors[0];
+    geometry.matmul_like.rhs = d.tensors[1];
+    geometry.matmul_like.output = d.tensors[2];
+    const tt_iree_ttex_tensor_desc_t *t[TT_IREE_BF16_NATIVE_TENSOR_COUNT];
+    for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
+      t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
+#ifdef TT_IREE_ENABLE_AOT
+    selection.bf16Sources =
+        generateBF16NativeMatrix(geometry, t, *body, /*use_tensix=*/true);
+    selection.bf16Source = selection.bf16Sources.reader;
+    selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+#endif
+    selection.mTiles = (d.m + 31) / 32;
+    selection.nTiles = (d.n + 31) / 32;
+    selection.kTiles = d.k / 32;
+    return selection;
+  }
   linalg::GenericOp contraction;
   for (auto op : generics)
     if (bf16ContractionBody(op)) {
@@ -591,6 +756,51 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     selection.nTiles = (d.n + 31) / 32;
     selection.kTiles = (d.k + 31) / 32;
     return selection;
+  }
+  // v21 tilize from the tt_iree encoding: store(face-transpose(expand(pack(
+  // load)))). The copy keeps PADDED_COPY; only its destination layout differs.
+  if (generics.empty() && stores.size() == 1) {
+    auto transpose = stores[0].getValue().getDefiningOp<linalg::TransposeOp>();
+    auto expand = transpose ? transpose.getInput()
+                                  .getDefiningOp<tensor::ExpandShapeOp>()
+                            : tensor::ExpandShapeOp{};
+    auto pack = expand ? expand.getSrc().getDefiningOp<linalg::PackOp>()
+                       : linalg::PackOp{};
+    if (pack) {
+      auto outer = pack.getOuterDimsPerm();
+      bool byRow = outer.empty() || outer == ArrayRef<int64_t>{0, 1};
+      bool byColumn = outer == ArrayRef<int64_t>{1, 0};
+      auto padding = pack.getPaddingValue();
+      auto sourceType = cast<RankedTensorType>(pack.getSource().getType());
+      bool padded = sourceType.getRank() == 2 &&
+                    (sourceType.getDimSize(0) % 32 || sourceType.getDimSize(1) % 32);
+      if (!bf16IsFaceTranspose(transpose) ||
+          !bf16IsTileReassociation(expand.getReassociationIndices()) ||
+          pack.getStaticInnerTiles() != ArrayRef<int64_t>{32, 32} ||
+          pack.getInnerDimsPos() != ArrayRef<int64_t>{0, 1} ||
+          !(byRow || byColumn) ||
+          (padded && (!padding || getConstantFloat(padding) !=
+                                      std::optional<double>(0.0))) ||
+          failed(bf16LoadDesc(pack.getSource(),
+                              TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR,
+                              d.tensors[0])) ||
+          failed(bf16TileStoreDesc(stores[0],
+                                   byRow ? TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE
+                                         : TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN,
+                                   d.tensors[2])) ||
+          d.tensors[0].rank != 2)
+        return failure();
+      d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY;
+      const tt_iree_ttex_tensor_desc_t *t[TT_IREE_BF16_NATIVE_TENSOR_COUNT];
+      for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
+        t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
+#ifdef TT_IREE_ENABLE_AOT
+      selection.bf16Source = generateBF16NativeTilize(t);
+      if (selection.bf16Source.empty())
+        return failure();
+#endif
+      return selection;
+    }
   }
   // Scalar families remain deliberately limited to the exact ResNet patterns.
   std::ostringstream body;

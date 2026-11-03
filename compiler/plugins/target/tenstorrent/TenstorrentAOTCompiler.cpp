@@ -1237,6 +1237,10 @@ bool compileBF16NativeAOT(const tt_iree_ttex_entry_point_desc_t &entry,
   if (tt_iree_ttex_is_native_matrix_kind(entry.bf16_native.operation_kind))
     for (uint8_t i : {0, 1, 16})
       cb.push_back({.cb_index = i, .data_format = tt::DataFormat::UInt32});
+  // v21 tilize staging/tile CBs; must match the runtime's CB formats.
+  else if (tt_iree_ttex_is_tile_layout(entry.bf16_native.tensors[2].layout))
+    for (uint8_t i : {0, 1})
+      cb.push_back({.cb_index = i, .data_format = tt::DataFormat::UInt32});
   DataMovementConfig config{.processor = DataMovementProcessor::RISCV_0,
                             .noc = NOC::RISCV_0_default,
                             .compile_args = args};

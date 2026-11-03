@@ -4,6 +4,8 @@
 #ifndef IREE_HAL_DRIVERS_TENSTORRENT_TT_DEVICE_PROFILER_H_
 #define IREE_HAL_DRIVERS_TENSTORRENT_TT_DEVICE_PROFILER_H_
 
+#include <cstdint>
+
 namespace tt::tt_metal::distributed {
 class MeshDevice;
 } // namespace tt::tt_metal::distributed
@@ -22,6 +24,10 @@ bool DeviceProfilerEnabled();
 // cannot build those, so while profiling the embedded kernel source is
 // JIT-compiled instead of loading the precompiled ELFs.
 bool UsePrecompiledKernels();
+
+// Unique per-program id so profiler rows ("run host ID") separate dispatches;
+// tt-metal otherwise reports 0 for every freshly created program.
+uint64_t NextProgramRuntimeId();
 
 // Drains device profiler buffers. Call after each blocking program so the
 // per-core buffers cannot overflow between reads.

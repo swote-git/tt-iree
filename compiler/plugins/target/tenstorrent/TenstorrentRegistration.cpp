@@ -8,6 +8,7 @@
 //   2. Activation: --iree-hal-target-backends=tenstorrent triggers session
 //
 #include "TenstorrentTarget.h"
+#include "TenstorrentEncoding.h"
 #include "TenstorrentPreprocessingPass.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/PluginAPI/Client.h"
@@ -47,6 +48,12 @@ struct TenstorrentOptions {
         llvm::cl::desc("Reuse BF16 operands across pairs of output tiles using "
                        "the existing two-page CBs; requires BF16 Tensix"));
     binder.opt<bool>(
+        "iree-tenstorrent-bf16-tile-layout", bf16TileLayout,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Data-tile BF16 matmuls into 32x32 tiles with Tensix "
+                       "face order at dispatch boundaries; use with "
+                       "--iree-opt-data-tiling"));
+    binder.opt<bool>(
         "iree-tenstorrent-native-f32-use-tensix", nativeF32UseTensix,
         llvm::cl::cat(category),
         llvm::cl::desc("Use experimental v16 INT8-digit Tensix math instead "
@@ -58,6 +65,7 @@ struct TenstorrentOptions {
   bool nativeF32UseTensix = false;
   bool nativeBF16UseTensix = false;
   bool nativeBF16ReuseOutputTiles = false;
+  bool bf16TileLayout = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -69,6 +77,10 @@ struct TenstorrentSession
                            TenstorrentOptions,
                            PluginActivationPolicy::DefaultActivated> {
   static void registerPasses() {}
+
+  void onRegisterDialects(DialectRegistry &registry) override {
+    tenstorrent::registerTenstorrentEncoding(registry);
+  }
 
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
     passManager.addPass(
@@ -84,6 +96,7 @@ struct TenstorrentSession
       opts.nativeF32UseTensix = options.nativeF32UseTensix;
       opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
       opts.nativeBF16ReuseOutputTiles = options.nativeBF16ReuseOutputTiles;
+      opts.bf16TileLayout = options.bf16TileLayout;
       return std::make_shared<IREE::HAL::TenstorrentTargetDevice>(opts);
     });
   }
@@ -97,6 +110,7 @@ struct TenstorrentSession
       opts.nativeF32UseTensix = options.nativeF32UseTensix;
       opts.nativeBF16UseTensix = options.nativeBF16UseTensix;
       opts.nativeBF16ReuseOutputTiles = options.nativeBF16ReuseOutputTiles;
+      opts.bf16TileLayout = options.bf16TileLayout;
       return std::make_shared<IREE::HAL::TenstorrentTargetBackend>(opts);
     });
   }

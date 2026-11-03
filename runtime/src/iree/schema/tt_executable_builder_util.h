@@ -43,8 +43,10 @@ extern "C" {
 #define TT_IREE_TTEX_VERSION_19 19u
 // Opt-in static BF16 batches. This is independent of v19 spatial contracts.
 #define TT_IREE_TTEX_VERSION_20 20u
+// Opt-in face-tiled BF16 matmul operands (TILE_FACE layouts).
+#define TT_IREE_TTEX_VERSION_21 21u
 #define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_18
-#define TT_IREE_TTEX_MAX_KNOWN_VERSION TT_IREE_TTEX_VERSION_20
+#define TT_IREE_TTEX_MAX_KNOWN_VERSION TT_IREE_TTEX_VERSION_21
 
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
 // Must stay in sync with BuiltinProgram in tt_executable_def.fbs.
@@ -126,6 +128,8 @@ typedef enum tt_iree_ttex_tensor_layout_e {
   TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR = 5,
   TT_IREE_TTEX_TENSOR_LAYOUT_NCHW = 6,
   TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR = 7,
+  TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE = 8,
+  TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN = 9,
 } tt_iree_ttex_tensor_layout_e;
 
 typedef enum tt_iree_ttex_kernel_role_e {

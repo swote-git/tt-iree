@@ -87,6 +87,7 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
     uint64_t start =
         stages ? iree::hal::tenstorrent::RuntimeProfiler::NowNs() : 0;
     auto program = tt::tt_metal::CreateProgram();
+    program.set_runtime_id(iree::hal::tenstorrent::NextProgramRuntimeId());
     tt::tt_metal::CoreRange range({0, 0}, {cols - 1, rows - 1});
     tt::tt_metal::CoreRangeSet cores(std::set<tt::tt_metal::CoreRange>{range});
     auto cb = [&](uint8_t index, tt::DataFormat format, uint32_t page,
@@ -97,7 +98,11 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
               .set_page_size(index, page));
     };
     cb(2, tt::DataFormat::UInt32, 128, 1);
-    if (matrix && !uses_tensix) {
+    if (!matrix && tt_iree_ttex_is_tile_layout(t[2]->layout)) {
+      // v21 tilize: 32 128-byte row windows plus one output tile.
+      cb(0, tt::DataFormat::UInt32, 8192, 1);
+      cb(1, tt::DataFormat::UInt32, 2048, 1);
+    } else if (matrix && !uses_tensix) {
       for (uint8_t i : {0, 1, 16})
         cb(i, tt::DataFormat::UInt32, 4096, 1);
     } else if (uses_tensix && bf16_native) {
@@ -190,9 +195,11 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
           uint32_t ordinal = r * cols + c, total = rows * cols;
           const uint8_t kind = bf16_native ? ep.bf16_native.operation_kind
                                            : ep.dispatch_kind;
-          uint32_t width = (t[2]->rank &&
-              (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
-               kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY))
+          // A tilize copy partitions whole 32x32 output tiles.
+          uint32_t width = tt_iree_ttex_is_tile_layout(t[2]->layout) ? 1024
+              : (t[2]->rank &&
+                 (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+                  kind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY))
                   ? t[2]->shape[t[2]->rank - 1] : 1;
           iree::hal::tenstorrent::NativeElementRange partition;
           if (!iree::hal::tenstorrent::PartitionNativeScalarRange(

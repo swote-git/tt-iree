@@ -3,6 +3,7 @@
 
 #include "TenstorrentTarget.h"
 #include "TenstorrentPreprocessingPass.h"
+#include "TenstorrentEncoding.h"
 #include "TenstorrentNativeKernels.h"
 #ifdef TT_IREE_ENABLE_AOT
 #include "TenstorrentAOTCompiler.h"
@@ -18,6 +19,7 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
@@ -2120,6 +2122,9 @@ public:
                static_cast<uint32_t>(TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE) &&
            selection->program !=
                static_cast<uint32_t>(
+                   TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX) &&
+           selection->program !=
+               static_cast<uint32_t>(
                    TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_MATMUL_TILED) &&
            selection->program !=
                static_cast<uint32_t>(
@@ -2159,6 +2164,9 @@ public:
         uint64_t outputRows = 1;
         for (unsigned i = 0; i + 1 < output.rank; ++i)
           outputRows *= output.shape[i];
+        // A tilize copy partitions whole tiles, matching the runtime.
+        if (tt_iree_ttex_is_tile_layout(output.layout))
+          outputRows = uint64_t(output.shape[0] / 32) * (output.shape[1] / 32);
         auto grid = selectNativeScalarGrid(outputRows, maxGridX, maxGridY);
         workgroupCount.push_back(builder.getIndexAttr(grid.x));
         workgroupCount.push_back(builder.getIndexAttr(grid.y));
@@ -2300,6 +2308,10 @@ void TenstorrentTargetBackend::getDefaultExecutableTargets(
       b.getNamedAttr("device_id", b.getStringAttr(selectedDeviceId)));
   backendConfigAttrs.push_back(b.getNamedAttr(
       "target_arch", b.getStringAttr(getTargetArchName(selectedDeviceId))));
+  if (options_.bf16TileLayout)
+    backendConfigAttrs.push_back(b.getNamedAttr(
+        IREE::Encoding::kEncodingResolverAttrName,
+        tenstorrent::EncodingResolverAttr::get(context, {})));
 
   executableTargetAttrs.push_back(IREE::HAL::ExecutableTargetAttr::get(
       context, b.getStringAttr("tenstorrent"),
@@ -2313,6 +2325,9 @@ void TenstorrentTargetBackend::getDefaultExecutableTargets(
 
 void TenstorrentTargetBackend::buildTranslationPassPipeline(
     IREE::HAL::ExecutableTargetAttr targetAttr, OpPassManager &passManager) {
+  if (options_.bf16TileLayout)
+    passManager.nest<ModuleOp>().addNestedPass<func::FuncOp>(
+        createMaterializeDeviceEncodingPass());
   passManager.addPass(
       std::make_unique<MaterializeMatmulWorkgroupCountPass>(options_.deviceId));
   // Lower dispatch.workgroup_count_from_slice to concrete workgroup counts.
@@ -2539,6 +2554,12 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       llvm::any_of(entryDescs, [](const auto &d) {
         return d.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
       }) ? (llvm::any_of(entryDescs, [](const auto &d) {
+              for (const auto &tensor : d.bf16_native.tensors)
+                if (tt_iree_ttex_is_tile_layout(tensor.layout))
+                  return true;
+              return false;
+            }) ? TT_IREE_TTEX_VERSION_21
+            : llvm::any_of(entryDescs, [](const auto &d) {
               for (const auto &tensor : d.bf16_native.tensors)
                 if (tensor.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW ||
                     tensor.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)

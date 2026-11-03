@@ -97,6 +97,11 @@ enum TensorLayout : uint8 {
   NCHW = 6,
   // v20: [B, C, spatial], with contiguous spatial positions per channel.
   BATCH_CHANNEL_MAJOR = 7,
+  // v21: logical [rows, cols] padded to 32x32 tiles. Each 2KiB tile holds four
+  // 16x16 faces in Tensix order; tiles are ordered by tile row.
+  TILE_FACE = 8,
+  // v21: as TILE_FACE, but tiles are ordered by tile column.
+  TILE_FACE_COLUMN = 9,
 }
 
 // ---------------------------------------------------------------------------

@@ -42,5 +42,9 @@ TenstorrentNativeSources generateBF16NativeMatrix(
     bool prefetch_bf16_inputs = true,
     // Pair output tiles using the existing two-page input/output CB contract.
     bool reuse_output_tiles = false);
+// v21 tilize: row-major BF16 slot 0 into the face-tiled slot 2, whole tiles
+// per core (element range in units of 1024).
+std::string
+generateBF16NativeTilize(const tt_iree_ttex_tensor_desc_t *const *tensors);
 } // namespace mlir::iree_compiler::IREE::HAL
 #endif

@@ -10,6 +10,10 @@ static inline bool tt_iree_ttex_is_batch_layout(uint8_t layout) {
          layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR;
 }
 
+static inline uint32_t tt_iree_bf16_tile_ceil(uint32_t value) {
+  return value > UINT32_MAX - 31 ? 0 : (value + 31) / 32 * 32;
+}
+
 static inline bool tt_iree_bf16_layout_rank_is_valid(uint8_t layout,
                                                      uint8_t rank) {
   switch (layout) {
@@ -17,6 +21,8 @@ static inline bool tt_iree_bf16_layout_rank_is_valid(uint8_t layout,
     return rank == 1 || rank == 2;
   case TT_IREE_TTEX_TENSOR_LAYOUT_OI:
   case TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR:
+  case TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE:
+  case TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN:
     return rank == 2;
   case TT_IREE_TTEX_TENSOR_LAYOUT_CHW:
   case TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR:
@@ -37,6 +43,10 @@ tt_iree_validate_bf16_layout_version(const tt_iree_ttex_bf16_native_desc_t *d,
         version != TT_IREE_TTEX_VERSION_20)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "BF16 batch layouts require opt-in TTEX v20");
+    if (tt_iree_ttex_is_tile_layout(d->tensors[i].layout) &&
+        version != TT_IREE_TTEX_VERSION_21)
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "BF16 tile layouts require opt-in TTEX v21");
   }
   return iree_ok_status();
 }
@@ -65,9 +75,27 @@ tt_iree_bf16_same_shape(const tt_iree_ttex_tensor_desc_t *a,
   return true;
 }
 
+// v21 face-tiled matmul: A [M,K] row tiles, B [K,N] column tiles, and the
+// unpacked row-major [M,N] result. Tiled shapes include their 32x32 padding.
+static inline bool tt_iree_bf16_tile_matrix_geometry_is_valid(
+    const tt_iree_ttex_bf16_native_desc_t *d) {
+  const auto &a = d->tensors[0], &b = d->tensors[1], &o = d->tensors[2];
+  const uint32_t m = tt_iree_bf16_tile_ceil(d->m), n = tt_iree_bf16_tile_ceil(d->n),
+                 k = tt_iree_bf16_tile_ceil(d->k);
+  return d->operation_kind == TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE && m &&
+         n && k && a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE &&
+         b.layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE_COLUMN &&
+         o.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR && a.rank == 2 &&
+         b.rank == 2 && o.rank == 2 && a.shape[0] == m && a.shape[1] == k &&
+         b.shape[0] == k && b.shape[1] == n && o.shape[0] == d->m &&
+         o.shape[1] == d->n;
+}
+
 static inline bool tt_iree_bf16_matrix_geometry_is_valid(
     const tt_iree_ttex_bf16_native_desc_t *d) {
   const auto &a = d->tensors[0], &b = d->tensors[1], &o = d->tensors[2];
+  if (tt_iree_ttex_is_tile_layout(a.layout))
+    return tt_iree_bf16_tile_matrix_geometry_is_valid(d);
   if (!d->m || !d->n || !d->k || d->m > UINT32_MAX - 31 ||
       d->n > UINT32_MAX - 31 || d->k > UINT32_MAX - 31 || b.shape[0] != d->n ||
       a.layout != o.layout || a.rank != o.rank || a.rank > 4 ||
@@ -122,6 +150,7 @@ tt_iree_bf16_conv_spatial_is_valid(const tt_iree_ttex_bf16_native_desc_t *d) {
 
 // v20 retains the v18 tensor descriptor rules, including arbitrary epilogue
 // slots. Only slots 0/1/2 acquire operation-specific static batch geometry.
+// v21 shares these rules and adds the tile layouts above.
 static inline iree_status_t
 tt_iree_validate_bf16_native_v20(const tt_iree_ttex_bf16_native_desc_t *d,
                                  uint32_t builtin, uint16_t binding_count,
@@ -184,6 +213,14 @@ tt_iree_validate_bf16_native_v20(const tt_iree_ttex_bf16_native_desc_t *d,
   bool valid = false;
   switch (d->operation_kind) {
   case TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY:
+    // v21 tilize: row-major [R,C] into zero-padded face tiles.
+    if (tt_iree_ttex_is_tile_layout(o.layout)) {
+      valid = !b.rank && a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR &&
+              a.rank == 2 && o.rank == 2 &&
+              o.shape[0] == tt_iree_bf16_tile_ceil(a.shape[0]) &&
+              o.shape[1] == tt_iree_bf16_tile_ceil(a.shape[1]);
+      break;
+    }
     valid = !b.rank && tt_iree_bf16_same_shape(&a, &o) &&
             ((a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_NCHW && a.rank == 4) ||
              (a.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHW && a.rank == 3));

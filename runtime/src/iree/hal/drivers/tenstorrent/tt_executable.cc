@@ -1780,7 +1780,8 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       version != TT_IREE_TTEX_VERSION_17 &&
       version != TT_IREE_TTEX_VERSION_18 &&
       version != TT_IREE_TTEX_VERSION_19 &&
-      version != TT_IREE_TTEX_VERSION_20) {
+      version != TT_IREE_TTEX_VERSION_20 &&
+      version != TT_IREE_TTEX_VERSION_21) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
         "unsupported TTEX version %u (runtime supports versions %u-%u)",
@@ -1820,11 +1821,12 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
     ttex_ns(EntryPointDef_table_t) fb_ep =
         ttex_ns(EntryPointDef_vec_at(eps, i));
     uint32_t builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
-    if (version == TT_IREE_TTEX_VERSION_20 &&
+    if ((version == TT_IREE_TTEX_VERSION_20 ||
+         version == TT_IREE_TTEX_VERSION_21) &&
         ttex_ns(EntryPointDef_dispatch_kind(fb_ep)) !=
             TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "TTEX v20 is reserved for BF16 native dispatches");
+                              "TTEX v20/v21 are reserved for BF16 native dispatches");
     if (!iree_hal_tt_is_supported_builtin(builtin_program)) {
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "TTEX entry point %zu uses unsupported builtin "
@@ -1872,13 +1874,15 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       bool tensix = builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
       if ((version != TT_IREE_TTEX_VERSION_17 &&
            version != TT_IREE_TTEX_VERSION_18 &&
-           version != TT_IREE_TTEX_VERSION_20) || !native ||
+           version != TT_IREE_TTEX_VERSION_20 &&
+           version != TT_IREE_TTEX_VERSION_21) || !native ||
           (builtin_program != TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE && !tensix) ||
           (tensix && version != TT_IREE_TTEX_VERSION_18 &&
-           version != TT_IREE_TTEX_VERSION_20) ||
+           version != TT_IREE_TTEX_VERSION_20 &&
+           version != TT_IREE_TTEX_VERSION_21) ||
           !ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep)))
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17/v18/v20 descriptor and AOT; Tensix requires v18/v20");
+                                "BF16 native requires v17/v18/v20/v21 descriptor and AOT; Tensix requires v18/v20/v21");
       auto tensors = ttex_ns(BF16NativeDef_tensors(native));
       uint8_t kind = ttex_ns(BF16NativeDef_operation_kind(native));
       if (tensix && !tt_iree_ttex_is_native_matrix_kind(kind))
@@ -1908,7 +1912,8 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
         has_bf16 |= ttex_ns(TensorDesc_element_type(tensor)) == TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
       }
       IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_layout_version(&desc, version));
-      if (version == TT_IREE_TTEX_VERSION_20) {
+      if (version == TT_IREE_TTEX_VERSION_20 ||
+          version == TT_IREE_TTEX_VERSION_21) {
         IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_native_v20(
             &desc, builtin_program, ttex_ns(EntryPointDef_binding_count(fb_ep)),
             ttex_ns(EntryPointDef_constant_count(fb_ep))));
@@ -1942,7 +1947,8 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
             output_count != static_cast<uint64_t>(m) * n ||
             ttex_ns(TensorDesc_element_type(lhs)) != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
             ttex_ns(TensorDesc_element_type(rhs)) != TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16 ||
-            ttex_ns(TensorDesc_shape_0(rhs)) != n)
+            (!tt_iree_ttex_is_tile_layout(ttex_ns(TensorDesc_layout(rhs))) &&
+             ttex_ns(TensorDesc_shape_0(rhs)) != n))
           return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native matrix shape/dtype contract mismatch");
         if (!tt_iree_bf16_matrix_geometry_is_valid(&desc))
           return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "BF16 native matrix layout/K contract mismatch");

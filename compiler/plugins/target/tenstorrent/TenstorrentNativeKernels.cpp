@@ -307,6 +307,49 @@ bool supportsBF16Prefetch(const tt_iree_ttex_entry_point_desc_t &ep,
          b.rank == 2 && unitStride(b, 1);
 }
 
+// v21 tile transfers. DRAM pages are 2KiB; a tile whose binding offset is not
+// page-aligned spans two pages, so every transfer splits at page boundaries.
+// NoC transfers need matching 64B offsets on both sides; otherwise the tile is
+// staged in a window with the source offset and copied.
+std::string tileTransferSource() {
+  return R"kernel(
+template <typename Buffer>
+inline void read_bytes(const Buffer &buffer, uint32_t byte, uint32_t dst, uint32_t size) {
+  while(size) {
+    uint32_t n=2048u-byte%2048u; if(n>size) n=size;
+    noc_async_read(buffer.get_noc_addr(byte/2048u,byte%2048u),dst,n);
+    byte+=n; dst+=n; size-=n;
+  }
+}
+template <typename Buffer>
+inline void write_bytes(uint32_t src, const Buffer &buffer, uint32_t byte, uint32_t size) {
+  while(size) {
+    uint32_t n=2048u-byte%2048u; if(n>size) n=size;
+    noc_async_write(src,buffer.get_noc_addr(byte/2048u,byte%2048u),n);
+    byte+=n; src+=n; size-=n;
+  }
+}
+inline void copy_bytes(uint32_t src, uint32_t dst, uint32_t size) {
+  if(((src|dst|size)&3u)==0) {
+    auto s=reinterpret_cast<const uint32_t*>(src); auto d=reinterpret_cast<uint32_t*>(dst);
+    for(uint32_t i=0;i<size/4u;++i) d[i]=s[i];
+  } else {
+    auto s=reinterpret_cast<const uint16_t*>(src); auto d=reinterpret_cast<uint16_t*>(dst);
+    for(uint32_t i=0;i<size/2u;++i) d[i]=s[i];
+  }
+}
+// |stage| holds 2048+64 bytes and is used only when offsets disagree.
+template <typename Buffer>
+inline void fetch_tile(const Buffer &buffer, uint32_t byte, uint32_t dst, uint32_t stage) {
+  if(((byte^dst)&63u)==0) { read_bytes(buffer,byte,dst,2048u); return; }
+  uint32_t window=((stage+63u)&~63u)+byte%64u;
+  read_bytes(buffer,byte,window,2048u);
+  noc_async_read_barrier();
+  copy_bytes(window,dst,2048u);
+}
+)kernel";
+}
+
 std::string bf16PrefetchSource() {
   std::ostringstream s;
   s << R"kernel(
@@ -1088,6 +1131,39 @@ generateBF16NativeMatrix(const tt_iree_ttex_entry_point_desc_t &geometry,
       lhsCoords = coords(*tensors[0], "m", "k"); rhsCoords = "n,k";
     }
     auto common = generateBF16NativeCommon(tensors) + bulkTransferSource(tensors);
+    // v21: A tiles [M1,K1] and B tiles [N1,K1] are already in CB order, so the
+    // reader only streams tiles; compute and writer are unchanged.
+    std::string tileReader;
+    if (tt_iree_ttex_is_tile_layout(tensors[0]->layout)) {
+      const uint32_t kTiles = (k + 31) / 32;
+      std::ostringstream reader;
+      reader << common << tileTransferSource() << R"kernel(
+// native-v21: face-ordered operand tiles stream straight into the CBs.
+void kernel_main() {
+  CircularBuffer tile_a(tt::CBIndex::c_0), tile_b(tt::CBIndex::c_1), stage_cb(tt::CBIndex::c_8);
+  stage_cb.reserve_back(1);
+  uint32_t stage=stage_cb.get_write_ptr();
+  const auto a_buf=TensorAccessor(accessor_0,get_arg_val<uint32_t>(0));
+  const auto b_buf=TensorAccessor(accessor_1,get_arg_val<uint32_t>(2));
+  uint32_t a_base=get_arg_val<uint32_t>(1), b_base=get_arg_val<uint32_t>(3);
+  uint32_t m_start=get_arg_val<uint32_t>(28), n_start=get_arg_val<uint32_t>(29);
+  uint32_t m_count=get_arg_val<uint32_t>(30), n_count=get_arg_val<uint32_t>(31);
+  for(uint32_t tm=0;tm<m_count;++tm) for(uint32_t tn=0;tn<n_count;++tn)
+)kernel" << "  for(uint32_t block=0;block<" << kTiles << "u;++block) {\n"
+             << "    uint32_t a_tile=(m_start+tm)*" << kTiles
+             << "u+block, b_tile=(n_start+tn)*" << kTiles << "u+block;\n"
+             << R"kernel(
+    tile_a.reserve_back(1); tile_b.reserve_back(1);
+    fetch_tile(a_buf,a_base+a_tile*2048u,tile_a.get_write_ptr(),stage);
+    fetch_tile(b_buf,b_base+b_tile*2048u,tile_b.get_write_ptr(),stage);
+    noc_async_read_barrier();
+    tile_a.push_back(1); tile_b.push_back(1);
+  }
+}
+)kernel";
+      tileReader = reader.str();
+      reuse_output_tiles = false;
+    }
     const bool prefetch =
         prefetch_bf16_inputs && supportsBF16Prefetch(geometry, tensors);
     const bool reuse = reuse_output_tiles && prefetch && (m > 32 || n > 32);
@@ -1182,7 +1258,7 @@ void kernel_main() {
   }
 }
 )kernel";
-    sources.reader = reader.str();
+    sources.reader = tileReader.empty() ? reader.str() : tileReader;
     sources.compute = R"kernel(
 // native-v18: all K tiles accumulate in FP32 Dst before one final pack.
 #include <cstdint>
@@ -1280,4 +1356,64 @@ void kernel_main() {
   }
   return sources;
 }
+std::string
+generateBF16NativeTilize(const tt_iree_ttex_tensor_desc_t *const *tensors) {
+  const auto *in = tensors[0], *out = tensors[2];
+  if (!in || !out || in->rank != 2 || out->rank != 2 ||
+      in->layout != TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR ||
+      !tt_iree_ttex_is_tile_layout(out->layout) || !unitStride(*in, 1) ||
+      out->shape[0] != (in->shape[0] + 31) / 32 * 32 ||
+      out->shape[1] != (in->shape[1] + 31) / 32 * 32)
+    return {};
+  const uint32_t rows = in->shape[0], cols = in->shape[1];
+  const uint32_t rowTiles = out->shape[0] / 32, colTiles = out->shape[1] / 32;
+  const bool byRow = out->layout == TT_IREE_TTEX_TENSOR_LAYOUT_TILE_FACE;
+  const bool partial = rows % 32 || cols % 32;
+  std::ostringstream s;
+  s << generateBF16NativeCommon(tensors) << tileTransferSource() << R"kernel(
+// native-v21 tilize: gather 32 row segments per tile into 128B windows, then
+// copy 16-element face rows into Tensix face order and write one 2KiB tile.
+void kernel_main() {
+  CircularBuffer stage_cb(tt::CBIndex::c_0), tile_cb(tt::CBIndex::c_1);
+  stage_cb.reserve_back(1); tile_cb.reserve_back(1);
+  uint32_t stage=stage_cb.get_write_ptr(), tile=tile_cb.get_write_ptr();
+  const auto src=TensorAccessor(accessor_0,get_arg_val<uint32_t>(0));
+  const auto dst=TensorAccessor(accessor_2,get_arg_val<uint32_t>(4));
+  uint32_t dst_base=get_arg_val<uint32_t>(5);
+  uint32_t first=get_arg_val<uint32_t>(28)/1024u;
+  uint32_t last=first+get_arg_val<uint32_t>(29)/1024u;
+  uint32_t ptrs[32];
+  for(uint32_t t=first;t<last;++t) {
+)kernel";
+  if (byRow)
+    s << "uint32_t tr=t/" << colTiles << "u,tc=t%" << colTiles << "u;\n";
+  else
+    s << "uint32_t tr=t%" << rowTiles << "u,tc=t/" << rowTiles << "u;\n";
+  s << "uint32_t valid_r=" << rows << "u-tr*32u; if(valid_r>32u) valid_r=32u;\n"
+    << "uint32_t valid_c=" << cols << "u-tc*32u; if(valid_c>32u) valid_c=32u;\n"
+    << R"kernel(
+    for(uint32_t r=0;r<valid_r;++r) {
+      uint32_t byte=byte_0(tr*32u+r,tc*32u,0,0);
+      ptrs[r]=((stage+63u)&~63u)+r*128u+byte%64u;
+      read_bytes(src,byte,ptrs[r],valid_c*2u);
+    }
+    noc_async_read_barrier();
+)kernel";
+  if (partial)
+    s << "if(valid_r<32u || valid_c<32u) { auto z=reinterpret_cast<uint32_t*>(tile); "
+         "for(uint32_t i=0;i<512u;++i) z[i]=0; }\n";
+  s << R"kernel(
+    for(uint32_t r=0;r<valid_r;++r)
+      for(uint32_t half=0;half<2u && half*16u<valid_c;++half) {
+        uint32_t n=valid_c-half*16u; if(n>16u) n=16u;
+        copy_bytes(ptrs[r]+half*32u,tile+((r/16u)*2u+half)*512u+(r%16u)*32u,n*2u);
+      }
+    write_bytes(tile,dst,dst_base+t*2048u,2048u);
+    noc_async_write_barrier();
+  }
+}
+)kernel";
+  return s.str();
+}
+
 } // namespace mlir::iree_compiler::IREE::HAL
