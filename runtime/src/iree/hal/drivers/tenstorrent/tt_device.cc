@@ -34,6 +34,7 @@
 #ifndef TT_IREE_ENABLE_MOCK
 #include "impl/kernels/kernel.hpp"
 #include "impl/program/program_impl.hpp"
+#include "iree/hal/drivers/tenstorrent/tt_device_profiler.h"
 #include "iree/hal/drivers/tenstorrent/tt_fill.h"
 #include "tt-metalium/bfloat16.hpp"
 #include "tt-metalium/device.hpp"
@@ -769,6 +770,8 @@ iree_hal_tt_create_kernel_from_embedded_precompiled(
     const std::string &artifact_root) {
   tt::tt_metal::KernelHandle kernel =
       tt::tt_metal::CreateKernelFromString(program, source, core_spec, config);
+  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
+    return kernel;
   program.impl().get_kernel(kernel)->set_precompiled_config(
       tt::tt_metal::experimental::PrecompiledKernelConfig{
           .precompiled_dir = artifact_root,
@@ -1130,6 +1133,7 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_host_matrices(
       profile_stages->enqueue_wait_ns +=
           iree::hal::tenstorrent::RuntimeProfiler::NowNs() - stage_start_ns;
     }
+    iree::hal::tenstorrent::ReadDeviceProfiler(device->mesh_device.get());
 
     out_row_major->assign(out_rows * out_cols, bfloat16(0.0f));
     for (uint32_t core_r = 0; core_r < num_cores_r; ++core_r) {
@@ -1618,6 +1622,7 @@ static iree_status_t iree_hal_tt_execute_f32_padded_copy_dispatch_device(
       profile_stages->enqueue_wait_ns +=
           iree::hal::tenstorrent::RuntimeProfiler::NowNs() - enqueue_start_ns;
     }
+    iree::hal::tenstorrent::ReadDeviceProfiler(device->mesh_device.get());
     auto &programs = workload.get_programs();
     if (!programs.empty()) {
       *program = std::move(programs.begin()->second);
@@ -2301,6 +2306,7 @@ static iree_status_t iree_hal_tt_execute_device_native_f32_matmul_like_dispatch(
       profile_stages->enqueue_wait_ns +=
           iree::hal::tenstorrent::RuntimeProfiler::NowNs() - stage_start_ns;
     }
+    iree::hal::tenstorrent::ReadDeviceProfiler(device->mesh_device.get());
     return iree_ok_status();
   } catch (const std::exception &e) {
     return iree_make_status(IREE_STATUS_INTERNAL,

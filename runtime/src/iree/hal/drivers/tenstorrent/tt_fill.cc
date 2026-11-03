@@ -14,6 +14,7 @@
 
 #include "impl/kernels/kernel.hpp"
 #include "impl/program/program_impl.hpp"
+#include "iree/hal/drivers/tenstorrent/tt_device_profiler.h"
 #include "iree/hal/drivers/tenstorrent/tt_fill_aot.h"
 #include "iree/hal/drivers/tenstorrent/tt_runtime_profiler.h"
 #include "tt-metalium/distributed.hpp"
@@ -110,13 +111,14 @@ iree_status_t DeviceFill::Execute(distributed::MeshDevice *device,
                                           metal::DataMovementProcessor::RISCV_0,
                                       .noc = metal::NOC::RISCV_0_default,
                                       .compile_args = std::move(args)});
-        program.impl()
-            .get_kernel(candidate->kernel)
-            ->set_precompiled_config(
-                metal::experimental::PrecompiledKernelConfig{
-                    .precompiled_dir = candidate->artifacts.root.string(),
-                    .fallback_policy = metal::experimental::
-                        PrecompiledKernelConfig::FallbackPolicy::Error});
+        if (UsePrecompiledKernels())
+          program.impl()
+              .get_kernel(candidate->kernel)
+              ->set_precompiled_config(
+                  metal::experimental::PrecompiledKernelConfig{
+                      .precompiled_dir = candidate->artifacts.root.string(),
+                      .fallback_policy = metal::experimental::
+                          PrecompiledKernelConfig::FallbackPolicy::Error});
         candidate->workload.add_program(
             distributed::MeshCoordinateRange(device->shape()),
             std::move(program));
@@ -133,6 +135,7 @@ iree_status_t DeviceFill::Execute(distributed::MeshDevice *device,
       RuntimeTransferStage enqueue(RuntimeTransferStageKind::DeviceEnqueueWait);
       distributed::EnqueueMeshWorkload(*queue, impl_->workload, true);
     }
+    ReadDeviceProfiler(device);
     if (auto *record = RuntimeTransferScope::CurrentRecord())
       record->device_fill_bytes += length;
     return iree_ok_status();

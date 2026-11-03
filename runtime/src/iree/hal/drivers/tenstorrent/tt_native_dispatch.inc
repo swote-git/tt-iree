@@ -216,6 +216,7 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
     if (stages)
       stages->enqueue_wait_ns +=
           iree::hal::tenstorrent::RuntimeProfiler::NowNs() - start;
+    iree::hal::tenstorrent::ReadDeviceProfiler(device->mesh_device.get());
     return iree_ok_status();
   } catch (const std::exception &e) {
     return iree_make_status(IREE_STATUS_INTERNAL,

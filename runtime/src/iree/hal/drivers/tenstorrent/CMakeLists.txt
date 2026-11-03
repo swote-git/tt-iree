@@ -28,6 +28,7 @@ set(TT_HAL_DRIVER_HDRS
   tt_native_dispatch.inc
   tt_native_partition.h
   tt_allocator.h
+  tt_device_profiler.h
   tt_buffer.h
   tt_buffer_transfer.h
   tt_fill.h
@@ -106,7 +107,8 @@ if(TT_IREE_ENABLE_TTNN AND NOT TT_IREE_ENABLE_MOCK)
     DEPENDS tt-iree-transfer-aot "${CMAKE_CURRENT_SOURCE_DIR}/tt_fill_kernel.h"
     COMMENT "Offline-compiling embedded HAL fill kernels (Wormhole/Blackhole)"
     VERBATIM)
-  target_sources(iree_hal_tenstorrent PRIVATE tt_fill.cc "${_TT_FILL_AOT_SOURCE}")
+  target_sources(iree_hal_tenstorrent PRIVATE tt_device_profiler.cc tt_fill.cc
+    "${_TT_FILL_AOT_SOURCE}")
 endif()
 
 # TTEX parsing is independent of TT-Metal and must also be available in mock

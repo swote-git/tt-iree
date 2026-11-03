@@ -27,6 +27,7 @@
 #include "iree/schema/tt_executable_builder_util.h"
 
 #ifndef TT_IREE_ENABLE_MOCK
+#include "iree/hal/drivers/tenstorrent/tt_device_profiler.h"
 #include "impl/kernels/kernel.hpp"
 #include "impl/program/program_impl.hpp"
 #include "tt-metalium/experimental/offline_kernel_compile.hpp"
@@ -1226,6 +1227,8 @@ iree_hal_tt_create_kernel_from_embedded_precompiled(
     const std::string &artifact_root) {
   tt::tt_metal::KernelHandle kernel =
       tt::tt_metal::CreateKernelFromString(program, source, core_spec, config);
+  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
+    return kernel;
   program.impl().get_kernel(kernel)->set_precompiled_config(
       tt::tt_metal::experimental::PrecompiledKernelConfig{
           .precompiled_dir = artifact_root,
