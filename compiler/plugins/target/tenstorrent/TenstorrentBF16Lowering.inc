@@ -191,6 +191,70 @@ public:
     return failure();
   }
 
+  // Parallel SFPI form for the v22 Tensix epilogue. Booleans are vInt 0/1.
+  llvm::DenseMap<Value, std::string> vectors;
+  std::ostringstream vcode;
+  bool vectorOk = true;
+
+  std::optional<std::string> getVector(Value value) {
+    auto it = vectors.find(value);
+    if (it != vectors.end())
+      return it->second;
+    if (auto constant = getConstantFloat(value)) {
+      float f = static_cast<float>(*constant);
+      uint32_t raw;
+      memcpy(&raw, &f, 4);
+      return "sfpi::vFloat(__builtin_bit_cast(float, uint32_t(" +
+             std::to_string(raw) + "u)))";
+    }
+    return std::nullopt;
+  }
+
+  void emitVector(Operation &scalar) {
+    if (!vectorOk)
+      return;
+    SmallVector<std::string> args;
+    for (Value operand : scalar.getOperands()) {
+      auto expr = getVector(operand);
+      if (!expr) {
+        vectorOk = false;
+        return;
+      }
+      args.push_back(*expr);
+    }
+    std::string name = "sv" + std::to_string(next), expr;
+    bool round = scalar.getResult(0).getType().isBF16();
+    if (isa<arith::ExtFOp>(scalar)) {
+      expr = args[0];
+      round = false;
+    } else if (isa<arith::TruncFOp>(scalar)) {
+      expr = args[0];
+    } else if (isa<arith::DivFOp, arith::MulFOp>(scalar)) {
+      // Never a bare `*`: the compiler would contract it with a following add
+      // into SFPMAD, which is not a correctly rounded FMA.
+      expr = std::string(isa<arith::DivFOp>(scalar) ? "tt_div(" : "tt_mul(") +
+             args[0] + "," + args[1] + ")";
+    } else if (isa<arith::AddFOp, arith::SubFOp>(scalar)) {
+      expr = "(" + args[0] + (isa<arith::AddFOp>(scalar) ? "+" : "-") +
+             args[1] + ")";
+    } else if (isa<arith::CmpFOp>(scalar)) {
+      vcode << "    sfpi::vInt " << name << " = tt_ugt(" << args[0] << ","
+            << args[1] << ");\n";
+      vectors[scalar.getResult(0)] = name;
+      return;
+    } else if (isa<arith::SelectOp>(scalar)) {
+      // BF16 select operands are already rounded.
+      expr = "tt_select(" + args[0] + "," + args[1] + "," + args[2] + ")";
+      round = false;
+    } else {
+      vectorOk = false;
+      return;
+    }
+    vcode << "    sfpi::vFloat " << name << " = "
+          << (round ? "tt_rne(" + expr + ")" : expr) << ";\n";
+    vectors[scalar.getResult(0)] = name;
+  }
+
   FailureOr<std::string> emit(linalg::GenericOp op) {
     for (Operation &scalar : op.getRegion().front()) {
       if (auto yield = dyn_cast<linalg::YieldOp>(scalar)) {
@@ -231,7 +295,7 @@ public:
                  cmp && args.size() == 2) {
         if (cmp.getPredicate() != arith::CmpFPredicate::UGT)
           return failure();
-        expr = "!(" + args[0] + " <= " + args[1] + ")";
+        expr = "!f_le(" + args[0] + "," + args[1] + ")";
         comparison = true;
       } else if (isa<arith::SelectOp>(scalar) && args.size() == 3) {
         expr = "(" + args[0] + " ? " + args[1] + " : " + args[2] + ")";
@@ -239,6 +303,7 @@ public:
         return failure();
       if (scalar.getResult(0).getType().isBF16())
         expr = "round_bf16(" + expr + ")";
+      emitVector(scalar);
       std::string name = "bfv" + std::to_string(next++);
       code << (comparison ? "bool " : "float ") << name << "=" << expr << ";\n";
       values[scalar.getResult(0)] = name;
@@ -391,7 +456,8 @@ static bool bf16GlobalSumBody(linalg::GenericOp op, tensor::ExtractOp extract) {
 static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
                                            Value contraction, uint8_t layout,
                                            BuiltinSelection &selection,
-                                           unsigned &slot) {
+                                           unsigned &slot,
+                                           TenstorrentSfpuEpilogue *sfpu = nullptr) {
   auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
   if (!type || op.getNumDpsInits() != 1 || op.getDpsInputs().empty() ||
       op.getDpsInputs()[0] != contraction ||
@@ -408,6 +474,12 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
       (nchw || ncm || layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR) ? 1 : 0;
   auto &body = op.getRegion().front();
   emitter.values[body.getArgument(0)] = "value";
+  emitter.vectors[body.getArgument(0)] = "value";
+  std::vector<TenstorrentEpilogueOperand> operands;
+  auto addOperand = [&](TenstorrentEpilogueOperand operand, Value arg) {
+    emitter.vectors[arg] = "x" + std::to_string(operands.size());
+    operands.push_back(std::move(operand));
+  };
   std::ostringstream constants;
   for (unsigned i = 1; i < op.getNumDpsInputs(); ++i) {
     auto input = op.getDpsInputs()[i];
@@ -474,6 +546,15 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
       }
       constants << "};\n";
       emitter.values[body.getArgument(i)] = "from_bits(" + name + "[n])";
+      TenstorrentEpilogueOperand operand;
+      operand.channel = true;
+      operand.f32 = !inputType.getElementType().isBF16();
+      for (float v : elements) {
+        uint32_t raw;
+        memcpy(&raw, &v, 4);
+        operand.constant.push_back(raw);
+      }
+      addOperand(std::move(operand), body.getArgument(i));
     } else {
       if (slot >= TT_IREE_BF16_NATIVE_TENSOR_COUNT ||
           failed(bf16LoadDesc(input,
@@ -482,6 +563,13 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
                                   : layout,
                               selection.bf16Native.tensors[slot])))
         return failure();
+      TenstorrentEpilogueOperand operand;
+      operand.channel = coords == "n";
+      operand.slot = slot;
+      operand.f32 = !inputType.getElementType().isBF16();
+      if (operand.channel && selection.bf16Native.tensors[slot].stride[0] > 1)
+        emitter.vectorOk = false;
+      addOperand(std::move(operand), body.getArgument(i));
       emitter.values[body.getArgument(i)] =
           "read_" + std::to_string(slot++) + "(scratch," + coords + ")";
     }
@@ -489,6 +577,25 @@ static FailureOr<std::string> bf16Epilogue(linalg::GenericOp op,
   auto result = emitter.emit(op);
   if (failed(result))
     return failure();
+  if (sfpu) {
+    auto &yield = *op.getRegion().front().getTerminator();
+    auto vector = emitter.getVector(yield.getOperand(0));
+    sfpu->operands.clear();
+    sfpu->body.clear();
+    if (emitter.vectorOk && vector &&
+        operands.size() <= kTenstorrentMaxEpilogueOperands) {
+      sfpu->operands = std::move(operands);
+      // A bare yield of the FP32 accumulator still rounds to the BF16 store.
+      sfpu->body = emitter.vcode.str() + "    value = " +
+                   (yield.getOperand(0).getType().isBF16()
+                        ? *vector
+                        : "tt_rne(" + *vector + ")") +
+                   ";\n";
+    } else {
+      sfpu->body = "";
+      sfpu->operands.clear();
+    }
+  }
   return constants.str() + emitter.code.str() + "value=" + *result + ";\n";
 }
 
@@ -556,10 +663,12 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
         (d.n + 31) / 32 * 32 != d.tensors[1].shape[1])
       return failure();
     unsigned slot = 3;
+    TenstorrentSfpuEpilogue sfpu;
     auto body = bf16Epilogue(epilogueOp, tileMatmul.getResult(0),
                              TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR, selection,
-                             slot);
-    if (failed(body) || slot != 3)
+                             slot, &sfpu);
+    // Tiled operands only feed Tensix, which needs an SFPU epilogue.
+    if (failed(body) || slot != 3 || sfpu.body.empty())
       return failure();
     tt_iree_ttex_entry_point_desc_t geometry = {};
     geometry.dispatch_kind = TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE;
@@ -573,8 +682,8 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
       t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
 #ifdef TT_IREE_ENABLE_AOT
-    selection.bf16Sources =
-        generateBF16NativeMatrix(geometry, t, *body, /*use_tensix=*/true);
+    selection.bf16Sources = generateBF16NativeMatrix(
+        geometry, t, *body, /*use_tensix=*/true, true, false, &sfpu);
     selection.bf16Source = selection.bf16Sources.reader;
     selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
 #endif
@@ -732,9 +841,17 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
             resultType.getShape())
       return failure();
     unsigned slot = 3;
-    auto body = bf16Epilogue(epilogueOp, result, layout, selection, slot);
+    TenstorrentSfpuEpilogue sfpu;
+    auto body = bf16Epilogue(epilogueOp, result, layout, selection, slot, &sfpu);
     if (failed(body))
       return failure();
+    // v22 Tensix runs the epilogue on the SFPU; any other epilogue keeps the
+    // RISC-V reference program.
+    if (sfpu.body.empty())
+      useTensix = false;
+    // Each lane of a reused pair keeps its own operand tiles in FP32 Dst.
+    if (2 * (1 + sfpu.operands.size()) > 8)
+      reuseOutputTiles = false;
     geometry.matmul_like.lhs = geometry.linear.input = geometry.conv2d.input =
         d.tensors[0];
     geometry.matmul_like.rhs = geometry.linear.weights =
@@ -747,7 +864,7 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
 #ifdef TT_IREE_ENABLE_AOT
     selection.bf16Sources =
         generateBF16NativeMatrix(geometry, t, *body, useTensix, true,
-                                reuseOutputTiles);
+                                reuseOutputTiles, useTensix ? &sfpu : nullptr);
     selection.bf16Source = selection.bf16Sources.reader;
     if (useTensix)
       selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;

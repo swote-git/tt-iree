@@ -4,11 +4,14 @@
 #define TT_IREE_TENSTORRENT_NATIVE_KERNELS_H_
 #include <cstdint>
 #include <string>
+#include <vector>
 struct tt_iree_ttex_entry_point_desc_t;
 struct tt_iree_ttex_tensor_desc_t;
 namespace mlir::iree_compiler::IREE::HAL {
 struct TenstorrentNativeSources {
   std::string reader, writer, compute;
+  // v22 BF16 Tensix: SFPU epilogue, operand CBs 26-31.
+  bool sfpuEpilogue = false;
 };
 struct TenstorrentScalarGrid {
   uint32_t x = 1, y = 1;
@@ -34,6 +37,32 @@ generateNativeSources(const tt_iree_ttex_entry_point_desc_t &entry,
                       bool use_tensix = false);
 std::string generateBF16NativeCommon(
     const tt_iree_ttex_tensor_desc_t *const *tensors);
+
+// v22 SFPU epilogue operand. The writer streams one FP32 tile per output tile
+// into CB c_26+i, unpacked straight to the FP32 Dst (BF16 sources widen
+// exactly). The tile is oriented like the Dst accumulator.
+struct TenstorrentEpilogueOperand {
+  // Per-output-channel vector broadcast over the tile, else a full tensor.
+  bool channel = false;
+  // Tensor slot; -1 for a compile-time constant channel vector.
+  int slot = -1;
+  // FP32 bits of a constant channel vector, indexed by channel.
+  std::vector<uint32_t> constant;
+  // FP32 source tensor elements; BF16 otherwise.
+  bool f32 = false;
+};
+inline constexpr unsigned kTenstorrentMaxEpilogueOperands = 6;
+// SFPI statements over vFloat `value` (FP32 accumulator) and operand vectors
+// `x<i>`; the BF16-rounded result is left in `value`.
+struct TenstorrentSfpuEpilogue {
+  std::string body;
+  std::vector<TenstorrentEpilogueOperand> operands;
+};
+
+// SFPI helpers (tt_rne, tt_ugt, tt_select, tt_div) for code inside
+// `namespace ckernel::sfpu` of a TRISC_MATH compute kernel.
+std::string tenstorrentSfpuHelperSource();
+
 TenstorrentNativeSources generateBF16NativeMatrix(
     const tt_iree_ttex_entry_point_desc_t &geometry,
     const tt_iree_ttex_tensor_desc_t *const *tensors,
@@ -41,7 +70,9 @@ TenstorrentNativeSources generateBF16NativeMatrix(
     // Disable only to compare against the original device reader in tests.
     bool prefetch_bf16_inputs = true,
     // Pair output tiles using the existing two-page input/output CB contract.
-    bool reuse_output_tiles = false);
+    bool reuse_output_tiles = false,
+    // v22 Tensix: run the epilogue on the SFPU; the writer stores BF16.
+    const TenstorrentSfpuEpilogue *sfpu = nullptr);
 // v21 tilize: row-major BF16 slot 0 into the face-tiled slot 2, whole tiles
 // per core (element range in units of 1024).
 std::string

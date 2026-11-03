@@ -33,6 +33,7 @@
 
 #ifndef TT_IREE_ENABLE_MOCK
 #include "impl/kernels/kernel.hpp"
+#include <tt-metalium/circular_buffer_constants.h>
 #include "impl/program/program_impl.hpp"
 #include "iree/hal/drivers/tenstorrent/tt_device_profiler.h"
 #include "iree/hal/drivers/tenstorrent/tt_fill.h"
@@ -786,6 +787,19 @@ static tt::tt_metal::ComputeConfig iree_hal_tt_matmul_compute_config() {
   config.math_fidelity = tt::tt_metal::MathFidelity::HiFi4;
   config.fp32_dest_acc_en = true;
   config.math_approx_mode = false;
+  return config;
+}
+
+// TTEX v22 BF16 Tensix: full-sync FP32 Dst (8 tiles: accumulators plus SFPU
+// epilogue operands); FP32 operand CBs 26-31 unpack straight to Dst. Must
+// match makeBF16TensixComputeConfig in the compiler for the AOT kernel hash.
+static tt::tt_metal::ComputeConfig iree_hal_tt_bf16_tensix_compute_config() {
+  tt::tt_metal::ComputeConfig config = iree_hal_tt_matmul_compute_config();
+  config.dst_full_sync_en = true;
+  config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS,
+                                    tt::tt_metal::UnpackToDestMode::Default);
+  for (unsigned i = 26; i < 32; ++i)
+    config.unpack_to_dest_mode[i] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
   return config;
 }
 

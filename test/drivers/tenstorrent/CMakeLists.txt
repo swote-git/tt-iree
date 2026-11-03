@@ -282,3 +282,30 @@ if(TT_IREE_ENABLE_TTNN AND NOT TT_IREE_ENABLE_MOCK)
   target_compile_options(tensix_precision_probe PRIVATE -ffp-contract=off)
   tt_metal_target_link_libraries(tensix_precision_probe)
 endif()
+
+# SFPU FP32 arithmetic (FMA, mul, add, tt_div) versus IEEE binary32 on device.
+# JIT-compiles project-owned kernels; run one hardware process at a time.
+if(NOT TT_IREE_ENABLE_MOCK)
+  add_executable(sfpu_fp32_test
+    sfpu_fp32_test.cc
+    ../../../compiler/plugins/target/tenstorrent/TenstorrentNativeKernels.cpp
+  )
+  target_compile_features(sfpu_fp32_test PRIVATE cxx_std_20)
+  target_compile_options(sfpu_fp32_test PRIVATE -ffp-contract=off)
+  set_property(TARGET sfpu_fp32_test PROPERTY CXX_SCAN_FOR_MODULES OFF)
+  target_include_directories(sfpu_fp32_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/compiler/plugins/target/tenstorrent
+    ${CMAKE_SOURCE_DIR}/runtime/src
+  )
+  target_link_libraries(sfpu_fp32_test PRIVATE
+    tt_executable_builder_util
+    iree_testing_gtest
+    iree_testing_gtest_main
+  )
+  tt_metal_target_link_libraries(sfpu_fp32_test)
+  add_test(NAME tt_sfpu_fp32_test COMMAND sfpu_fp32_test)
+  set_tests_properties(tt_sfpu_fp32_test PROPERTIES
+    LABELS "tt-iree;hal;device-native;sfpu;hardware"
+    RUN_SERIAL TRUE TIMEOUT 600
+    ENVIRONMENT "TT_METAL_RUNTIME_ROOT=${CMAKE_SOURCE_DIR}/third_party/tt-metal")
+endif()

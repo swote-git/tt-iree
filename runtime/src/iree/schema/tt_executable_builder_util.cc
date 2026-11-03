@@ -161,15 +161,18 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
   for (iree_host_size_t i = 0; i < entry_point_count; ++i) {
     const auto &ep = entry_points[i];
     if ((version == TT_IREE_TTEX_VERSION_20 ||
-         version == TT_IREE_TTEX_VERSION_21) &&
+         version == TT_IREE_TTEX_VERSION_21 ||
+         version == TT_IREE_TTEX_VERSION_22) &&
         ep.dispatch_kind != TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "TTEX v20/v21 are reserved for BF16 native dispatches");
+                              "TTEX v20-v22 are reserved for BF16 native dispatches");
     if (ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
       IREE_RETURN_IF_ERROR(
           tt_iree_validate_bf16_layout_version(&ep.bf16_native, version));
       if (version == TT_IREE_TTEX_VERSION_20 ||
-          version == TT_IREE_TTEX_VERSION_21) {
+          version == TT_IREE_TTEX_VERSION_21 ||
+          (version == TT_IREE_TTEX_VERSION_22 &&
+           tt_iree_bf16_uses_opt_in_layout(&ep.bf16_native))) {
         IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_native_v20(
             &ep.bf16_native, ep.builtin_program, ep.binding_count,
             ep.constant_count));

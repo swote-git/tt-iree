@@ -131,8 +131,9 @@ def main():
                        "-o", str(out / f"{backend}.vmfb")]
             command += (["--iree-tenstorrent-device-id=p100a"] if backend == "tenstorrent"
                         else ["--iree-llvmcpu-target-cpu=host"])
-            if backend == "tenstorrent" and args.use_tensix:
-                command.append("--iree-tenstorrent-native-bf16-use-tensix=true")
+            if backend == "tenstorrent":
+                command.append("--iree-tenstorrent-native-bf16-use-tensix=" +
+                               ("true" if args.use_tensix else "false"))
             run(command, out / f"{backend}-compile.log")
         expected = np.load(golden / "bf16_module/logits.npy")
         actual_outputs, cpu_outputs = [], []

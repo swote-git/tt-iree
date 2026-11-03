@@ -105,6 +105,19 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
     } else if (matrix && !uses_tensix) {
       for (uint8_t i : {0, 1, 16})
         cb(i, tt::DataFormat::UInt32, 4096, 1);
+    } else if (uses_tensix && bf16_native &&
+               params->ttex_version >= TT_IREE_TTEX_VERSION_22) {
+      // v22: FP32 output tiles (the BF16 packer would turn NaN into
+      // infinity), 32 writer row windows, FP32 SFPU operand CBs.
+      for (uint8_t i : {0, 1})
+        cb(i, tt::DataFormat::Float16_b, 2048, 2);
+      cb(16, tt::DataFormat::Float32, 4096, 2);
+      for (uint8_t i : {8, 9})
+        cb(i, tt::DataFormat::UInt32, 4096, 1);
+      cb(17, tt::DataFormat::UInt32, 8192, 1);
+      cb(3, tt::DataFormat::UInt32, 128, 1);
+      for (uint8_t i = 26; i < 32; ++i)
+        cb(i, tt::DataFormat::Float32, 4096, 2);
     } else if (uses_tensix && bf16_native) {
       cb(0, tt::DataFormat::Float16_b, 2048, 2);
       cb(1, tt::DataFormat::Float16_b, 2048, 2);
@@ -168,7 +181,11 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
           program,
           iree_hal_tt_find_aot_kernel_source(bundle,
                                              TT_IREE_TTEX_KERNEL_ROLE_COMPUTE),
-          cores, iree_hal_tt_matmul_compute_config(), root);
+          cores,
+          bf16_native && params->ttex_version >= TT_IREE_TTEX_VERSION_22
+              ? iree_hal_tt_bf16_tensix_compute_config()
+              : iree_hal_tt_matmul_compute_config(),
+          root);
     }
     for (uint32_t r = 0; r < rows; ++r)
       for (uint32_t c = 0; c < cols; ++c) {

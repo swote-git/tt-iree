@@ -1781,7 +1781,8 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       version != TT_IREE_TTEX_VERSION_18 &&
       version != TT_IREE_TTEX_VERSION_19 &&
       version != TT_IREE_TTEX_VERSION_20 &&
-      version != TT_IREE_TTEX_VERSION_21) {
+      version != TT_IREE_TTEX_VERSION_21 &&
+      version != TT_IREE_TTEX_VERSION_22) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
         "unsupported TTEX version %u (runtime supports versions %u-%u)",
@@ -1822,11 +1823,12 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
         ttex_ns(EntryPointDef_vec_at(eps, i));
     uint32_t builtin_program = ttex_ns(EntryPointDef_builtin(fb_ep));
     if ((version == TT_IREE_TTEX_VERSION_20 ||
-         version == TT_IREE_TTEX_VERSION_21) &&
+         version == TT_IREE_TTEX_VERSION_21 ||
+         version == TT_IREE_TTEX_VERSION_22) &&
         ttex_ns(EntryPointDef_dispatch_kind(fb_ep)) !=
             TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "TTEX v20/v21 are reserved for BF16 native dispatches");
+                              "TTEX v20-v22 are reserved for BF16 native dispatches");
     if (!iree_hal_tt_is_supported_builtin(builtin_program)) {
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "TTEX entry point %zu uses unsupported builtin "
@@ -1875,14 +1877,16 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       if ((version != TT_IREE_TTEX_VERSION_17 &&
            version != TT_IREE_TTEX_VERSION_18 &&
            version != TT_IREE_TTEX_VERSION_20 &&
-           version != TT_IREE_TTEX_VERSION_21) || !native ||
+           version != TT_IREE_TTEX_VERSION_21 &&
+           version != TT_IREE_TTEX_VERSION_22) || !native ||
           (builtin_program != TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE && !tensix) ||
           (tensix && version != TT_IREE_TTEX_VERSION_18 &&
            version != TT_IREE_TTEX_VERSION_20 &&
-           version != TT_IREE_TTEX_VERSION_21) ||
+           version != TT_IREE_TTEX_VERSION_21 &&
+           version != TT_IREE_TTEX_VERSION_22) ||
           !ttex_ns(EntryPointDef_aot_kernel_bundle(fb_ep)))
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17/v18/v20/v21 descriptor and AOT; Tensix requires v18/v20/v21");
+                                "BF16 native requires v17/v18/v20-v22 descriptor and AOT; Tensix requires v18/v20-v22");
       auto tensors = ttex_ns(BF16NativeDef_tensors(native));
       uint8_t kind = ttex_ns(BF16NativeDef_operation_kind(native));
       if (tensix && !tt_iree_ttex_is_native_matrix_kind(kind))
@@ -1913,7 +1917,9 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
       }
       IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_layout_version(&desc, version));
       if (version == TT_IREE_TTEX_VERSION_20 ||
-          version == TT_IREE_TTEX_VERSION_21) {
+          version == TT_IREE_TTEX_VERSION_21 ||
+          (version == TT_IREE_TTEX_VERSION_22 &&
+           tt_iree_bf16_uses_opt_in_layout(&desc))) {
         IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_native_v20(
             &desc, builtin_program, ttex_ns(EntryPointDef_binding_count(fb_ep)),
             ttex_ns(EntryPointDef_constant_count(fb_ep))));

@@ -110,8 +110,8 @@ def main():
                        f"--iree-hal-target-backends={backend}", "-o", target / "mnist.vmfb"]
             if backend == "tenstorrent":
                 command.append("--iree-tenstorrent-device-id=p100a")
-                if args.engine == "tensix":
-                    command.append("--iree-tenstorrent-native-bf16-use-tensix=true")
+                command.append("--iree-tenstorrent-native-bf16-use-tensix=" +
+                               ("true" if args.engine == "tensix" else "false"))
             else:
                 command.append("--iree-llvmcpu-target-cpu=host")
             compile_seconds = run(command, target / "compile.log")

@@ -40,8 +40,9 @@ struct TenstorrentOptions {
     binder.opt<bool>(
         "iree-tenstorrent-native-bf16-use-tensix", nativeBF16UseTensix,
         llvm::cl::cat(category),
-        llvm::cl::desc("Use v18 BF16 HiFi4 Tensix contractions instead of "
-                       "v17 device-RISC-V FP32; preserve IR epilogue rounding"));
+        llvm::cl::desc("Run BF16 contractions on Tensix (HiFi4, FP32 Dst, SFPU "
+                       "epilogue); false selects the v17 device-RISC-V FP32 "
+                       "reference. Both preserve IR epilogue rounding"));
     binder.opt<bool>(
         "iree-tenstorrent-native-bf16-reuse-output-tiles", nativeBF16ReuseOutputTiles,
         llvm::cl::cat(category),
@@ -63,7 +64,7 @@ struct TenstorrentOptions {
   std::string deviceId = "p100a";
   bool dumpTTEX = false;
   bool nativeF32UseTensix = false;
-  bool nativeBF16UseTensix = false;
+  bool nativeBF16UseTensix = true;
   bool nativeBF16ReuseOutputTiles = false;
   bool bf16TileLayout = false;
 };

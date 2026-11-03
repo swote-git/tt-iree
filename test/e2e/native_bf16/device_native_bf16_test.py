@@ -65,7 +65,8 @@ def main():
     commands = [
         [args.iree_compile, str(root / "test/e2e/native_bf16/device_native_bf16_projection.mlir"),
          "--iree-hal-target-backends=tenstorrent", "--iree-tenstorrent-device-id=p100a",
-         "-o", str(out / "module.vmfb")],
+         # Bitwise fixture for the sequential FP32 device-RISC-V reference.
+         "--iree-tenstorrent-native-bf16-use-tensix=false", "-o", str(out / "module.vmfb")],
         [args.iree_run_module, "--device=tenstorrent", f"--module={out / 'module.vmfb'}",
          "--function=bf16_projection", f"--input=35x49xbf16=@{out / 'a.bin'}",
          f"--input=33x35xbf16=@{out / 'b.bin'}", f"--output=@{out / 'output.bin'}"],
@@ -104,7 +105,7 @@ def main():
     source = root / "test/e2e/native_bf16/device_native_bf16_average.mlir"
     for index, command in enumerate((
         [args.iree_compile, str(source), "--iree-hal-target-backends=tenstorrent",
-         "-o", str(average / "module.vmfb")],
+         "--iree-tenstorrent-native-bf16-use-tensix=false", "-o", str(average / "module.vmfb")],
         [args.iree_run_module, "--device=tenstorrent", f"--module={average / 'module.vmfb'}",
          "--function=bf16_average", f"--input=4x7x7xbf16=@{average / 'input.bin'}",
          f"--output=@{average / 'output.bin'}"],

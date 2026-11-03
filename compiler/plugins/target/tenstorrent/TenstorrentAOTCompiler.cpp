@@ -28,6 +28,7 @@
 extern char **environ;
 
 #include <hostdevcommon/kernel_structs.h>
+#include <tt-metalium/circular_buffer_constants.h>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/data_types.hpp>
 #include <tt-metalium/experimental/mock_device/mock_device.hpp>
@@ -74,6 +75,17 @@ ComputeConfig makeMatmulComputeConfig() {
   config.math_fidelity = tt::tt_metal::MathFidelity::HiFi4;
   config.fp32_dest_acc_en = true;
   config.math_approx_mode = false;
+  return config;
+}
+
+// TTEX v22 BF16 Tensix; must match iree_hal_tt_bf16_tensix_compute_config.
+ComputeConfig makeBF16TensixComputeConfig() {
+  ComputeConfig config = makeMatmulComputeConfig();
+  config.dst_full_sync_en = true;
+  config.unpack_to_dest_mode.assign(NUM_CIRCULAR_BUFFERS,
+                                    tt::tt_metal::UnpackToDestMode::Default);
+  for (unsigned i = 26; i < 32; ++i)
+    config.unpack_to_dest_mode[i] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
   return config;
 }
 
@@ -1220,18 +1232,27 @@ bool compileBF16NativeAOT(const tt_iree_ttex_entry_point_desc_t &entry,
       error_message = "BF16 Tensix requires all three generated kernel roles";
       return false;
     }
+    // CB formats and the compute config must match the runtime's choice for
+    // the executable version (v22 SFPU epilogue vs. the v18-v21 writer).
+    const bool v22 = sources.sfpuEpilogue;
     for (uint8_t i : {0, 1})
       cb.push_back({.cb_index = i, .data_format = tt::DataFormat::Float16_b});
     for (uint8_t i : {3, 8, 9, 17})
       cb.push_back({.cb_index = i, .data_format = tt::DataFormat::UInt32});
     cb.push_back({.cb_index = 16, .data_format = tt::DataFormat::Float32});
+    if (v22) {
+      for (uint8_t i = 26; i < 32; ++i)
+        cb.push_back({.cb_index = i, .data_format = tt::DataFormat::Float32});
+    }
     DataMovementConfig reader{.processor = DataMovementProcessor::RISCV_1,
                               .noc = NOC::RISCV_1_default, .compile_args = args};
     DataMovementConfig writer{.processor = DataMovementProcessor::RISCV_0,
                               .noc = NOC::RISCV_0_default, .compile_args = args};
     return compileAOTKernelBundle(sources.reader.c_str(), reader,
                                   sources.writer.c_str(), writer, sources.compute.c_str(),
-                                  makeMatmulComputeConfig(), cb, target_arch,
+                                  v22 ? makeBF16TensixComputeConfig()
+                                      : makeMatmulComputeConfig(),
+                                  cb, target_arch,
                                   out_bundle, error_message);
   }
   if (tt_iree_ttex_is_native_matrix_kind(entry.bf16_native.operation_kind))

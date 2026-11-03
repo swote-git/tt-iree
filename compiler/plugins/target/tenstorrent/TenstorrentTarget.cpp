@@ -2554,6 +2554,10 @@ LogicalResult TenstorrentTargetBackend::serializeExecutable(
       llvm::any_of(entryDescs, [](const auto &d) {
         return d.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE;
       }) ? (llvm::any_of(entryDescs, [](const auto &d) {
+              return d.builtin_program ==
+                     TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+            }) ? TT_IREE_TTEX_VERSION_22
+            : llvm::any_of(entryDescs, [](const auto &d) {
               for (const auto &tensor : d.bf16_native.tensors)
                 if (tt_iree_ttex_is_tile_layout(tensor.layout))
                   return true;

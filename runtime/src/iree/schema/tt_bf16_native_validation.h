@@ -35,18 +35,30 @@ static inline bool tt_iree_bf16_layout_rank_is_valid(uint8_t layout,
   }
 }
 
+// v22 keeps the v20/v21 structural checks only for their opt-in layouts.
+static inline bool
+tt_iree_bf16_uses_opt_in_layout(const tt_iree_ttex_bf16_native_desc_t *d) {
+  for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
+    if (tt_iree_ttex_is_batch_layout(d->tensors[i].layout) ||
+        tt_iree_ttex_is_tile_layout(d->tensors[i].layout))
+      return true;
+  return false;
+}
+
 static inline iree_status_t
 tt_iree_validate_bf16_layout_version(const tt_iree_ttex_bf16_native_desc_t *d,
                                      uint32_t version) {
   for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i) {
     if (tt_iree_ttex_is_batch_layout(d->tensors[i].layout) &&
-        version != TT_IREE_TTEX_VERSION_20)
+        version != TT_IREE_TTEX_VERSION_20 &&
+        version != TT_IREE_TTEX_VERSION_22)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "BF16 batch layouts require opt-in TTEX v20");
+                              "BF16 batch layouts require opt-in TTEX v20/v22");
     if (tt_iree_ttex_is_tile_layout(d->tensors[i].layout) &&
-        version != TT_IREE_TTEX_VERSION_21)
+        version != TT_IREE_TTEX_VERSION_21 &&
+        version != TT_IREE_TTEX_VERSION_22)
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                              "BF16 tile layouts require opt-in TTEX v21");
+                              "BF16 tile layouts require opt-in TTEX v21/v22");
   }
   return iree_ok_status();
 }

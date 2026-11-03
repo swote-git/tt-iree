@@ -45,8 +45,11 @@ extern "C" {
 #define TT_IREE_TTEX_VERSION_20 20u
 // Opt-in face-tiled BF16 matmul operands (TILE_FACE layouts).
 #define TT_IREE_TTEX_VERSION_21 21u
+// BF16 Tensix programs run the epilogue on the SFPU and stream FP32 epilogue
+// operand tiles through CBs 26-31. Accepts the v20/v21 layouts.
+#define TT_IREE_TTEX_VERSION_22 22u
 #define TT_IREE_TTEX_CURRENT_VERSION TT_IREE_TTEX_VERSION_18
-#define TT_IREE_TTEX_MAX_KNOWN_VERSION TT_IREE_TTEX_VERSION_21
+#define TT_IREE_TTEX_MAX_KNOWN_VERSION TT_IREE_TTEX_VERSION_22
 
 // BuiltinProgram enum values shared by the compiler, runtime, and tests.
 // Must stay in sync with BuiltinProgram in tt_executable_def.fbs.

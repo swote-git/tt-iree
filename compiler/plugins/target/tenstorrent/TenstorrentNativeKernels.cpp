@@ -37,6 +37,16 @@ inline uint16_t bf16_bits(float value) {
   return (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16;
 }
 inline float round_bf16(float value) { return from_bits(uint32_t(bf16_bits(value)) << 16); }
+// IEEE a <= b on integer bits (false for NaN, +0 == -0). Data-movement RISC-V
+// cores have no FPU, so a float compare would call soft-float __lesf2.
+inline bool f_le(float a, float b) {
+  uint32_t x = to_bits(a), y = to_bits(b);
+  if ((x & 0x7fffffffu) > 0x7f800000u || (y & 0x7fffffffu) > 0x7f800000u) return false;
+  if (((x | y) & 0x7fffffffu) == 0) return true;
+  int32_t ix = int32_t(x), iy = int32_t(y);
+  ix ^= (ix >> 31) & 0x7fffffff; iy ^= (iy >> 31) & 0x7fffffff;
+  return ix <= iy;
+}
 inline uint32_t face_index(uint32_t row, uint32_t col) {
   return (row / 16) * 512 + (col / 16) * 256 + (row % 16) * 16 + col % 16;
 }
@@ -643,6 +653,391 @@ void kernel_main() {
   }
 }
 )kernel";
+
+// v22 SFPU epilogue. Exact BF16 RNE (with NaN quieting) and the UGT compare
+// run on integer bits; FP32 add/sub use the SFPU adder, products go through
+// tt_mul and quotients through tt_div (never a bare SFPMAD).
+constexpr char kSfpuHelpers[] = R"kernel(
+sfpi_inline sfpi::vFloat tt_rne(sfpi::vFloat v) {
+  sfpi::vInt b = sfpi::as<sfpi::vInt>(v);
+  sfpi::vInt r = (b + int32_t(0x7fff) + ((b >> 16u) & int32_t(1))) & int32_t(0xffff0000u);
+  v_if ((b & int32_t(0x7fffffff)) > int32_t(0x7f800000)) {
+    r = (b | int32_t(0x400000)) & int32_t(0xffff0000u);
+  } v_endif;
+  return sfpi::as<sfpi::vFloat>(r);
+}
+// IEEE unordered-or-greater as 0/1. Keys order floats as signed integers; the
+// sign split keeps every key subtraction free of overflow.
+sfpi_inline sfpi::vInt tt_ugt(sfpi::vFloat x, sfpi::vFloat y) {
+  sfpi::vInt r = 0;
+  sfpi::vInt a = sfpi::as<sfpi::vInt>(x);
+  sfpi::vInt ka = a & int32_t(0x7fffffff);
+  v_if (ka > int32_t(0x7f800000)) { r = 1; } v_endif;
+  v_if (a < 0) { ka = -ka; } v_endif;
+  sfpi::vInt b = sfpi::as<sfpi::vInt>(y);
+  sfpi::vInt kb = b & int32_t(0x7fffffff);
+  v_if (kb > int32_t(0x7f800000)) { r = 1; } v_endif;
+  v_if (b < 0) { kb = -kb; } v_endif;
+  v_if (kb < 0) {
+    v_if (ka >= 0 || ka > kb) { r = 1; } v_endif;
+  } v_else {
+    v_if (ka >= 0 && ka > kb) { r = 1; } v_endif;
+  } v_endif;
+  return r;
+}
+sfpi_inline sfpi::vFloat tt_select(sfpi::vInt c, sfpi::vFloat t, sfpi::vFloat f) {
+  v_if (c != 0) { f = t; } v_endif;
+  return f;
+}
+// IEEE product sign for zero results. SFPMUL adds +0, so an exact -0 product
+// would come back as +0; the predicated fix-up also keeps the compiler from
+// contracting the product into a following add (SFPMAD is not a correctly
+// rounded fused multiply-add).
+sfpi_inline sfpi::vFloat tt_mul(sfpi::vFloat x, sfpi::vFloat y) {
+  sfpi::vFloat r = x * y;
+  v_if ((sfpi::as<sfpi::vInt>(r) & int32_t(0x7fffffff)) == 0) {
+    r = sfpi::as<sfpi::vFloat>((sfpi::as<sfpi::vInt>(x) ^ sfpi::as<sfpi::vInt>(y)) &
+                               int32_t(0x80000000u));
+  } v_endif;
+  return r;
+}
+// IEEE binary32 x/y, round-to-nearest-even, by integer long division of the
+// 24-bit mantissas (25 quotient bits plus a sticky remainder). NaN results are
+// the canonical 0x7fc00000 of the RISC-V soft-float reference. Like the other
+// SFPU float ops, subnormal operands and results flush to signed zero.
+sfpi_inline sfpi::vFloat tt_div(sfpi::vFloat x, sfpi::vFloat y) {
+  sfpi::vInt a = sfpi::as<sfpi::vInt>(x), b = sfpi::as<sfpi::vInt>(y);
+  sfpi::vInt sign = (a ^ b) & int32_t(0x80000000u);
+  a = a & int32_t(0x7fffffff);
+  b = b & int32_t(0x7fffffff);
+  v_if (a < int32_t(0x800000)) { a = 0; } v_endif;
+  v_if (b < int32_t(0x800000)) { b = 0; } v_endif;
+  // 1 is never a special result; special operands override the quotient,
+  // lowest precedence first.
+  sfpi::vInt special = 1;
+  v_if (b == 0) { special = sign | int32_t(0x7f800000); } v_endif;
+  v_if (a == 0) { special = sign; } v_endif;
+  v_if (b == int32_t(0x7f800000)) { special = sign; } v_endif;
+  v_if (a == int32_t(0x7f800000)) { special = sign | int32_t(0x7f800000); } v_endif;
+  v_if ((a == 0 && b == 0) ||
+        (a == int32_t(0x7f800000) && b == int32_t(0x7f800000)) ||
+        a > int32_t(0x7f800000) || b > int32_t(0x7f800000)) {
+    special = int32_t(0x7fc00000);
+  } v_endif;
+  // Biased result exponent + 512 with the sign in bit 31.
+  sign = sign | ((a >> 23u) - (b >> 23u) + int32_t(127 + 512));
+  a = (a & int32_t(0x7fffff)) | int32_t(0x800000);
+  b = (b & int32_t(0x7fffff)) | int32_t(0x800000);
+  v_if (a < b) { a = a << 1u; sign = sign - 1; } v_endif;
+  sfpi::vInt q = 0;
+  for (uint32_t i = 0; i < 25u; ++i) {
+    q = q << 1u;
+    v_if (a >= b) { a = a - b; q = q | int32_t(1); } v_endif;
+    a = a << 1u;
+  }
+  b = q >> 1u;
+  v_if ((q & int32_t(1)) != 0 && (a != 0 || (b & int32_t(1)) != 0)) { b = b + 1; } v_endif;
+  q = (sign & int32_t(0x3ff)) - 512;
+  v_if (b == int32_t(0x1000000)) { b = int32_t(0x800000); q = q + 1; } v_endif;
+  a = (b & int32_t(0x7fffff)) | (q << 23u);
+  v_if (q >= 255) { a = int32_t(0x7f800000); } v_endif;
+  v_if (q <= 0) { a = 0; } v_endif;
+  a = a | (sign & int32_t(0x80000000u));
+  v_if (special != 1) { a = special; } v_endif;
+  return sfpi::as<sfpi::vFloat>(a);
+}
+)kernel";
+
+constexpr char kSfpuWriterHelpers[] = R"kernel(
+// Tile rows are two 16-element face rows; |es| is the element size.
+inline void row_copy(uint32_t tile, uint32_t es, uint32_t r, uint32_t c, uint32_t len,
+                     uint32_t window, bool to_tile) {
+  while(len) {
+    uint32_t n=16u-c%16u; if(n>len) n=len;
+    uint32_t at=tile+(((r/16u)*2u+c/16u)*256u+(r%16u)*16u+c%16u)*es;
+    if(to_tile) copy_bytes(window,at,n*es); else copy_bytes(at,window,n*es);
+    window+=n*es; c+=n; len-=n;
+  }
+}
+// FP32 operand tiles: BF16 sources widen bit-exactly (NaN payloads included).
+inline void row_load(uint32_t tile, uint32_t r, uint32_t c, uint32_t len,
+                     uint32_t window, uint32_t es) {
+  if(es==4u) { row_copy(tile,4u,r,c,len,window,true); return; }
+  auto s=reinterpret_cast<const uint16_t*>(window);
+  auto d=reinterpret_cast<uint32_t*>(tile);
+  for(uint32_t j=0;j<len;++j,++c)
+    d[((r/16u)*2u+c/16u)*256u+(r%16u)*16u+c%16u]=uint32_t(s[j])<<16;
+}
+// The FP32 output tile holds BF16-rounded values; keep their upper halves. The
+// packer's own FP32->BF16 conversion turns NaN into infinity.
+inline void row_store(uint32_t tile, uint32_t r, uint32_t c, uint32_t len, uint32_t window) {
+  while(len) {
+    uint32_t n=16u-c%16u; if(n>len) n=len;
+    auto s=reinterpret_cast<const uint32_t*>(tile)+((r/16u)*2u+c/16u)*256u+(r%16u)*16u+c%16u;
+    uint32_t j=0;
+    if(window&2u) { *reinterpret_cast<uint16_t*>(window)=uint16_t(s[0]>>16); j=1; }
+    // Two outputs per aligned 32-bit store.
+    auto d=reinterpret_cast<uint32_t*>(window+j*2u);
+    for(;j+1u<n;j+=2u) *d++=(s[j]>>16)|(s[j+1u]&0xffff0000u);
+    if(j<n) *reinterpret_cast<uint16_t*>(window+j*2u)=uint16_t(s[j]>>16);
+    window+=n*2u; c+=n; len-=n;
+  }
+}
+inline void fill_row(uint32_t tile, uint32_t r, uint32_t bits) {
+  for(uint32_t half=0;half<2u;++half) {
+    auto d=reinterpret_cast<uint32_t*>(tile+(((r/16u)*2u+half)*256u+(r%16u)*16u)*4u);
+    for(uint32_t i=0;i<16u;++i) d[i]=bits;
+  }
+}
+// 32 row windows of 192B: up to 128B of data at the transfer's 64B offset.
+constexpr uint32_t kWindows=32u, kWindowBytes=192u;
+)kernel";
+
+bool isChannelLayout(const tt_iree_ttex_tensor_desc_t &d) {
+  return (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR && d.rank == 2) ||
+         (d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR && d.rank == 3) ||
+         isSpatial(d);
+}
+
+TenstorrentNativeSources
+sfpuEpilogueSources(const std::string &common,
+                    const tt_iree_ttex_tensor_desc_t *const *t,
+                    const TenstorrentSfpuEpilogue &e, uint32_t m, uint32_t n,
+                    unsigned group) {
+  const auto &o = *t[2];
+  // Channel layouts store runs along M, so the Dst tile is transposed first
+  // and every operand tile is built with rows = channels.
+  const bool transposed = isChannelLayout(o);
+  if (!transposed && !(o.layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR && o.rank == 2))
+    throw std::invalid_argument("SFPU epilogue requires a row-major or channel output");
+  const unsigned count = e.operands.size();
+  if (count > kTenstorrentMaxEpilogueOperands || group * (1 + count) > 8)
+    throw std::invalid_argument("SFPU epilogue exceeds the FP32 Dst tiles");
+  // Operands always travel as FP32 tiles unpacked straight into Dst: the
+  // Src register path would turn a BF16 NaN into infinity.
+  auto cbIndex = [](unsigned i) { return 26 + i; };
+
+  TenstorrentNativeSources sources;
+  std::ostringstream c;
+  c << R"kernel(
+// native-v22: FP32 Dst accumulation, SFPU epilogue, FP32 pack of BF16 values.
+#include <cstdint>
+#include "api/compute/matmul.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/transpose_dest.h"
+#include "api/compute/reconfig_data_format.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/dataflow/circular_buffer.h"
+#ifdef TRISC_MATH
+#include "sfpi.h"
+namespace ckernel::sfpu {
+)kernel" << kSfpuHelpers << R"kernel(
+// Called per face; operand tiles of this lane start at Dst tile |operands|.
+inline void tt_iree_epilogue_face(const uint32_t acc, const uint32_t operands, const uint32_t) {
+  for (uint32_t i = 0; i < 8u; ++i) {
+    sfpi::vFloat value = sfpi::dst_reg[acc * 32u + i];
+)kernel";
+  for (unsigned i = 0; i < count; ++i)
+    c << "    sfpi::vFloat x" << i << " = sfpi::dst_reg[(operands + " << i
+      << "u) * 32u + i];\n";
+  c << e.body << R"kernel(
+    sfpi::dst_reg[acc * 32u + i] = value;
+  }
+}
+} // namespace ckernel::sfpu
+#endif
+void kernel_main() {
+  uint32_t tiles=get_arg_val<uint32_t>(0), blocks=get_arg_val<uint32_t>(1);
+  CircularBuffer lhs(tt::CBIndex::c_0), rhs(tt::CBIndex::c_1), out(tt::CBIndex::c_16);
+  compute_kernel_hw_startup<SrcOrder::Reverse>(tt::CBIndex::c_0,tt::CBIndex::c_1,tt::CBIndex::c_16);
+  for(uint32_t tile=0;tile<tiles;) {
+)kernel" << "    uint32_t group=tiles-tile; if(group>" << group << "u) group="
+    << group << "u;\n" << R"kernel(
+    matmul_init(tt::CBIndex::c_0,tt::CBIndex::c_1);
+    tile_regs_acquire();
+    for(uint32_t block=0;block<blocks;++block)
+      for(uint32_t lane=0;lane<group;++lane) {
+        lhs.wait_front(1); rhs.wait_front(1);
+        matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,lane);
+        lhs.pop_front(1); rhs.pop_front(1);
+      }
+    for(uint32_t lane=0;lane<group;++lane) {
+)kernel";
+  if (transposed)
+    c << "      transpose_dest_init<true,true>();\n"
+         "      transpose_dest<true,true>(lane);\n";
+  c << "      uint32_t operands=" << group << "u+lane*" << count << "u;\n";
+  unsigned previous = 1;
+  for (unsigned i = 0; i < count; ++i) {
+    unsigned cb = cbIndex(i);
+    c << "      {\n        CircularBuffer operand(" << cb << ");\n"
+      << "        copy_tile_to_dst_init_short_with_dt(" << previous << "," << cb
+      << ");\n        operand.wait_front(1);\n"
+      << "        copy_tile(" << cb << ",0,operands+" << i << "u);\n"
+      << "        operand.pop_front(1);\n      }\n";
+    previous = cb;
+  }
+  if (previous != 1)
+    c << "      reconfig_data_format_srca(" << previous << ",1);\n";
+  c << R"kernel(
+      MATH((SFPU_BINARY_INIT(unused)));
+      MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE,
+          tt_iree_epilogue_face, lane, operands, lane, VectorMode::RC)));
+    }
+    tile_regs_commit(); tile_regs_wait();
+    out.reserve_back(group);
+    for(uint32_t lane=0;lane<group;++lane) pack_tile(lane,tt::CBIndex::c_16);
+    out.push_back(group);
+    tile_regs_release();
+    tile+=group;
+  }
+}
+)kernel";
+  sources.compute = c.str();
+
+  // Writer: per tile, stream operand tiles into their CBs, then copy the
+  // packed BF16 tile rows into contiguous runs of the output.
+  std::ostringstream w;
+  w << common << tileTransferSource() << kSfpuWriterHelpers;
+  for (unsigned i = 0; i < count; ++i) {
+    const auto &op = e.operands[i];
+    if (op.slot >= 0) continue;
+    // FP32 bits, padded so a 32-channel window never reads past the array.
+    w << "static const uint32_t tt_k" << i << "[]={";
+    for (size_t j = 0; j < op.constant.size() + 32; ++j)
+      w << (j < op.constant.size() ? op.constant[j] : 0) << "u,";
+    w << "};\n";
+  }
+  // Coordinates of tile row r / column c for output-shaped tensors.
+  const std::string rowVar = transposed ? "n" : "m", colVar = transposed ? "m" : "n";
+  auto runLength = [&](const tt_iree_ttex_tensor_desc_t &d) -> std::string {
+    if (!unitStride(d, d.rank - 1))
+      return "1u";
+    if (!transposed || d.layout == TT_IREE_TTEX_TENSOR_LAYOUT_CHANNEL_MAJOR)
+      return "cols-c";
+    std::string width = std::to_string(d.shape[d.rank - 1]) + "u";
+    return "(cols-c<" + width + "-m%" + width + "?cols-c:" + width + "-m%" +
+           width + ")";
+  };
+  auto runLoop = [&](const tt_iree_ttex_tensor_desc_t &d) {
+    std::ostringstream s;
+    s << "for(uint32_t r=0;r<rows;++r) for(uint32_t c=0;c<cols;) {\n"
+      << "uint32_t " << rowVar << "=" << rowVar << "_base+r," << colVar << "="
+      << colVar << "_base+c;\n"
+      << "uint32_t len=" << runLength(d) << ";\n";
+    return s.str();
+  };
+  w << R"kernel(
+// native-v22 writer: epilogue operand tiles in, BF16 output rows out.
+void kernel_main() {
+  CircularBuffer out(tt::CBIndex::c_16), window_cb(tt::CBIndex::c_17);
+  window_cb.reserve_back(1);
+  const uint32_t windows=(window_cb.get_write_ptr()+63u)&~63u;
+  const auto o_buf=TensorAccessor(accessor_2,get_arg_val<uint32_t>(4));
+)kernel";
+  for (unsigned i = 0; i < count; ++i)
+    if (e.operands[i].slot >= 0)
+      w << "  const auto buf_" << i << "=TensorAccessor(accessor_"
+        << e.operands[i].slot << ",get_arg_val<uint32_t>("
+        << e.operands[i].slot * 2 << "));\n";
+  w << R"kernel(
+  uint32_t m_start=get_arg_val<uint32_t>(28),n_start=get_arg_val<uint32_t>(29);
+  uint32_t m_count=get_arg_val<uint32_t>(30),n_count=get_arg_val<uint32_t>(31);
+  uint32_t pr[kWindows],pc[kWindows],pl[kWindows],pw[kWindows];
+  const uint32_t tiles=m_count*n_count;
+  for(uint32_t first=0;first<tiles;) {
+)kernel" << "uint32_t group=tiles-first; if(group>" << group << "u) group=" << group
+    << "u;\n";
+  auto tileCoordinates = [&]() {
+    std::ostringstream s;
+    s << "uint32_t tm=(first+lane)/n_count,tn=(first+lane)%n_count;\n"
+      << "uint32_t m_base=(m_start+tm)*32u,n_base=(n_start+tn)*32u;\n"
+      << "uint32_t valid_m=" << m << "u-m_base; if(valid_m>32u) valid_m=32u;\n"
+      << "uint32_t valid_n=" << n << "u-n_base; if(valid_n>32u) valid_n=32u;\n"
+      << "uint32_t rows=" << (transposed ? "valid_n" : "valid_m")
+      << ",cols=" << (transposed ? "valid_m" : "valid_n") << ";\n"
+      << "(void)rows; (void)cols;\n";
+    return s.str();
+  };
+  w << "for(uint32_t lane=0;lane<group;++lane) {\n" << tileCoordinates();
+  for (unsigned i = 0; i < count; ++i) {
+    const auto &op = e.operands[i];
+    // Source element size; constants are already FP32 bits.
+    const unsigned es = op.f32 || op.slot < 0 ? 4 : 2;
+    w << "{\nCircularBuffer operand(" << cbIndex(i) << ");\n"
+      << "operand.reserve_back(1);\nuint32_t tile=operand.get_write_ptr();\n";
+    if (op.channel) {
+      // Channel vector: element j belongs to channel n_base+j.
+      std::string vector;
+      if (op.slot < 0) {
+        vector = "reinterpret_cast<uint32_t>(tt_k" + std::to_string(i) + "+n_base)";
+      } else {
+        const auto &d = *t[op.slot];
+        if (d.rank != 1 || !unitStride(d, 0))
+          throw std::invalid_argument("SFPU channel operand must be contiguous");
+        w << "uint32_t byte=byte_" << op.slot << "(n_base,0,0,0);\n"
+          << "uint32_t vector=windows+byte%64u;\n"
+          << "read_bytes(buf_" << i << ",byte,vector,valid_n*" << es << "u);\n"
+          << "noc_async_read_barrier();\nasm volatile(\"\" ::: \"memory\");\n";
+        vector = "vector";
+      }
+      if (transposed) {
+        w << "for(uint32_t r=0;r<valid_n;++r) fill_row(tile,r,"
+          << (es == 4 ? "reinterpret_cast<const uint32_t*>(" + vector + ")[r]"
+                      : "uint32_t(reinterpret_cast<const uint16_t*>(" + vector +
+                            ")[r])<<16")
+          << ");\n";
+      } else {
+        // Widen the 32 channels once into window 1, then copy every row.
+        w << "{\nuint32_t row=windows+kWindowBytes;\n"
+          << "auto d=reinterpret_cast<uint32_t*>(row);\n"
+          << "for(uint32_t j=0;j<32u;++j) d[j]="
+          << (es == 4 ? "reinterpret_cast<const uint32_t*>(" + vector + ")[j]"
+                      : "uint32_t(reinterpret_cast<const uint16_t*>(" + vector +
+                            ")[j])<<16")
+          << ";\nfor(uint32_t r=0;r<valid_m;++r) row_copy(tile,4u,r,0,32u,row,true);\n}\n";
+      }
+    } else {
+      const auto &d = *t[op.slot];
+      w << "uint32_t pending=0;\n"
+        << "auto flush=[&]() {\nnoc_async_read_barrier();\n"
+           "asm volatile(\"\" ::: \"memory\");\n"
+        << "for(uint32_t p=0;p<pending;++p) row_load(tile,pr[p],pc[p],pl[p],pw[p],"
+        << es << "u);\npending=0;\n};\n"
+        << runLoop(d) << "uint32_t byte=byte_" << op.slot << "("
+        << coords(d, "m", "n") << coordinatePadding(d) << ");\n"
+        << "if(pending==kWindows) flush();\n"
+        << "uint32_t window=windows+pending*kWindowBytes+byte%64u;\n"
+        << "read_bytes(buf_" << i << ",byte,window,len*" << es << "u);\n"
+        << "pr[pending]=r; pc[pending]=c; pl[pending]=len; pw[pending]=window; ++pending;\n"
+        << "c+=len;\n}\nflush();\n";
+    }
+    w << "operand.push_back(1);\n}\n";
+  }
+  w << "}\nfor(uint32_t lane=0;lane<group;++lane) {\n" << tileCoordinates()
+    << R"kernel(
+out.wait_front(1);
+asm volatile("" ::: "memory");
+uint32_t tile=out.get_read_ptr(), used=0;
+)kernel" << runLoop(o) << "uint32_t byte=byte_2(" << coords(o, "m", "n")
+    << coordinatePadding(o) << ");\n" << R"kernel(
+if(used==kWindows) { noc_async_write_barrier(); used=0; }
+uint32_t window=windows+used*kWindowBytes+byte%64u;
+row_store(tile,r,c,len,window);
+write_bytes(window,o_buf,byte,len*2u);
+++used; c+=len;
+}
+noc_async_write_barrier();
+out.pop_front(1);
+}
+first+=group;
+}
+}
+)kernel";
+  sources.writer = w.str();
+  return sources;
+}
 } // namespace
 
 static TenstorrentNativeSources generateNativeSourcesImpl(
@@ -958,6 +1353,8 @@ void kernel_main() {
   result.compute = kCompute;
   return result;
 }
+std::string tenstorrentSfpuHelperSource() { return kSfpuHelpers; }
+
 TenstorrentNativeSources generateNativeSources(
     const tt_iree_ttex_entry_point_desc_t &ep, bool use_tensix) {
   return generateNativeSourcesImpl(ep, use_tensix);
@@ -1112,7 +1509,8 @@ TenstorrentNativeSources
 generateBF16NativeMatrix(const tt_iree_ttex_entry_point_desc_t &geometry,
                          const tt_iree_ttex_tensor_desc_t *const *tensors,
                          const std::string &epilogue, bool use_tensix,
-                         bool prefetch_bf16_inputs, bool reuse_output_tiles) {
+                         bool prefetch_bf16_inputs, bool reuse_output_tiles,
+                         const TenstorrentSfpuEpilogue *sfpu) {
   if (use_tensix) {
     if (!tt_iree_ttex_is_native_matrix_kind(geometry.dispatch_kind))
       throw std::invalid_argument("BF16 Tensix codegen requires a matrix geometry");
@@ -1337,6 +1735,12 @@ void kernel_main() {
     emitNativeOutputStores(writer, *tensors[2]);
     writer << "out.pop_front(1);\n}\n}\n";
     sources.writer = writer.str();
+    if (sfpu) {
+      auto v22 = sfpuEpilogueSources(common, tensors, *sfpu, m, n, reuse ? 2u : 1u);
+      sources.compute = std::move(v22.compute);
+      sources.writer = std::move(v22.writer);
+      sources.sfpuEpilogue = true;
+    }
     return sources;
   }
   auto sources = generateNativeSourcesImpl(geometry, false, tensors, &epilogue);
