@@ -1889,9 +1889,6 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
                                 "BF16 native requires v17/v18/v20-v22 descriptor and AOT; Tensix requires v18/v20-v22");
       auto tensors = ttex_ns(BF16NativeDef_tensors(native));
       uint8_t kind = ttex_ns(BF16NativeDef_operation_kind(native));
-      if (tensix && !tt_iree_ttex_is_native_matrix_kind(kind))
-        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 Tensix requires a matrix operation");
       if (ttex_ns(TensorDesc_vec_len(tensors)) != TT_IREE_BF16_NATIVE_TENSOR_COUNT ||
           kind < TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
           kind > TT_IREE_TTEX_DISPATCH_KIND_LINEAR)
@@ -1915,6 +1912,13 @@ static iree_status_t iree_hal_tt_executable_create_ttex(
             ttex_ns(EntryPointDef_constant_count(fb_ep)), "BF16-native", "slot", true));
         has_bf16 |= ttex_ns(TensorDesc_element_type(tensor)) == TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
       }
+      // Non-matrix Tensix entries are the v22 SFPU vector programs.
+      if (tensix && !tt_iree_ttex_is_native_matrix_kind(kind) &&
+          (version != TT_IREE_TTEX_VERSION_22 ||
+           !tt_iree_bf16_sfpu_vector_tiles(&desc)))
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "BF16 Tensix requires a matrix operation or a v22 SFPU vector program");
       IREE_RETURN_IF_ERROR(tt_iree_validate_bf16_layout_version(&desc, version));
       if (version == TT_IREE_TTEX_VERSION_20 ||
           version == TT_IREE_TTEX_VERSION_21 ||

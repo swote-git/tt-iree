@@ -472,6 +472,11 @@ static iree_status_t iree_hal_tt_command_buffer_validate_dispatch(
              TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
          kernel_params->bf16_native.operation_kind ==
              TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY ||
+         // Partitioned by output tiles (SFPU) or elements (device RISC-V).
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM ||
+         kernel_params->bf16_native.operation_kind ==
+             TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV ||
          kernel_params->bf16_native.operation_kind ==
              TT_IREE_TTEX_DISPATCH_KIND_LINEAR)) ||
        (kernel_params->ttex_version >= TT_IREE_TTEX_VERSION_13 &&

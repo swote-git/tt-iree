@@ -925,6 +925,7 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
   }
   // Scalar families remain deliberately limited to the exact ResNet patterns.
   std::ostringstream body;
+  std::string sfpuBody;
   uint8_t layout =
       cast<RankedTensorType>(stores[0].getValue().getType()).getRank() == 4
           ? TT_IREE_TTEX_TENSOR_LAYOUT_NCHW
@@ -1117,18 +1118,39 @@ static FailureOr<BuiltinSelection> inferBF16NativeProgram(func::FuncOp func,
     BF16ScalarEmitter emit;
     emit.values[block.getArgument(0)] = "read_1(scratch,0)";
     emit.values[block.getArgument(1)] = "read_0(scratch,i)";
+    // SFPU form: the element in the high and the scalar in the low half.
+    emit.vectors[block.getArgument(0)] = "TT_X1";
+    emit.vectors[block.getArgument(1)] = "TT_X0";
     auto result = emit.emit(op);
     if (failed(result) || d.tensors[0].rank != 1 ||
         d.tensors[1].shape[0] != 1 || d.tensors[2].rank != 1)
       return failure();
     d.operation_kind = TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV;
     body << emit.code.str() << "write_2(scratch," << *result << ",i);\n";
+    Value yielded = block.getTerminator()->getOperand(0);
+    auto vector = emit.getVector(yielded);
+    if (emit.vectorOk && vector)
+      sfpuBody = emit.vcode.str() + "    value = " +
+                 (yielded.getType().isBF16() ? *vector
+                                             : "tt_rne(" + *vector + ")") +
+                 ";\n";
   } else
     return failure();
   const tt_iree_ttex_tensor_desc_t *t[TT_IREE_BF16_NATIVE_TENSOR_COUNT];
   for (unsigned i = 0; i < TT_IREE_BF16_NATIVE_TENSOR_COUNT; ++i)
     t[i] = d.tensors[i].rank ? &d.tensors[i] : nullptr;
 #ifdef TT_IREE_ENABLE_AOT
+  // v22: the arithmetic runs on the SFPU; the data-movement cores only gather
+  // and store. Unsupported shapes keep the device-RISC-V program below.
+  if (useTensix) {
+    auto sources = generateBF16NativeSfpuVector(d.operation_kind, t, sfpuBody);
+    if (!sources.reader.empty()) {
+      selection.bf16Sources = std::move(sources);
+      selection.bf16Source = selection.bf16Sources.reader;
+      selection.program = TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+      return selection;
+    }
+  }
   selection.bf16Source = generateBF16NativeSpatial(d.operation_kind, t);
   if (selection.bf16Source.empty())
     selection.bf16Source =

@@ -199,9 +199,11 @@ def require_native_profile(directory, batch_count):
         if record["INPUT_0_DATATYPE"] != "BF16" or record["OUTPUT_0_DATATYPE"] != "BF16":
             raise ValueError("non-BF16 dispatch storage")
         builtin = record["IREE BUILTIN PROGRAM"]
-        compute = {"11": "BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING",
-                   "12": "BF16_HIFI4_FP32_DST_F32_EPILOGUE"}
-        if builtin not in compute or record["IREE COMPUTE DATATYPE"] != compute[builtin]:
+        # Builtin 12 is Tensix: FPU matrix ops with SFPU epilogues, or the SFPU
+        # vector programs (pooling, reductions, elementwise division).
+        compute = {"11": ("BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING",),
+                   "12": ("BF16_HIFI4_FP32_DST_F32_EPILOGUE", "BF16_SFPU_FP32_IR_ROUNDING")}
+        if builtin not in compute or record["IREE COMPUTE DATATYPE"] not in compute[builtin]:
             raise ValueError("unexpected BF16 compute routing")
         for stage in STAGING_STAGES:
             if int(record[f"IREE {stage} DURATION [ns]"]) != 0:

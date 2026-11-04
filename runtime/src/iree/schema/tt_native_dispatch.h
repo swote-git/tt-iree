@@ -24,6 +24,37 @@ static inline bool tt_iree_ttex_is_native_matrix_kind(uint8_t kind) {
          kind == TT_IREE_TTEX_DISPATCH_KIND_LINEAR;
 }
 
+// v22 BF16 SFPU vector programs (builtin 12 with a non-matrix kind): the
+// number of FP32 output tiles the runtime partitions across cores, 0 if the
+// kind has no SFPU program. SCALAR_DIV: 1024 elements per tile. GLOBAL_SUM: 64
+// channels per tile. MAX_POOL: whole output rows, floor(1024 / width) per tile.
+static inline uint32_t
+tt_iree_bf16_sfpu_vector_tiles(const tt_iree_ttex_bf16_native_desc_t *d) {
+  const tt_iree_ttex_tensor_desc_t *o = &d->tensors[2];
+  if (!o->rank || o->rank > TT_IREE_TTEX_MAX_TENSOR_RANK)
+    return 0;
+  uint64_t rows = 1;
+  for (unsigned i = 0; i + 1 < o->rank; ++i)
+    rows *= o->shape[i];
+  const uint64_t width = o->shape[o->rank - 1];
+  uint64_t tiles = 0;
+  switch (d->operation_kind) {
+  case TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV:
+    tiles = o->rank == 1 ? (width + 1023) / 1024 : 0;
+    break;
+  case TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM:
+    tiles = o->rank == 1 ? (width + 63) / 64 : 0;
+    break;
+  case TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL:
+    if (width && width <= 1024)
+      tiles = (rows + 1024 / width - 1) / (1024 / width);
+    break;
+  default:
+    break;
+  }
+  return tiles > UINT32_MAX ? 0 : (uint32_t)tiles;
+}
+
 static inline void
 tt_iree_ttex_native_tensors(const tt_iree_ttex_entry_point_desc_t *ep,
                             const tt_iree_ttex_tensor_desc_t **t) {

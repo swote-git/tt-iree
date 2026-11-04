@@ -2154,7 +2154,17 @@ public:
           selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE
               ? selection->bf16Native.operation_kind
               : selection->dispatchKind;
-      if (scalarKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
+      // BF16 SFPU vector kinds split whole output tiles; the device-RISC-V
+      // reference splits the same grid by elements/rows.
+      const uint32_t sfpuTiles =
+          selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE
+              ? tt_iree_bf16_sfpu_vector_tiles(&selection->bf16Native)
+              : 0;
+      if (sfpuTiles) {
+        auto grid = selectNativeScalarGrid(sfpuTiles, maxGridX, maxGridY);
+        workgroupCount.push_back(builder.getIndexAttr(grid.x));
+        workgroupCount.push_back(builder.getIndexAttr(grid.y));
+      } else if (scalarKind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
           (selection->dispatchKind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE &&
            scalarKind == TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY)) {
         const auto &output =

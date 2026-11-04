@@ -19,25 +19,25 @@ import device_native_bf16_batch_test as batch
 
 
 def operation(kind, m=0, n=0, k=0, call=1, grid=None):
-    matrix = kind in ("CONV2D", "MATMUL", "LINEAR")
+    matrix = kind in batch.MATRIX
     if grid is None:
         grid = (min(11, (n + 31) // 32), min(10, (m + 31) // 32)) if matrix else (1, 1)
-    program = 12 if matrix else 11
+    program, compute = batch.routing(kind)
     record = {"OP TYPE": kind, "OP CODE": f"fixture_{call}", "GLOBAL CALL COUNT": str(call),
               "IREE M": str(m), "IREE N": str(n), "IREE K": str(k),
               "IREE GRID X": str(grid[0]), "IREE GRID Y": str(grid[1]), "IREE GRID Z": "1",
               "CORE COUNT": str(math.prod(grid)), "IREE EXECUTION DOMAIN": "device_native",
-              "IREE BUILTIN PROGRAM": str(program), "IREE COMPUTE DATATYPE": batch.COMPUTE[program],
+              "IREE BUILTIN PROGRAM": str(program), "IREE COMPUTE DATATYPE": compute,
               "INPUT_0_DATATYPE": "BF16", "OUTPUT_0_DATATYPE": "BF16", "IREE DISPATCH KIND": "8"}
     record.update({f"IREE {stage} DURATION [ns]": "0" for stage in batch.STAGING})
     return record
 
 
-def mappings(record, scalar_range=()):
+def mappings(record, scalar_range=(), sfpu_tiles=0):
     gx, gy = (int(record[f"IREE GRID {axis}"]) for axis in "XY")
     rows = []
-    matrix = record["OP TYPE"] in ("CONV2D", "MATMUL", "LINEAR")
-    if not matrix and not scalar_range:
+    matrix = record["OP TYPE"] in batch.MATRIX
+    if not matrix and not scalar_range and not sfpu_tiles:
         return rows
     for y in range(gy):
         for x in range(gx):
@@ -45,7 +45,12 @@ def mappings(record, scalar_range=()):
                    "CORE X": str(x), "CORE Y": str(y), "M TILE BEGIN": "", "M TILE END": "",
                    "N TILE BEGIN": "", "N TILE END": "", "K TILE COUNT": "",
                    "ELEMENT BEGIN": "", "ELEMENT END": ""}
-            if scalar_range:
+            if sfpu_tiles:
+                index, size = y * gx + x, gx * gy
+                row.update({"ELEMENT BEGIN": str(sfpu_tiles * index // size),
+                            "ELEMENT END": str(sfpu_tiles * (index + 1) // size),
+                            "PARTITION UNIT": "sfpu_tiles"})
+            elif scalar_range:
                 count, width = scalar_range
                 index, size = y * gx + x, gx * gy
                 row.update({"ELEMENT BEGIN": str((count // width * index // size) * width),
@@ -71,10 +76,13 @@ def profile_fixture(directory, case, edit=None):
     directory.mkdir(parents=True)
     records, rows = [], []
     for call, spec in enumerate(case.dispatches, 1):
-        grid = (10, 3) if case.scalar_range else None
+        tiles = case.sfpu_tiles.get(spec[0], 0)
+        # The compiler's selectNativeScalarGrid for SFPU output tiles.
+        grid = ((min(tiles, 11), min(tiles // min(tiles, 11), 10)) if tiles
+                else (10, 3) if case.scalar_range else None)
         record = operation(*spec, call=call, grid=grid)
         records.append(record)
-        rows.extend(mappings(record, case.scalar_range))
+        rows.extend(mappings(record, () if tiles else case.scalar_range, tiles))
     summary = {"dispatch_count": len(records), "all_dispatches_device_native": True}
     if edit:
         edit(records, rows, summary)
@@ -260,6 +268,25 @@ class ProfileTest(unittest.TestCase):
                 batch.validate_mapping(record, rows, scalar_range)
         with self.assertRaises(AssertionError):
             batch.validate_mapping(record, original[:-1], scalar_range)
+
+    def test_sfpu_tile_gaps_units_and_riscv_routing_fail(self):
+        record = operation("GLOBAL_SUM", grid=(11, 3))
+        original = mappings(record, sfpu_tiles=40)
+        batch.validate_mapping(record, original, sfpu_tiles=40)
+        for field, value in (("ELEMENT BEGIN", "2"), ("PARTITION UNIT", "rows")):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                rows = copy.deepcopy(original)
+                rows[1][field] = value
+                batch.validate_mapping(record, rows, sfpu_tiles=40)
+        with self.assertRaises(AssertionError):
+            batch.validate_mapping(record, original, sfpu_tiles=41)
+        case = next(c for c in batch.build_cases() if c.name == "average_fc")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "riscv"
+            profile_fixture(directory, case, lambda records, rows, summary: records[0].update(
+                {"IREE BUILTIN PROGRAM": "11", "IREE COMPUTE DATATYPE": batch.COMPUTE[11]}))
+            with self.assertRaises(AssertionError):
+                batch.validate_profile(directory, case)
 
     def test_all_case_profile_plans_pass(self):
         with tempfile.TemporaryDirectory() as temporary:

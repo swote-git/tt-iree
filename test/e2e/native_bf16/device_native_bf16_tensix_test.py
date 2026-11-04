@@ -162,6 +162,84 @@ def main():
         ("33xf32", "inv1", inv1, "f32"), ("33xbf16", "gamma1", gamma1, "bf16"),
         ("33xbf16", "beta1", beta1, "bf16")])
 
+    # v22 SFPU vector programs (GLOBAL_SUM, SCALAR_DIV, MAX_POOL_2D) versus the
+    # device-RISC-V reference over multi-core tile splits with tails. Inputs mix
+    # NaN payloads, a signalling NaN, infinities, signed zeros and the largest
+    # finite value. The integer max is exact for every input, so the pool also
+    # gets subnormals; the SFPU float adder flushes them, so the sums do not.
+    vector_mlir = "device_native_bf16_vector.mlir"
+    state = 12345
+
+    def raw_bf16(count, subnormals):
+        nonlocal state
+        specials = [0x0000, 0x8000, 0x7f80, 0xff80, 0x7fc0, 0x7fc5, 0xffc1, 0x7f81,
+                    0x7f7f, 0xff7f, 0x3f80, 0xbf80]
+        if subnormals:
+            specials += [0x0001, 0x8001, 0x007f, 0x807f]
+        values = []
+        for _ in range(count):
+            state = (state * 1103515245 + 12345) & 0x7fffffff
+            pick = state >> 8
+            if pick % 97 == 0:
+                values.append(specials[(pick // 97) % len(specials)])
+            else:
+                values.append(((pick & 1) << 15) | ((0x70 + (pick >> 1) % 32) << 7) | (pick >> 6) % 128)
+        return values
+
+    def compare_vector(name, function, shape, count, values, kinds, cores):
+        target = out / name
+        target.mkdir(exist_ok=True)
+        (target / "input.bin").write_bytes(struct.pack(f"<{len(values)}H", *values))
+        outputs = {}
+        for engine in ("tensix", "riscv"):
+            vmfb = out / f"vector-{engine}.vmfb"
+            if not vmfb.exists():
+                command = [args.iree_compile, str(root / "test/e2e/native_bf16" / vector_mlir),
+                           "--iree-hal-target-backends=tenstorrent",
+                           f"--iree-tenstorrent-native-bf16-use-tensix={'true' if engine == 'tensix' else 'false'}",
+                           "-o", str(vmfb)]
+                with (out / f"vector-{engine}.compile.log").open("w") as stream:
+                    subprocess.run(command, env=environment, check=True, stdout=stream,
+                                   stderr=subprocess.STDOUT, timeout=600)
+            environment["TT_IREE_PROFILE_OUTPUT"] = str(target / f"{engine}.profile")
+            command = [args.iree_run_module, "--device=tenstorrent", f"--module={vmfb}",
+                       f"--function={function}", f"--input={shape}=@{target / 'input.bin'}",
+                       f"--output=@{target / (engine + '.bin')}"]
+            with (target / f"{engine}.run.log").open("w") as stream:
+                subprocess.run(command, env=environment, check=True, stdout=stream,
+                               stderr=subprocess.STDOUT, timeout=120)
+            with (target / f"{engine}.profile/ops_perf_results.csv").open() as stream:
+                records = list(csv.DictReader(stream))
+            assert [r["OP TYPE"] for r in records] == [kind for kind, _ in kinds], records
+            for record, (kind, sfpu) in zip(records, kinds):
+                program = "12" if engine == "tensix" and sfpu else "11"
+                assert record["IREE BUILTIN PROGRAM"] == program, (engine, kind, record)
+                if program == "12":
+                    assert record["IREE COMPUTE DATATYPE"] == "BF16_SFPU_FP32_IR_ROUNDING", record
+            if engine == "tensix":
+                observed = {r["OP TYPE"]: int(r["CORE COUNT"]) for r in records}
+                assert all(observed[kind] == n for kind, n in cores.items()), observed
+            outputs[engine] = (target / f"{engine}.bin").read_bytes()
+        tensix = struct.unpack(f"<{count}H", outputs["tensix"])
+        riscv = struct.unpack(f"<{count}H", outputs["riscv"])
+        mismatches = sum(x != y for x, y in zip(tensix, riscv))
+        specials = sum((v & 0x7f80) == 0x7f80 for v in tensix)
+        results.append({"fixture": name, "elements": count, "nan_or_inf_outputs": specials,
+                        "bitwise_mismatches_vs_riscv": mismatches, "tensix_cores": cores})
+        (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        assert mismatches == 0, f"{name}: {mismatches} BF16 mismatches versus RISC-V"
+        assert specials, f"{name}: no NaN/infinity reached the output"
+        print(f"PASS: {name}, {count} BF16 values equal to the RISC-V reference", flush=True)
+
+    # 2500 channels: 40 GLOBAL_SUM tiles on 11x3 cores, 3 SCALAR_DIV tiles.
+    compare_vector("vector_average", "bf16_average_wide", "2500x7x7xbf16", 2500,
+                   raw_bf16(2500 * 49, False),
+                   [("PADDED_COPY", False), ("GLOBAL_SUM", True), ("SCALAR_DIV", True)],
+                   {"GLOBAL_SUM": 33, "SCALAR_DIV": 3})
+    # 84 output rows of 57: 17 rows per tile, five tiles on five cores.
+    compare_vector("vector_pool", "bf16_pool_wide", "6x29x115xbf16", 6 * 14 * 57,
+                   raw_bf16(6 * 29 * 115, True), [("MAX_POOL_2D", True)], {"MAX_POOL_2D": 5})
+
 
 if __name__ == "__main__":
     main()

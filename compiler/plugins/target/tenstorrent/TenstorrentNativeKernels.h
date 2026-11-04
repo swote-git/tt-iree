@@ -84,6 +84,15 @@ TenstorrentNativeSources generateBF16NativeMatrix(
     bool reuse_output_tiles = false,
     // v22 Tensix: run the epilogue on the SFPU; the writer stores BF16.
     const TenstorrentSfpuEpilogue *sfpu = nullptr);
+// v22 SFPU vector programs for the BF16 non-matrix kinds: SCALAR_DIV (|body|
+// assigns `value` from TT_X0, the element, and TT_X1, the scalar), GLOBAL_SUM
+// (sequential BF16-rounded 7x7 sums) and MAX_POOL (3x3/stride-2). The cores
+// split tt_iree_bf16_sfpu_vector_tiles() output tiles. Empty sources keep the
+// device-RISC-V program for unsupported shapes or strides.
+TenstorrentNativeSources
+generateBF16NativeSfpuVector(uint8_t operation_kind,
+                             const tt_iree_ttex_tensor_desc_t *const *tensors,
+                             const std::string &body = {});
 // v21 tilize: row-major BF16 slot 0 into the face-tiled slot 2, whole tiles
 // per core (element range in units of 1024).
 std::string

@@ -319,7 +319,8 @@ RuntimeProfiler::AppendCoreMappingLocked(const RuntimeProfileRecord &record) {
                                   "invalid scalar core mapping");
         output << record.global_call_count << ',' << CsvEscape(record.op_code)
                << ',' << x << ',' << y << ",,,,,," << range.begin << ','
-               << uint64_t(range.begin) + range.count << ",rows\n";
+               << uint64_t(range.begin) + range.count << ','
+               << record.scalar_unit << '\n';
       }
     return CheckOutputStream(output, path);
   }

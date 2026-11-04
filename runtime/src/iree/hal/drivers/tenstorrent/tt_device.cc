@@ -3661,7 +3661,9 @@ static iree_status_t iree_hal_tt_make_profile_record(
     if (iree_hal_tt_is_native_v13(params)) {
       if (params->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
         record.compute_datatype = params->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX
-            ? "BF16_HIFI4_FP32_DST_F32_EPILOGUE"
+            ? (tt_iree_ttex_is_native_matrix_kind(params->bf16_native.operation_kind)
+                   ? "BF16_HIFI4_FP32_DST_F32_EPILOGUE"
+                   : "BF16_SFPU_FP32_IR_ROUNDING")
             : "BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING";
       } else if (!tt_iree_ttex_is_native_matrix_kind(params->dispatch_kind)) {
         record.compute_datatype = "F32_DATAFLOW";
@@ -3690,7 +3692,15 @@ static iree_status_t iree_hal_tt_make_profile_record(
     record.m = params->bf16_native.m;
     record.n = params->bf16_native.n;
     record.k = params->bf16_native.k;
-    if (params->bf16_native.operation_kind ==
+    if (params->builtin_program ==
+            TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX &&
+        !tt_iree_ttex_is_native_matrix_kind(
+            params->bf16_native.operation_kind)) {
+      record.scalar_elements =
+          tt_iree_bf16_sfpu_vector_tiles(&params->bf16_native);
+      record.scalar_row_width = 1;
+      record.scalar_unit = "sfpu_tiles";
+    } else if (params->bf16_native.operation_kind ==
             TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL ||
         params->bf16_native.operation_kind ==
             TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY) {

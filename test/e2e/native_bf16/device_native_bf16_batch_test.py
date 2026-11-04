@@ -11,7 +11,7 @@ compiler or device. No NumPy, PyTorch, B1 host loop, or accuracy tolerance.
 import argparse
 from collections import Counter
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -25,6 +25,20 @@ SOURCE = Path(__file__).with_name("device_native_bf16_batch.mlir")
 STAGING = ("INPUT STAGING", "PACK", "UPLOAD", "DOWNLOAD", "UNPACK", "OUTPUT STAGING")
 COMPUTE = {11: "BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING",
            12: "BF16_HIFI4_FP32_DST_F32_EPILOGUE"}
+MATRIX = ("CONV2D", "MATMUL", "LINEAR")
+# Arithmetic kinds that run as v22 SFPU vector programs (builtin 12); only the
+# data-movement-only PADDED_COPY stays on the device-RISC-V program.
+SFPU_VECTOR = ("MAX_POOL_2D", "GLOBAL_SUM", "SCALAR_DIV")
+SFPU_COMPUTE = "BF16_SFPU_FP32_IR_ROUNDING"
+
+
+def routing(kind):
+    """Expected (builtin program, compute datatype) of a profiled dispatch."""
+    if kind in MATRIX:
+        return 12, COMPUTE[12]
+    if kind in SFPU_VECTOR:
+        return 12, SFPU_COMPUTE
+    return 11, COMPUTE[11]
 
 
 def require(condition, message):
@@ -74,8 +88,10 @@ class Case:
     expected: list
     # (profile OP TYPE, M, N, K); scalar geometry is zero.
     dispatches: tuple
-    # Logical elements and row width for padded-copy/maxpool core partitions.
+    # Logical elements and row width for padded-copy core partitions.
     scalar_range: tuple = ()
+    # Output tiles of each SFPU vector dispatch, split across cores.
+    sfpu_tiles: dict = field(default_factory=dict)
 
     def __post_init__(self):
         require(len(self.expected) == math.prod(self.shape), f"{self.name}: output shape mismatch")
@@ -175,7 +191,9 @@ def spatial(pool):
                     expected.append(bf16_bits(value))
     return Case("maxpool" if pool else "input_pad", [Tensor("input", (2, 5, 7, 39), a)],
                 (2, 5, oh, ow), expected, (("MAX_POOL_2D" if pool else "PADDED_COPY", 0, 0, 0),),
-                (2 * 5 * 3 * 19, 19) if pool else (2 * 5 * 7 * 39, 39))
+                () if pool else (2 * 5 * 7 * 39, 39),
+                # 30 output rows of 19 fit one 1024-element tile.
+                {"MAX_POOL_2D": 1} if pool else {})
 
 
 def ordered_average(values):
@@ -211,18 +229,33 @@ def average_fc():
     return Case("average_fc", [Tensor("input", (2, 35, 8, 8), a),
                                Tensor("weight", (33, 35), weight), Tensor("bias", (33,), bias)],
                 (2, 33), expected, (("GLOBAL_SUM", 0, 0, 0),
-                                    ("SCALAR_DIV", 0, 0, 0), ("LINEAR", 2, 33, 35)))
+                                    ("SCALAR_DIV", 0, 0, 0), ("LINEAR", 2, 33, 35)),
+                # 70 channel sums: two 64-channel tiles, one 1024-element tile.
+                sfpu_tiles={"GLOBAL_SUM": 2, "SCALAR_DIV": 1})
 
 
 def build_cases():
     return [convolution(1), convolution(2), projection(), spatial(False), spatial(True), average_fc()]
 
 
-def validate_mapping(record, rows, scalar_range=()):
+def validate_mapping(record, rows, scalar_range=(), sfpu_tiles=0):
     gx, gy, gz = (int(record[f"IREE GRID {axis}"]) for axis in "XYZ")
     require(1 <= gx <= 11 and 1 <= gy <= 10 and gz == 1, f"invalid native grid: {(gx, gy, gz)}")
     require(int(record["CORE COUNT"]) == gx * gy, "core count does not match grid")
-    matrix = record["OP TYPE"] in ("CONV2D", "MATMUL", "LINEAR")
+    matrix = record["OP TYPE"] in MATRIX
+    if sfpu_tiles:
+        require(len(rows) == gx * gy, "missing or duplicate core partitions")
+        coordinates = {(int(row["CORE X"]), int(row["CORE Y"])) for row in rows}
+        require(coordinates == {(x, y) for y in range(gy) for x in range(gx)},
+                "incomplete core coordinates")
+        previous = 0
+        for row in sorted(rows, key=lambda r: int(r["ELEMENT BEGIN"])):
+            begin, end = int(row["ELEMENT BEGIN"]), int(row["ELEMENT END"])
+            require(row["PARTITION UNIT"] == "sfpu_tiles", "SFPU vector partition must use output tiles")
+            require(begin == previous and begin < end <= sfpu_tiles, "SFPU tile coverage gap/overlap")
+            previous = end
+        require(previous == sfpu_tiles, "incomplete SFPU tile coverage")
+        return
     if not matrix and not scalar_range:
         require((gx, gy) == (1, 1), "unpartitioned scalar kernel must use one core")
         require(not rows, "unexpected scalar tile mapping")
@@ -272,18 +305,18 @@ def validate_profile(directory, case):
     require(len(set(calls)) == len(calls), "duplicate dispatch call IDs")
     require(all(row["GLOBAL CALL COUNT"] in calls for row in mappings), "orphan core mapping")
     for row in records:
-        matrix = row["OP TYPE"] in ("CONV2D", "MATMUL", "LINEAR")
-        program = 12 if matrix else 11
+        program, compute = routing(row["OP TYPE"])
         require(row["IREE EXECUTION DOMAIN"] == "device_native", "host-assisted/mock dispatch")
         require(int(row["IREE BUILTIN PROGRAM"]) == program, "wrong BF16 compute program")
-        require(row["IREE COMPUTE DATATYPE"] == COMPUTE[program], "wrong BF16 compute datatype")
+        require(row["IREE COMPUTE DATATYPE"] == compute, "wrong BF16 compute datatype")
         require(row["INPUT_0_DATATYPE"] == row["OUTPUT_0_DATATYPE"] == "BF16", "non-BF16 storage")
         require(int(row["IREE DISPATCH KIND"]) == 8, "not a BF16-native dispatch")
         for stage in STAGING:
             require(int(row[f"IREE {stage} DURATION [ns]"]) == 0, f"unexpected {stage.lower()}")
         rows = [mapping for mapping in mappings if mapping["GLOBAL CALL COUNT"] == row["GLOBAL CALL COUNT"]]
         require(all(mapping["OP CODE"] == row["OP CODE"] for mapping in rows), "mapping opcode mismatch")
-        validate_mapping(row, rows, case.scalar_range)
+        sfpu_tiles = case.sfpu_tiles.get(row["OP TYPE"], 0)
+        validate_mapping(row, rows, () if sfpu_tiles else case.scalar_range, sfpu_tiles)
     return {"dispatches": observed, "cores": [int(row["CORE COUNT"]) for row in records],
             "all_dispatches_device_native": True}
 
@@ -389,10 +422,10 @@ def main(argv=None):
         command += [f"--output=@{output}"]
         run_logged(command, target / "run.log", dict(env, TT_IREE_PROFILE_OUTPUT=str(profile)), args.run_timeout)
         compare_output(output, case)
-        routing = validate_profile(profile, case)
-        results[case.name] = {"elements": len(case.expected), "bitwise_mismatches": 0, **routing}
+        profiled = validate_profile(profile, case)
+        results[case.name] = {"elements": len(case.expected), "bitwise_mismatches": 0, **profiled}
         (out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-        print(f"PASS: {case.name}: {len(case.expected)} exact BF16 values; cores={routing['cores']}", flush=True)
+        print(f"PASS: {case.name}: {len(case.expected)} exact BF16 values; cores={profiled['cores']}", flush=True)
 
 
 if __name__ == "__main__":

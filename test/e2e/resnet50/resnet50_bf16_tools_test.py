@@ -72,14 +72,26 @@ class Bf16ToolsTest(unittest.TestCase):
                 row.update({"IREE BUILTIN PROGRAM": "12",
                             "IREE COMPUTE DATATYPE": "BF16_HIFI4_FP32_DST_F32_EPILOGUE"})
             save()
+            # Pooling, the 7x7 sums and the division must run on the SFPU too.
+            with self.assertRaisesRegex(ValueError, "routing"):
+                require_native_profile(root, True)
+            for row in rows[55:]:
+                row.update({"IREE BUILTIN PROGRAM": "12",
+                            "IREE COMPUTE DATATYPE": "BF16_SFPU_FP32_IR_ROUNDING"})
+            save()
             require_native_profile(root, True)
             with self.assertRaisesRegex(ValueError, "routing"):
                 require_native_profile(root)
-            rows[-1]["IREE BUILTIN PROGRAM"] = "12"
+            rows[54]["IREE BUILTIN PROGRAM"] = "12"
             save()
             with self.assertRaisesRegex(ValueError, "routing"):
                 require_native_profile(root, True)
-            rows[-1]["IREE BUILTIN PROGRAM"] = "11"
+            rows[54]["IREE BUILTIN PROGRAM"] = "11"
+            rows[-1]["IREE COMPUTE DATATYPE"] = "BF16_HIFI4_FP32_DST_F32_EPILOGUE"
+            save()
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                require_native_profile(root, True)
+            rows[-1]["IREE COMPUTE DATATYPE"] = "BF16_SFPU_FP32_IR_ROUNDING"
             rows[-1]["IREE EXECUTION DOMAIN"] = "host"
             save()
             with self.assertRaisesRegex(ValueError, "non-native"):

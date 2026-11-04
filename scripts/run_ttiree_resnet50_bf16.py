@@ -52,11 +52,16 @@ def require_native_profile(directory, use_tensix=False, sample_count=1):
             raise ValueError("unexpected non-BF16 dispatch storage")
         if record["IREE EXECUTION DOMAIN"] != "device_native":
             raise ValueError("non-native execution domain in BF16 profile")
+        # Tensix: matrix ops on the FPU with SFPU epilogues, the other
+        # arithmetic on the SFPU; only the data-movement PADDED_COPY stays on
+        # the device-RISC-V program.
         matrix = record["OP TYPE"] in ("MATMUL", "CONV2D", "LINEAR")
-        builtin = "12" if use_tensix and matrix else "11"
+        vector = record["OP TYPE"] in ("MAX_POOL_2D", "GLOBAL_SUM", "SCALAR_DIV")
+        builtin = "12" if use_tensix and (matrix or vector) else "11"
         if record["IREE BUILTIN PROGRAM"] != builtin:
             raise ValueError(f"unexpected BF16 compute routing: expected builtin {builtin}")
         expected_compute = ("BF16_HIFI4_FP32_DST_F32_EPILOGUE" if use_tensix and matrix
+                            else "BF16_SFPU_FP32_IR_ROUNDING" if use_tensix and vector
                             else "BF16_STORAGE_F32_DATAFLOW_IR_ROUNDING")
         if record["IREE COMPUTE DATATYPE"] != expected_compute:
             raise ValueError("BF16 compute profile does not match requested engine")
@@ -78,8 +83,9 @@ def main():
     parser.add_argument("--indices", default="0", help="distinct source image indices; no batch padding")
     parser.add_argument("--checkpoints", action="store_true")
     parser.add_argument("--engine", choices=("tensix", "riscv"), default="tensix",
-                        help="BF16 matrix engine: Tensix HiFi4 with SFPU epilogues (default) or the "
-                             "device-RISC-V FP32 reference; scalar dispatches stay on device RISC-V")
+                        help="BF16 engine: Tensix (default; HiFi4 matrix ops with SFPU epilogues, "
+                             "SFPU pooling/reduction/division) or the device-RISC-V FP32 reference; "
+                             "the data-movement-only padded copy always runs on device RISC-V")
     parser.add_argument("--cpu-reference", action="store_true",
                         help="also compile/run identical BF16 IR on LLVM CPU; fail if that backend rejects it")
     args = parser.parse_args()

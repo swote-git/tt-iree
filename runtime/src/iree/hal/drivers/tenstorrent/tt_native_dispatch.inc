@@ -44,10 +44,21 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
                             "native AOT architecture mismatch");
   const bool matrix = tt_iree_ttex_is_native_matrix_kind(
       bf16_native ? ep.bf16_native.operation_kind : ep.dispatch_kind);
+  // v22 BF16 SFPU vector program: the reader gathers FP32 operand tiles, the
+  // SFPU computes, the writer stores BF16 halves; cores split whole tiles.
+  const bool sfpu_vector =
+      bf16_native && !matrix &&
+      params->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+  const uint32_t vector_tiles =
+      sfpu_vector ? tt_iree_bf16_sfpu_vector_tiles(&ep.bf16_native) : 0;
+  if (sfpu_vector && !vector_tiles)
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "BF16 SFPU vector dispatch has no output tiles");
   const bool uses_tensix =
-      matrix && (bf16_native
+      sfpu_vector ||
+      (matrix && (bf16_native
           ? params->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX
-          : params->ttex_version != TT_IREE_TTEX_VERSION_15);
+          : params->ttex_version != TT_IREE_TTEX_VERSION_15));
   uint32_t m = 0, n = 0, k = 0, elements = 0;
   if (bf16_native && matrix) {
     m = ep.bf16_native.m;
@@ -208,6 +219,18 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
                 {partition.m_count * partition.n_count,
                  k / 32 + (k % 32 != 0)});
           }
+        } else if (sfpu_vector) {
+          uint32_t ordinal = r * cols + c, total = rows * cols;
+          iree::hal::tenstorrent::NativeElementRange partition;
+          if (!iree::hal::tenstorrent::PartitionNativeScalarRange(
+                  vector_tiles, 1, ordinal, total, &partition))
+            return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                    "invalid SFPU vector tile partition");
+          core_args.insert(core_args.end(),
+                           {partition.begin, partition.count, ordinal});
+          tt::tt_metal::SetRuntimeArgs(program, writer, core, core_args);
+          tt::tt_metal::SetRuntimeArgs(program, compute, core,
+                                       {partition.count});
         } else {
           uint32_t ordinal = r * cols + c, total = rows * cols;
           const uint8_t kind = bf16_native ? ep.bf16_native.operation_kind

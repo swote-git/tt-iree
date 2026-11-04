@@ -374,19 +374,23 @@ iree_status_t tt_iree_build_ttex_executable_def_with_version(
 
     if (ep->dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_BF16_NATIVE) {
       bool tensix = ep->builtin_program == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX;
+      bool matrix = ep->bf16_native.operation_kind ==
+                        TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
+                    ep->bf16_native.operation_kind ==
+                        TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
+                    ep->bf16_native.operation_kind ==
+                        TT_IREE_TTEX_DISPATCH_KIND_LINEAR;
+      // Non-matrix Tensix entries are the v22 SFPU vector programs.
       if ((version < TT_IREE_TTEX_VERSION_17 ||
            version > TT_IREE_TTEX_MAX_KNOWN_VERSION) ||
           (tensix && (version < TT_IREE_TTEX_VERSION_18 ||
-                      !(ep->bf16_native.operation_kind ==
-                            TT_IREE_TTEX_DISPATCH_KIND_MATMUL_LIKE ||
-                        ep->bf16_native.operation_kind ==
-                            TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION ||
-                        ep->bf16_native.operation_kind ==
-                            TT_IREE_TTEX_DISPATCH_KIND_LINEAR)))) {
+                      (!matrix && (version < TT_IREE_TTEX_VERSION_22 ||
+                                   !tt_iree_bf16_sfpu_vector_tiles(
+                                       &ep->bf16_native)))))) {
         flatcc_builder_clear(&builder);
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "BF16 native requires v17-v20; Tensix requires "
-                                "v18+ matrix dispatch");
+                                "BF16 native requires v17-v22; Tensix requires "
+                                "v18+ matrix or v22 SFPU vector dispatch");
       }
     }
     bool is_matmul_like =

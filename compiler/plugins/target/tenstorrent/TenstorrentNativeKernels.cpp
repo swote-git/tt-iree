@@ -703,6 +703,22 @@ sfpi_inline sfpi::vFloat tt_select(sfpi::vInt c, sfpi::vFloat t, sfpi::vFloat f)
   v_if (c != 0) { f = t; } v_endif;
   return f;
 }
+// arith.maximumf on integer bits: any NaN gives the canonical 0x7fc00000,
+// max(-0, +0) is +0, subnormals compare exactly. Same-sign operands compare
+// as integers (reversed when negative), so no subtraction can overflow.
+sfpi_inline sfpi::vFloat tt_max(sfpi::vFloat x, sfpi::vFloat y) {
+  sfpi::vInt a = sfpi::as<sfpi::vInt>(x), b = sfpi::as<sfpi::vInt>(y);
+  sfpi::vInt r = a;
+  v_if (a >= 0) {
+    v_if (b >= 0) { v_if (b > a) { r = b; } v_endif; } v_endif;
+  } v_else {
+    v_if (b >= 0) { r = b; } v_else { v_if (b < a) { r = b; } v_endif; } v_endif;
+  } v_endif;
+  v_if (((a | b) & int32_t(0x7fffffff)) == 0) { r = a & b; } v_endif;
+  v_if ((a & int32_t(0x7fffffff)) > int32_t(0x7f800000)) { r = int32_t(0x7fc00000); } v_endif;
+  v_if ((b & int32_t(0x7fffffff)) > int32_t(0x7f800000)) { r = int32_t(0x7fc00000); } v_endif;
+  return sfpi::as<sfpi::vFloat>(r);
+}
 // IEEE product sign for zero results. SFPMUL adds +0, so an exact -0 product
 // would come back as +0; the predicated fix-up also keeps the compiler from
 // contracting the product into a following add (SFPMAD is not a correctly
@@ -1895,6 +1911,356 @@ void kernel_main() {
 }
 )kernel";
   return s.str();
+}
+
+namespace {
+// Elements between consecutive indices of |axis| in the storage order that
+// byte_N() addresses.
+uint64_t storageStride(const tt_iree_ttex_tensor_desc_t &d, unsigned axis) {
+  uint64_t s = d.stride[axis] ? d.stride[axis] : 1;
+  for (unsigned j = axis + 1; j < d.rank; ++j)
+    s *= d.storage_shape[j];
+  return s;
+}
+
+// Reader/writer helpers of the v22 SFPU vector programs. Operand and output
+// tiles are plain 1024-word vectors: unpack, SFPU and pack all keep the L1
+// word order, so no face reordering is needed.
+constexpr char kSfpuVectorTransfer[] = R"kernel(
+// FP32 words hold BF16-rounded values; write their upper halves to |window|.
+inline void store_hi16(uint32_t src, uint32_t window, uint32_t n) {
+  auto s=reinterpret_cast<volatile tt_l1_ptr const uint32_t*>(src);
+  uint32_t j=0;
+  if(n && (window&2u)) { *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(window)=uint16_t(s[0]>>16); j=1; }
+  auto d=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(window+j*2u);
+  for(;j+1u<n;j+=2u) *d++=(s[j]>>16)|(s[j+1u]&0xffff0000u);
+  if(j<n) *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(window+j*2u)=uint16_t(s[j]>>16);
+}
+)kernel";
+} // namespace
+
+TenstorrentNativeSources
+generateBF16NativeSfpuVector(uint8_t kind,
+                             const tt_iree_ttex_tensor_desc_t *const *t,
+                             const std::string &body) {
+  const TenstorrentNativeSources none;
+  const auto *in = t[0], *aux = t[1], *out = t[2];
+  auto isBF16 = [](const tt_iree_ttex_tensor_desc_t *d) {
+    return d && d->rank &&
+           d->element_type == TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  };
+  if (!isBF16(in) || !isBF16(out) || !unitStride(*in, in->rank - 1) ||
+      !unitStride(*out, out->rank - 1))
+    return none;
+  tt_iree_ttex_bf16_native_desc_t desc = {};
+  desc.operation_kind = kind;
+  desc.tensors[2] = *out;
+  if (!tt_iree_bf16_sfpu_vector_tiles(&desc))
+    return none;
+  const bool batched = in->rank == 4;
+  const unsigned channel = batched ? 1 : 0;
+  // Operand tiles in CBs 26.. land in Dst tiles 1..; the result is Dst tile 0.
+  unsigned operandTiles = 0;
+  bool perFace = true;
+  std::ostringstream face, reader, writer;
+  const std::string common =
+      generateBF16NativeCommon(t) + tileTransferSource() + kSfpuVectorTransfer;
+  reader << common << R"kernel(
+// native-v22 SFPU vector reader: BF16 sources widened into FP32 operand tiles.
+void kernel_main() {
+  const uint32_t begin=get_arg_val<uint32_t>(28), count=get_arg_val<uint32_t>(29);
+  CircularBuffer stage_cb(tt::CBIndex::c_17);
+  stage_cb.reserve_back(1);
+  const uint32_t stage=(stage_cb.get_write_ptr()+63u)&~63u;
+  const auto input=TensorAccessor(accessor_0,get_arg_val<uint32_t>(0));
+)kernel";
+  writer << common << R"kernel(
+// native-v22 SFPU vector writer: BF16 upper halves of the FP32 result tiles.
+void kernel_main() {
+  const uint32_t begin=get_arg_val<uint32_t>(28), count=get_arg_val<uint32_t>(29);
+  CircularBuffer out(tt::CBIndex::c_16), window_cb(tt::CBIndex::c_8);
+  window_cb.reserve_back(1);
+  const uint32_t windows=(window_cb.get_write_ptr()+63u)&~63u;
+  const auto output=TensorAccessor(accessor_2,get_arg_val<uint32_t>(4));
+)kernel";
+  // Writer tail shared by the 1-D outputs: |n| contiguous results per tile.
+  auto writeRun = [&](unsigned perTile, uint64_t total) {
+    writer << "for(uint32_t tile=begin;tile<begin+count;++tile) {\n"
+           << "const uint32_t first=tile*" << perTile << "u;\n"
+           << "uint32_t n=" << total << "u-first; if(n>" << perTile
+           << "u) n=" << perTile << "u;\n"
+           << R"kernel(out.wait_front(1);
+const uint32_t byte=byte_2(first,0,0,0), window=windows+byte%64u;
+store_hi16(out.get_read_ptr(),window,n);
+write_bytes(window,output,byte,n*2u);
+noc_async_write_barrier();
+out.pop_front(1);
+}
+}
+)kernel";
+  };
+
+  if (kind == TT_IREE_TTEX_DISPATCH_KIND_SCALAR_DIV) {
+    // One tile holds 1024 elements (high halves) with the broadcast scalar in
+    // every low half.
+    if (body.empty() || in->rank != 1 || out->rank != 1 ||
+        in->shape[0] != out->shape[0] || !isBF16(aux) || aux->rank != 1 ||
+        aux->shape[0] != 1)
+      return none;
+    operandTiles = 1;
+    face << "#define TT_X0 tt_hi16(32u + i)\n#define TT_X1 tt_lo16(32u + i)\n"
+         << "inline void tt_iree_vector(const uint32_t, const uint32_t, "
+            "const uint32_t) {\n  for (uint32_t i = 0; i < 8u; ++i) {\n"
+            "    sfpi::vFloat value;\n"
+         << body
+         << "    sfpi::dst_reg[i] = sfpi::as<sfpi::vInt>(value);\n  }\n}\n"
+         << "#undef TT_X0\n#undef TT_X1\n";
+    reader << R"kernel(
+const auto scalar=TensorAccessor(accessor_1,get_arg_val<uint32_t>(2));
+const uint32_t scalar_byte=byte_1(0,0,0,0);
+noc_async_read(scalar.get_noc_addr(scalar_byte/2048u,scalar_byte%2048u),stage+scalar_byte%64u,2);
+noc_async_read_barrier();
+const uint32_t lo=*reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage+scalar_byte%64u);
+CircularBuffer operand(26);
+for(uint32_t tile=begin;tile<begin+count;++tile) {
+  const uint32_t first=tile*1024u;
+)kernel" << "  uint32_t n=" << out->shape[0]
+           << "u-first; if(n>1024u) n=1024u;\n" << R"kernel(
+  const uint32_t byte=byte_0(first,0,0,0), ptr=stage+128u+byte%64u;
+  read_bytes(input,byte,ptr,n*2u);
+  noc_async_read_barrier();
+  operand.reserve_back(1);
+  auto s=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptr);
+  auto d=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(operand.get_write_ptr());
+  for(uint32_t e=0;e<n;++e) d[e]=(uint32_t(s[e])<<16)|lo;
+  operand.push_back(1);
+}
+}
+)kernel";
+    writeRun(1024, out->shape[0]);
+  } else if (kind == TT_IREE_TTEX_DISPATCH_KIND_GLOBAL_SUM) {
+    // 64 channels per tile. Position p = 7h + w of channel j is word
+    // 64 (p % 16) + j of operand tile p / 16, i.e. Dst rows 4 (p % 16) + 0..3:
+    // SFPU units 2 (p % 16) and 2 (p % 16) + 1 hold the channel halves in the
+    // same lanes as units 0 and 1 of the result tile.
+    if (!isSpatial(*in) || in->shape[channel + 1] != 8 ||
+        in->shape[channel + 2] != 8 || out->rank != 1 || !isBF16(aux) ||
+        aux->rank != 1 || aux->shape[0] != 1)
+      return none;
+    const uint64_t row = storageStride(*in, channel + 1);
+    const uint64_t span = (6 * row + 7) * 2;
+    // 32 channel spans per batch of reads, 192-byte slots with their 64B offset.
+    if (span + 64 > 192)
+      return none;
+    operandTiles = 4;
+    perFace = false;
+    face << "inline void tt_iree_vector(const uint32_t, const uint32_t, "
+            "const uint32_t) {\n  sfpi::vFloat value;\n";
+    for (unsigned half = 0; half < 2; ++half) {
+      face << "  value = 0.0f;\n";
+      for (unsigned p = 0; p < 49; ++p)
+        face << "  value = tt_rne(value + tt_load(" << (1 + p / 16) * 32 + 2 * (p % 16) + half
+             << "u));\n";
+      face << "  sfpi::dst_reg[" << half << "] = sfpi::as<sfpi::vInt>(value);\n";
+    }
+    face << "}\n";
+    const std::string coordinates =
+        batched ? "i/" + std::to_string(in->shape[1]) + "u,i%" +
+                      std::to_string(in->shape[1]) + "u,0,0"
+                : "i,0,0,0";
+    reader << "CircularBuffer o0(26), o1(27), o2(28), o3(29);\n"
+           << "for(uint32_t tile=begin;tile<begin+count;++tile) {\n"
+           << "const uint32_t first=tile*64u;\n"
+           << "uint32_t n=" << out->shape[0] << "u-first; if(n>64u) n=64u;\n"
+           << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1);
+auto d0=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o0.get_write_ptr());
+auto d1=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o1.get_write_ptr());
+auto d2=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o2.get_write_ptr());
+auto d3=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o3.get_write_ptr());
+for(uint32_t half=0;half<n;half+=32u) {
+  uint32_t m=n-half; if(m>32u) m=32u;
+  uint32_t ptrs[32];
+  for(uint32_t j=0;j<m;++j) {
+    const uint32_t i=first+half+j;
+)kernel" << "    const uint32_t byte=byte_0(" << coordinates << ");\n"
+           << "    ptrs[j]=stage+j*192u+byte%64u;\n"
+           << "    read_bytes(input,byte,ptrs[j]," << span << "u);\n"
+           << R"kernel(  }
+  noc_async_read_barrier();
+  for(uint32_t j=0;j<m;++j) {
+    auto s=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[j]);
+    const uint32_t lane=half+j;
+)kernel";
+    for (unsigned p = 0; p < 49; ++p)
+      reader << "    d" << p / 16 << "[" << 64 * (p % 16) << "u+lane]=uint32_t(s["
+             << (p / 7) * row + p % 7 << "u])<<16;\n";
+    reader << R"kernel(  }
+}
+o0.push_back(1); o1.push_back(1); o2.push_back(1); o3.push_back(1);
+}
+}
+)kernel";
+    // The divisor output (49 as BF16) is written once, by core 0.
+    writer << R"kernel(
+if(get_arg_val<uint32_t>(30)==0) {
+  const auto divisor=TensorAccessor(accessor_1,get_arg_val<uint32_t>(2));
+  const uint32_t byte=byte_1(0,0,0,0), window=windows+3072u+byte%64u;
+  *reinterpret_cast<volatile tt_l1_ptr uint16_t*>(window)=0x4244u;
+  noc_async_write(window,divisor.get_noc_addr(byte/2048u,byte%2048u),2);
+  noc_async_write_barrier();
+}
+)kernel";
+    writeRun(64, out->shape[0]);
+  } else if (kind == TT_IREE_TTEX_DISPATCH_KIND_MAX_POOL) {
+    // Whole output rows, floor(1024 / width) per tile. The nine 3x3 taps are
+    // BF16 operand pairs (high, low) in tiles 1-4 plus tap 8 alone in tile 5.
+    if (!isSpatial(*in) || !isSpatial(*out) || in->rank != out->rank ||
+        in->layout != out->layout || in->shape[channel] != out->shape[channel] ||
+        (batched && in->shape[0] != out->shape[0]))
+      return none;
+    const uint32_t width = out->shape[channel + 2], height = out->shape[channel + 1];
+    const uint32_t perTile = 1024 / width;
+    const uint64_t rowBytes = (2 * uint64_t(width) + 1) * 2;
+    // Two sets of three input-row slots (double-buffered) in the 8 KiB stage.
+    const uint64_t slot = (rowBytes + 63 + 63) / 64 * 64;
+    if (in->shape[channel + 2] < 2 * width + 1 ||
+        in->shape[channel + 1] < 2 * height + 1 || 6 * slot + 64 > 8192)
+      return none;
+    operandTiles = 5;
+    face << R"kernel(inline void tt_iree_vector(const uint32_t, const uint32_t, const uint32_t) {
+  for (uint32_t i = 0; i < 8u; ++i) {
+    sfpi::vFloat value = tt_hi16(32u + i);
+    value = tt_max(value, tt_lo16(32u + i));
+    value = tt_max(value, tt_hi16(64u + i));
+    value = tt_max(value, tt_lo16(64u + i));
+    value = tt_max(value, tt_hi16(96u + i));
+    value = tt_max(value, tt_lo16(96u + i));
+    value = tt_max(value, tt_hi16(128u + i));
+    value = tt_max(value, tt_lo16(128u + i));
+    value = tt_max(value, tt_load(160u + i));
+    sfpi::dst_reg[i] = sfpi::as<sfpi::vInt>(value);
+  }
+}
+)kernel";
+    uint64_t rows = 1;
+    for (unsigned i = 0; i + 1 < out->rank; ++i)
+      rows *= out->shape[i];
+    // Coordinates of output row g (and input row 2h + kh).
+    auto rowCoords = [&](const std::string &h) {
+      std::string c = batched ? "g/" + std::to_string(uint64_t(out->shape[1]) * height) +
+                                    "u,(g/" + std::to_string(height) + "u)%" +
+                                    std::to_string(out->shape[1]) + "u,"
+                              : "g/" + std::to_string(height) + "u,";
+      return c + h + (batched ? ",0" : ",0,0");
+    };
+    reader << "CircularBuffer o0(26), o1(27), o2(28), o3(29), o4(30);\n"
+           << "uint32_t ptrs[2][3];\n"
+           << "auto issue=[&](uint32_t g,uint32_t buffer) {\n"
+           << "for(uint32_t kh=0;kh<3u;++kh) {\n"
+           << "const uint32_t byte=byte_0(" << rowCoords("(g%" + std::to_string(height) + "u)*2u+kh") << ");\n"
+           << "ptrs[buffer][kh]=stage+(buffer*3u+kh)*" << slot << "u+byte%64u;\n"
+           << "read_bytes(input,byte,ptrs[buffer][kh]," << rowBytes << "u);\n}\n};\n"
+           << "for(uint32_t tile=begin;tile<begin+count;++tile) {\n"
+           << "const uint32_t first=tile*" << perTile << "u;\n"
+           << "uint32_t rows=" << rows << "u-first; if(rows>" << perTile
+           << "u) rows=" << perTile << "u;\n"
+           << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1); o4.reserve_back(1);
+auto d0=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o0.get_write_ptr());
+auto d1=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o1.get_write_ptr());
+auto d2=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o2.get_write_ptr());
+auto d3=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o3.get_write_ptr());
+auto d4=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o4.get_write_ptr());
+issue(first,0);
+for(uint32_t r=0;r<rows;++r) {
+  noc_async_read_barrier();
+  const uint32_t buffer=r&1u;
+  if(r+1u<rows) issue(first+r+1u,buffer^1u);
+  auto a=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][0]);
+  auto b=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][1]);
+  auto c=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][2]);
+)kernel" << "  const uint32_t e0=r*" << width << "u;\n"
+           << "  for(uint32_t w=0;w<" << width << "u;++w) {\n" << R"kernel(
+    const uint32_t x=w*2u, e=e0+w;
+    d0[e]=(uint32_t(a[x])<<16)|a[x+1u];
+    d1[e]=(uint32_t(a[x+2u])<<16)|b[x];
+    d2[e]=(uint32_t(b[x+1u])<<16)|b[x+2u];
+    d3[e]=(uint32_t(c[x])<<16)|c[x+1u];
+    d4[e]=uint32_t(c[x+2u])<<16;
+  }
+}
+o0.push_back(1); o1.push_back(1); o2.push_back(1); o3.push_back(1); o4.push_back(1);
+}
+}
+)kernel";
+    writer << "for(uint32_t tile=begin;tile<begin+count;++tile) {\n"
+           << "const uint32_t first=tile*" << perTile << "u;\n"
+           << "uint32_t rows=" << rows << "u-first; if(rows>" << perTile
+           << "u) rows=" << perTile << "u;\n"
+           << R"kernel(out.wait_front(1);
+const uint32_t src=out.get_read_ptr();
+uint32_t cursor=windows;
+for(uint32_t r=0;r<rows;++r) {
+  const uint32_t g=first+r;
+)kernel" << "  const uint32_t byte=byte_2(" << rowCoords("g%" + std::to_string(height) + "u") << ");\n"
+           << "  uint32_t window=cursor+byte%64u;\n"
+           << "  if(window+" << width * 2 << "u>windows+4032u) { noc_async_write_barrier(); cursor=windows; window=cursor+byte%64u; }\n"
+           << "  store_hi16(src+r*" << width * 4 << "u,window," << width << "u);\n"
+           << "  write_bytes(window,output,byte," << width * 2 << "u);\n"
+           << "  cursor=(window+" << width * 2 << "u+63u)&~63u;\n" << R"kernel(}
+noc_async_write_barrier();
+out.pop_front(1);
+}
+}
+)kernel";
+  } else {
+    return none;
+  }
+
+  std::ostringstream c;
+  c << R"kernel(
+// native-v22 SFPU vector program: FP32 operand tiles unpacked straight to Dst
+// tiles 1.., the BF16-rounded result in Dst tile 0, FP32 pack.
+#include <cstdint>
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/dataflow/circular_buffer.h"
+#ifdef TRISC_MATH
+#include "sfpi.h"
+namespace ckernel::sfpu {
+)kernel" << kSfpuHelpers
+    << face.str() << R"kernel(} // namespace ckernel::sfpu
+#endif
+void kernel_main() {
+  const uint32_t tiles=get_arg_val<uint32_t>(0);
+  CircularBuffer out(tt::CBIndex::c_16);
+  compute_kernel_hw_startup(26,tt::CBIndex::c_16);
+  for(uint32_t tile=0;tile<tiles;++tile) {
+    tile_regs_acquire();
+)kernel";
+  for (unsigned i = 0; i < operandTiles; ++i)
+    c << "    {\n      CircularBuffer operand(" << 26 + i << ");\n"
+      << "      copy_tile_to_dst_init_short(" << 26 + i << ");\n"
+      << "      operand.wait_front(1);\n"
+      << "      copy_tile(" << 26 + i << ",0," << 1 + i << ");\n"
+      << "      operand.pop_front(1);\n    }\n";
+  c << "    MATH((SFPU_BINARY_INIT(unused)));\n"
+    << "    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE,\n"
+    << "        tt_iree_vector, 0, 1, 0, VectorMode::" << (perFace ? "RC" : "None")
+    << ")));\n" << R"kernel(    tile_regs_commit(); tile_regs_wait();
+    out.reserve_back(1);
+    pack_tile(0,tt::CBIndex::c_16);
+    out.push_back(1);
+    tile_regs_release();
+  }
+}
+)kernel";
+  TenstorrentNativeSources sources;
+  sources.reader = reader.str();
+  sources.writer = writer.str();
+  sources.compute = c.str();
+  sources.sfpuEpilogue = true;
+  return sources;
 }
 
 } // namespace mlir::iree_compiler::IREE::HAL

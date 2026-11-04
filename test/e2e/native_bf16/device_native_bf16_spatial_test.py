@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 The tt-iree Authors
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Compile BF16 spatial kernels, checking exact bits and per-core row coverage."""
+"""Compile BF16 spatial kernels, checking exact bits and per-core row or SFPU tile coverage."""
 import argparse
 import csv
 import json
@@ -71,17 +71,29 @@ def main():
         assert list(actual) == expected, f"{op}: output bits or halo differ"
         with (profile / "ops_perf_results.csv").open() as stream:
             ops = list(csv.DictReader(stream))
-        assert len(ops) == 1 and int(ops[0]["CORE COUNT"]) > 1, ops
         with (profile / "core_mapping.csv").open() as stream:
             ranges = list(csv.DictReader(stream))
         previous = 0
-        width = 39 if op == "copy" else 19
-        for row in ranges:
-            begin, end = int(row["ELEMENT BEGIN"]), int(row["ELEMENT END"])
-            assert begin == previous and begin % width == end % width == 0
-            previous = end
-        expected_count = 5*7*39 if op == "copy" else 5*3*19
-        assert previous == expected_count
+        if op == "copy":
+            # Data movement only: the device-RISC-V program splits whole rows.
+            assert len(ops) == 1 and int(ops[0]["CORE COUNT"]) > 1, ops
+            assert ops[0]["IREE BUILTIN PROGRAM"] == "11", ops
+            for row in ranges:
+                begin, end = int(row["ELEMENT BEGIN"]), int(row["ELEMENT END"])
+                assert row["PARTITION UNIT"] == "rows"
+                assert begin == previous and begin % 39 == end % 39 == 0
+                previous = end
+            assert previous == 5*7*39
+        else:
+            # The SFPU computes the max: 15 output rows of 19 fit one tile.
+            assert len(ops) == 1 and ops[0]["IREE BUILTIN PROGRAM"] == "12", ops
+            assert ops[0]["IREE COMPUTE DATATYPE"] == "BF16_SFPU_FP32_IR_ROUNDING", ops
+            for row in ranges:
+                begin, end = int(row["ELEMENT BEGIN"]), int(row["ELEMENT END"])
+                assert row["PARTITION UNIT"] == "sfpu_tiles"
+                assert begin == previous and begin < end
+                previous = end
+            assert previous == 1
         summary = json.loads((profile / "run_results.json").read_text())
         assert summary["all_dispatches_device_native"]
         results[op] = {"values": len(expected), "bitwise_mismatches": 0,

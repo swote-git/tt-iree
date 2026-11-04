@@ -40,9 +40,11 @@ struct TenstorrentOptions {
     binder.opt<bool>(
         "iree-tenstorrent-native-bf16-use-tensix", nativeBF16UseTensix,
         llvm::cl::cat(category),
-        llvm::cl::desc("Run BF16 contractions on Tensix (HiFi4, FP32 Dst, SFPU "
-                       "epilogue); false selects the v17 device-RISC-V FP32 "
-                       "reference. Both preserve IR epilogue rounding"));
+        llvm::cl::desc("Run BF16 arithmetic on Tensix: contractions on the "
+                       "FPU (HiFi4, FP32 Dst) with SFPU epilogues, max-pool, "
+                       "7x7 sums and scalar division on the SFPU; false "
+                       "selects the device-RISC-V FP32 reference. Both "
+                       "preserve IR rounding"));
     binder.opt<bool>(
         "iree-tenstorrent-native-bf16-reuse-output-tiles", nativeBF16ReuseOutputTiles,
         llvm::cl::cat(category),

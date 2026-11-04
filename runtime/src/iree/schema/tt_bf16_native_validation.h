@@ -217,11 +217,14 @@ tt_iree_validate_bf16_native_v20(const tt_iree_ttex_bf16_native_desc_t *d,
                               "v20 BF16 matrix shape/layout/dtype mismatch");
     return iree_ok_status();
   }
-  if (builtin != TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE || d->m || d->n ||
-      d->k)
+  // Builtin 12 marks a v22 SFPU vector program (the caller checks v22).
+  if ((builtin != TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE &&
+       !(builtin == TT_IREE_TTEX_BUILTIN_PROGRAM_BF16_NATIVE_TENSIX &&
+         tt_iree_bf16_sfpu_vector_tiles(d))) ||
+      d->m || d->n || d->k)
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
-        "v20 BF16 scalar requires builtin 11 and zero M/N/K");
+        "v20 BF16 scalar requires builtin 11 (or a v22 SFPU program) and zero M/N/K");
   bool valid = false;
   switch (d->operation_kind) {
   case TT_IREE_TTEX_DISPATCH_KIND_PADDED_COPY:
