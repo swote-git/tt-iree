@@ -482,6 +482,113 @@ for(uint32_t i=0;i<1024;++i) tb[i]=0;
     s << "}\n";
 }
 
+// Channel-major outputs as out^T = W x X^T: in0 is the weight tile [n][k] and
+// in1 the activation tile [k][m]. Both are rows of their source tensors (weight
+// rows along K, activation rows along M), so the reader copies whole row runs
+// into face order and never transposes element by element.
+constexpr char kFaceRowCopy[] = R"kernel(
+// |n| BF16 values at |src| into row |r| of a face-ordered tile from column |c|,
+// |step| elements apart in the source. Signalling NaNs are quieted exactly as
+// transport_bf16 does; contiguous runs move as words.
+inline void put_row(uint32_t tile, uint32_t r, uint32_t c, uint32_t src,
+                    uint32_t n, uint32_t step) {
+  while(n) {
+    uint32_t len=16u-c%16u; if(len>n) len=n;
+    uint32_t dst=tile+(((r/16u)*2u+c/16u)*256u+(r%16u)*16u+c%16u)*2u, j=0;
+    auto s=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
+    auto d=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(dst);
+    if(step==1u && ((src^dst)&3u)==0) {
+      if(dst&2u) { d[0]=transport_bf16(s[0]); j=1; }
+      auto sw=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src+j*2u);
+      auto dw=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst+j*2u);
+      for(;j+1u<len;j+=2u) {
+        uint32_t w=*sw++;
+        if((w&0x7f800000u)==0x7f800000u || (w&0x7f80u)==0x7f80u)
+          w=transport_bf16(uint16_t(w))|(uint32_t(transport_bf16(uint16_t(w>>16)))<<16);
+        *dw++=w;
+      }
+    }
+    for(;j<len;++j) d[j]=transport_bf16(s[j*step]);
+    src+=len*step*2u; c+=len; n-=len;
+  }
+}
+inline void zero_tile(uint32_t tile) {
+  auto d=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(tile);
+  for(uint32_t i=0;i<512u;++i) d[i]=0;
+}
+)kernel";
+
+// True when consecutive M of the activation are consecutive elements across
+// whole H x W planes (dense, offset-free spatial dims), so a 32-wide M run
+// needs one transfer instead of one per output row.
+bool denseSpatialPlane(const tt_iree_ttex_tensor_desc_t &a) {
+  if (!isSpatial(a))
+    return false;
+  for (unsigned i = a.rank - 2; i < a.rank; ++i)
+    if (!unitStride(a, i) || a.offset[i] || a.storage_shape[i] != a.shape[i])
+      return false;
+  return true;
+}
+
+void emitFlippedPrefetchLoads(std::ostringstream &s,
+                              const tt_iree_ttex_entry_point_desc_t &ep,
+                              const tt_iree_ttex_tensor_desc_t *const *t,
+                              const std::string &lhsCoords,
+                              const std::string &rhsCoords) {
+  const bool convolution =
+      ep.dispatch_kind == TT_IREE_TTEX_DISPATCH_KIND_CONVOLUTION;
+  const uint32_t step = static_cast<uint32_t>(bf16SpatialStep(ep, *t[0]));
+  // Run of M that stays contiguous in the activation: an output row for a
+  // convolution, a whole plane for a dense matmul input, else one row.
+  uint64_t run = 0;
+  if (convolution)
+    run = ep.conv2d.output.shape[ep.conv2d.output.rank - 1];
+  else if (denseSpatialPlane(*t[0]))
+    run = uint64_t(t[0]->shape[t[0]->rank - 2]) * t[0]->shape[t[0]->rank - 1];
+  else if (isSpatial(*t[0]) ||
+           t[0]->layout == TT_IREE_TTEX_TENSOR_LAYOUT_BATCH_CHANNEL_MAJOR)
+    run = t[0]->shape[t[0]->rank - 1];
+  auto convIndices = [&]() {
+    if (convolution)
+      s << "uint32_t ic=k/" << ep.conv2d.kernel_h * ep.conv2d.kernel_w
+        << "u,kh=(k/" << ep.conv2d.kernel_w << "u)%" << ep.conv2d.kernel_h
+        << "u,kw=k%" << ep.conv2d.kernel_w << "u;\n";
+  };
+  s << R"kernel(
+tile_a.reserve_back(1); tile_b.reserve_back(1);
+const uint32_t ta=tile_a.get_write_ptr(), tb=tile_b.get_write_ptr();
+// Only a K tail needs zeros (in both operands); M/N tails reach only output
+// lanes the writer never stores.
+if(valid_k<32u) { zero_tile(ta); zero_tile(tb); }
+uint32_t wptr[32], xptr[32];
+for(uint32_t r=0;r<valid_n;++r) {
+uint32_t n=n_base+r,k=block*32u;
+)kernel";
+  convIndices();
+  s << "wptr[r]=prefetch_bf16_1(rhs.get_write_ptr()+r*128u,byte_1("
+    << rhsCoords << (convolution ? "" : ",0,0") << "),valid_k);\n}\n"
+    << "for(uint32_t first=0;first<valid_m;) {\n"
+       "uint32_t chunk=valid_m-first,m=m_base+first;\n";
+  if (run)
+    s << "uint32_t run_remaining=" << run << "u-m%" << run
+      << "u; if(chunk>run_remaining) chunk=run_remaining;\n";
+  // Include stride gaps without growing the 64B span in each 128B window.
+  if (step != 1)
+    s << "if(chunk>" << 1 + 31 / step << "u) chunk=" << 1 + 31 / step
+      << "u;\n";
+  s << "for(uint32_t r=0;r<valid_k;++r) {\nuint32_t k=block*32u+r;\n";
+  convIndices();
+  s << "xptr[r]=prefetch_bf16_0(lhs.get_write_ptr()+r*128u,byte_0("
+    << lhsCoords << coordinatePadding(*t[0])
+    << (step == 1 ? "),chunk);\n}\n"
+                  : "),(chunk-1u)*" + std::to_string(step) + "u+1u);\n}\n")
+    << R"kernel(noc_async_read_barrier();
+if(!first) for(uint32_t r=0;r<valid_n;++r) put_row(ta,r,0,wptr[r],valid_k,1u);
+)kernel"
+    << "for(uint32_t r=0;r<valid_k;++r) put_row(tb,r,first,xptr[r],chunk,"
+    << step << "u);\nfirst+=chunk;\n}\n";
+}
+
 void emitNativeOutputStores(std::ostringstream &s,
                             const tt_iree_ttex_tensor_desc_t &d) {
   bool spatial = isSpatial(d);
@@ -873,7 +980,7 @@ TenstorrentNativeSources
 sfpuEpilogueSources(const std::string &common,
                     const tt_iree_ttex_tensor_desc_t *const *t,
                     const TenstorrentSfpuEpilogue &e, uint32_t m, uint32_t n,
-                    unsigned group) {
+                    unsigned group, bool flipped = false) {
   const auto &o = *t[2];
   // Channel layouts store runs along M, so the Dst tile is transposed first
   // and every operand tile is built with rows = channels.
@@ -944,7 +1051,8 @@ void kernel_main() {
       }
     for(uint32_t lane=0;lane<group;++lane) {
 )kernel";
-  if (transposed)
+  // A flipped reader already produced [n][m] tiles (out^T = W x X^T).
+  if (transposed && !flipped)
     c << "      transpose_dest_init<true,true>();\n"
          "      transpose_dest<true,true>(lane);\n";
   c << "      uint32_t operands=" << group << "u+lane*" << tiles << "u;\n";
@@ -1658,8 +1766,15 @@ void kernel_main() {
     const bool prefetch =
         prefetch_bf16_inputs && supportsBF16Prefetch(geometry, tensors);
     const bool reuse = reuse_output_tiles && prefetch && (m > 32 || n > 32);
+    // Channel-major outputs with an SFPU epilogue compute out^T = W x X^T, so
+    // both operand tiles are row copies and Dst needs no transpose.
+    const bool flipped = sfpu && prefetch && !reuse &&
+                         isChannelLayout(*tensors[2]) &&
+                         tensors[0]->layout != TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR &&
+                         !tt_iree_ttex_is_tile_layout(tensors[0]->layout);
     std::ostringstream reader;
-    reader << common << (prefetch ? bf16PrefetchSource() : "");
+    reader << common << (prefetch ? bf16PrefetchSource() : "")
+           << (flipped ? kFaceRowCopy : "");
     if (reuse)
       reader << R"kernel(
 // Only this reader writes the input CBs. A popped page stays unchanged until
@@ -1718,7 +1833,9 @@ void kernel_main() {
              << "u;++block) {\n";
     reader << "uint32_t valid_k=" << k
            << "u-block*32; if(valid_k>32) valid_k=32;\n";
-    if (prefetch) {
+    if (flipped) {
+      emitFlippedPrefetchLoads(reader, geometry, tensors, lhsCoords, rhsCoords);
+    } else if (prefetch) {
       emitBF16PrefetchLoads(reader, geometry, tensors, lhsCoords, rhsCoords,
                            reuse);
     } else {
@@ -1829,7 +1946,8 @@ void kernel_main() {
     writer << "out.pop_front(1);\n}\n}\n";
     sources.writer = writer.str();
     if (sfpu) {
-      auto v22 = sfpuEpilogueSources(common, tensors, *sfpu, m, n, reuse ? 2u : 1u);
+      auto v22 = sfpuEpilogueSources(common, tensors, *sfpu, m, n, reuse ? 2u : 1u,
+                                     flipped);
       sources.compute = std::move(v22.compute);
       sources.writer = std::move(v22.writer);
       sources.sfpuEpilogue = true;
