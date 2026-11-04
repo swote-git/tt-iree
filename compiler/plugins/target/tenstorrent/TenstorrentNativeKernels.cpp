@@ -16,6 +16,86 @@ std::string bits(float value) {
   return "from_bits(" + std::to_string(raw) + "u)";
 }
 
+// Kernel phase profiling. Generated kernels mark phase boundaries with
+// TT_PHASE(n); time until the next mark belongs to phase n. Each RISC keeps
+// wall-clock cycle totals per phase and records one "TTIREE <phase>" device
+// profiler marker per phase when kernel_main returns. The marks exist only when
+// the runtime JIT-builds kernels for the device profiler with
+// TT_IREE_KERNEL_PHASES defined; AOT and unprofiled builds compile them away.
+// Phase names are the analyzer's contract (tools/tt_iree_profile.py).
+enum ReaderPhase : unsigned {
+  kRdOther, kRdCbWait, kRdZero, kRdNocIssue, kRdNocWait, kRdTile
+};
+constexpr const char *kReaderPhases[] = {"rd.other",     "rd.cb_wait",
+                                         "rd.zero",      "rd.noc_issue",
+                                         "rd.noc_wait",  "rd.tile"};
+// cmp.dst_wait: the math/pack handoff of the Dst registers. TRISC phases time
+// instruction issue: CB waits poll on the RISC and are exact, but semaphore
+// waits run in the Tensix pipe and surface in the next issuing phase.
+enum ComputePhase : unsigned {
+  kCmpOther, kCmpCbWait, kCmpMatmul, kCmpTranspose, kCmpOperand, kCmpSfpu,
+  kCmpOutWait, kCmpPack, kCmpDstWait
+};
+constexpr const char *kComputePhases[] = {
+    "cmp.other",   "cmp.cb_wait", "cmp.matmul",   "cmp.transpose",
+    "cmp.operand", "cmp.sfpu",    "cmp.out_wait", "cmp.pack",
+    "cmp.dst_wait"};
+enum WriterPhase : unsigned {
+  kWrOther, kWrOperandCbWait, kWrOperandIssue, kWrOperandNocWait,
+  kWrOperandCopy, kWrOutWait, kWrOutCopy, kWrOutIssue, kWrOutNocWait
+};
+constexpr const char *kWriterPhases[] = {
+    "wr.other",        "wr.operand_cb_wait", "wr.operand_issue",
+    "wr.operand_noc_wait", "wr.operand_copy", "wr.out_wait",
+    "wr.out_copy",     "wr.out_issue",       "wr.out_noc_wait"};
+
+std::string mark(unsigned phase) {
+  return "TT_PHASE(" + std::to_string(phase) + "u);\n";
+}
+
+// Adds the phase accumulator before kernel_main and starts it on entry.
+template <size_t N>
+std::string withPhases(std::string source, const char *const (&names)[N]) {
+  const std::string entry = "void kernel_main() {";
+  const size_t at = source.find(entry);
+  if (at == std::string::npos)
+    return source;
+  std::ostringstream s;
+  s << R"kernel(
+#if defined(PROFILE_KERNEL) && defined(TT_IREE_KERNEL_PHASES)
+// TRISC firmware includes the kernel before the profiler header.
+#include "tools/profiler/kernel_profiler.hpp"
+// tt-iree kernel phases: wall-clock cycles of this RISC per phase, recorded at
+// kernel end as one marker each (cycles in bits 0-39, entries in bits 40-63).
+struct TtIreePhases {
+)kernel" << "  uint64_t cycles[" << N << "] = {};\n  uint32_t entries[" << N
+    << "] = {};\n" << R"kernel(  uint32_t current = 0, last = now();
+  static uint32_t now() {
+    return reinterpret_cast<volatile tt_reg_ptr uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L)[0];
+  }
+  void close() { const uint32_t t = now(); cycles[current] += t - last; last = t; }
+  void to(uint32_t phase) { close(); current = phase; ++entries[phase]; }
+  static uint64_t pack(uint64_t c, uint32_t e) { return (uint64_t(e) << 40) | (c & 0xffffffffffull); }
+  ~TtIreePhases() {
+    close();
+)kernel";
+  for (size_t i = 0; i < N; ++i)
+    s << "    DeviceTimestampedData(\"TTIREE " << names[i] << "\", pack(cycles["
+      << i << "], entries[" << i << "]));\n";
+  s << R"kernel(  }
+};
+#define TT_PHASES TtIreePhases tt_phases
+#define TT_PHASE(p) tt_phases.to(p)
+#else
+#define TT_PHASES (void)0
+#define TT_PHASE(p) (void)0
+#endif
+)kernel";
+  source.insert(at + entry.size(), "\n  TT_PHASES;");
+  source.insert(at, s.str());
+  return source;
+}
+
 std::string commonSource(const tt_iree_ttex_entry_point_desc_t &ep,
                          const tt_iree_ttex_tensor_desc_t *const *override = nullptr,
                          unsigned count = TT_IREE_NATIVE_TENSOR_COUNT) {
@@ -403,9 +483,10 @@ void emitBF16PrefetchLoads(std::ostringstream &s,
         << "u,kw=k%" << ep.conv2d.kernel_w << "u;\n";
   };
   if (!reuse_pair) {
-    s << R"kernel(
+    s << mark(kRdCbWait) << R"kernel(
 // Initialize masked lanes directly in BF16; publish only after all DMA completes.
 tile_a.reserve_back(1); tile_b.reserve_back(1);
+)kernel" << mark(kRdZero) << R"kernel(
 auto ta=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_a.get_write_ptr());
 auto tb=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_b.get_write_ptr());
 for(uint32_t i=0;i<1024;++i) { ta[i]=0; tb[i]=0; }
@@ -415,18 +496,21 @@ uint32_t ptrs[32];
     s << R"kernel(
 uint32_t ptrs[32];
 if(reuse_a) {
+)kernel" << mark(kRdTile) << R"kernel(
   copy_operand_tile(saved_tile_a,tile_a_base);
 } else {
+)kernel" << mark(kRdZero) << R"kernel(
 for(uint32_t i=0;i<1024;++i) ta[i]=0;
 )kernel";
   }
+  s << mark(kRdNocIssue);
   if (t[0]->layout == TT_IREE_TTEX_TENSOR_LAYOUT_ROW_MAJOR) {
     s << "for(uint32_t row=0;row<valid_m;++row) {\n"
          "uint32_t m=m_base+row,k=block*32;\n"
          "ptrs[row]=prefetch_bf16_0(lhs.get_write_ptr()+row*128u,byte_0(m,k,0,"
          "0),valid_k);\n}\n"
-         "noc_async_read_barrier();\n"
-         "for(uint32_t row=0;row<valid_m;++row) for(uint32_t "
+      << mark(kRdNocWait) << "noc_async_read_barrier();\n" << mark(kRdTile)
+      << "for(uint32_t row=0;row<valid_m;++row) for(uint32_t "
          "col=0;col<valid_k;++col)\n"
          "ta[face_index(row,col)]=transport_bf16(reinterpret_cast<volatile "
          "tt_l1_ptr uint16_t*>(ptrs[row])[col]);\n";
@@ -449,32 +533,36 @@ for(uint32_t i=0;i<1024;++i) ta[i]=0;
       << lhsCoords << coordinatePadding(*t[0])
       << (step == 1 ? "),chunk);\n}\n"
                     : "),(chunk-1u)*" + std::to_string(step) + "u+1u);\n}\n")
-      << "noc_async_read_barrier();\n"
-         "for(uint32_t col=0;col<valid_k;++col) "
+      << mark(kRdNocWait) << "noc_async_read_barrier();\n" << mark(kRdTile)
+      << "for(uint32_t col=0;col<valid_k;++col) "
          "for(uint32_t j=0;j<chunk;++j)\n"
          "ta[face_index(first+j,col)]=transport_bf16("
          "reinterpret_cast<volatile "
          "tt_l1_ptr uint16_t*>(ptrs[col])["
       << (step == 1 ? "j" : "j*" + std::to_string(step) + "u")
       << "]);\n"
-         "first+=chunk;\n}\n";
+         "first+=chunk;\n"
+      << mark(kRdNocIssue) << "}\n";
   }
   if (reuse_pair)
     s << R"kernel(
 }
 if(reuse_b) {
+)kernel" << mark(kRdTile) << R"kernel(
   copy_operand_tile(saved_tile_b,tile_b_base);
 } else {
+)kernel" << mark(kRdZero) << R"kernel(
 for(uint32_t i=0;i<1024;++i) tb[i]=0;
 )kernel";
-  s << "for(uint32_t col=0;col<valid_n;++col) {\n"
+  s << mark(kRdNocIssue)
+    << "for(uint32_t col=0;col<valid_n;++col) {\n"
        "uint32_t n=n_base+col,k=block*32;\n";
   convIndices();
   s << "ptrs[col]=prefetch_bf16_1(rhs.get_write_ptr()+col*128u,byte_1("
     << rhsCoords << (convolution ? "" : ",0,0")
     << "),valid_k);\n}\n"
-       "noc_async_read_barrier();\n"
-       "for(uint32_t col=0;col<valid_n;++col) for(uint32_t "
+    << mark(kRdNocWait) << "noc_async_read_barrier();\n" << mark(kRdTile)
+    << "for(uint32_t col=0;col<valid_n;++col) for(uint32_t "
        "row=0;row<valid_k;++row)\n"
        "tb[face_index(row,col)]=transport_bf16(reinterpret_cast<volatile "
        "tt_l1_ptr uint16_t*>(ptrs[col])[row]);\n";
@@ -554,12 +642,15 @@ void emitFlippedPrefetchLoads(std::ostringstream &s,
         << "u,kh=(k/" << ep.conv2d.kernel_w << "u)%" << ep.conv2d.kernel_h
         << "u,kw=k%" << ep.conv2d.kernel_w << "u;\n";
   };
-  s << R"kernel(
+  s << mark(kRdCbWait) << R"kernel(
 tile_a.reserve_back(1); tile_b.reserve_back(1);
 const uint32_t ta=tile_a.get_write_ptr(), tb=tile_b.get_write_ptr();
 // Only a K tail needs zeros (in both operands); M/N tails reach only output
 // lanes the writer never stores.
-if(valid_k<32u) { zero_tile(ta); zero_tile(tb); }
+if(valid_k<32u) {
+)kernel" << mark(kRdZero) << R"kernel(
+zero_tile(ta); zero_tile(tb); }
+)kernel" << mark(kRdNocIssue) << R"kernel(
 uint32_t wptr[32], xptr[32];
 for(uint32_t r=0;r<valid_n;++r) {
 uint32_t n=n_base+r,k=block*32u;
@@ -582,11 +673,11 @@ uint32_t n=n_base+r,k=block*32u;
     << lhsCoords << coordinatePadding(*t[0])
     << (step == 1 ? "),chunk);\n}\n"
                   : "),(chunk-1u)*" + std::to_string(step) + "u+1u);\n}\n")
-    << R"kernel(noc_async_read_barrier();
-if(!first) for(uint32_t r=0;r<valid_n;++r) put_row(ta,r,0,wptr[r],valid_k,1u);
+    << mark(kRdNocWait) << "noc_async_read_barrier();\n" << mark(kRdTile)
+    << R"kernel(if(!first) for(uint32_t r=0;r<valid_n;++r) put_row(ta,r,0,wptr[r],valid_k,1u);
 )kernel"
     << "for(uint32_t r=0;r<valid_k;++r) put_row(tb,r,first,xptr[r],chunk,"
-    << step << "u);\nfirst+=chunk;\n}\n";
+    << step << "u);\nfirst+=chunk;\n" << mark(kRdNocIssue) << "}\n";
 }
 
 void emitNativeOutputStores(std::ostringstream &s,
@@ -1042,10 +1133,14 @@ void kernel_main() {
 )kernel" << "    uint32_t group=tiles-tile; if(group>" << group << "u) group="
     << group << "u;\n" << R"kernel(
     matmul_init(tt::CBIndex::c_0,tt::CBIndex::c_1);
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_acquire();
+)kernel" << mark(kCmpOther) << R"kernel(
     for(uint32_t block=0;block<blocks;++block)
       for(uint32_t lane=0;lane<group;++lane) {
+)kernel" << mark(kCmpCbWait) << R"kernel(
         lhs.wait_front(1); rhs.wait_front(1);
+)kernel" << mark(kCmpMatmul) << R"kernel(
         matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,lane);
         lhs.pop_front(1); rhs.pop_front(1);
       }
@@ -1053,31 +1148,38 @@ void kernel_main() {
 )kernel";
   // A flipped reader already produced [n][m] tiles (out^T = W x X^T).
   if (transposed && !flipped)
-    c << "      transpose_dest_init<true,true>();\n"
+    c << mark(kCmpTranspose)
+      << "      transpose_dest_init<true,true>();\n"
          "      transpose_dest<true,true>(lane);\n";
-  c << "      uint32_t operands=" << group << "u+lane*" << tiles << "u;\n";
+  c << mark(kCmpOperand)
+    << "      uint32_t operands=" << group << "u+lane*" << tiles << "u;\n";
   unsigned previous = 1;
   for (unsigned i = 0; i < tiles; ++i) {
     unsigned cb = cbIndex(i);
     c << "      {\n        CircularBuffer operand(" << cb << ");\n"
       << "        copy_tile_to_dst_init_short_with_dt(" << previous << "," << cb
-      << ");\n        operand.wait_front(1);\n"
+      << ");\n" << mark(kCmpCbWait) << "        operand.wait_front(1);\n"
+      << mark(kCmpOperand)
       << "        copy_tile(" << cb << ",0,operands+" << i << "u);\n"
       << "        operand.pop_front(1);\n      }\n";
     previous = cb;
   }
   if (previous != 1)
     c << "      reconfig_data_format_srca(" << previous << ",1);\n";
-  c << R"kernel(
+  c << mark(kCmpSfpu) << R"kernel(
       MATH((SFPU_BINARY_INIT(unused)));
       MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE,
           tt_iree_epilogue_face, lane, operands, lane, VectorMode::RC)));
     }
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_commit(); tile_regs_wait();
+)kernel" << mark(kCmpOutWait) << R"kernel(
     out.reserve_back(group);
+)kernel" << mark(kCmpPack) << R"kernel(
     for(uint32_t lane=0;lane<group;++lane) pack_tile(lane,tt::CBIndex::c_16);
     out.push_back(group);
     tile_regs_release();
+)kernel" << mark(kCmpOther) << R"kernel(
     tile+=group;
   }
 }
@@ -1151,7 +1253,8 @@ void kernel_main() {
   w << "for(uint32_t lane=0;lane<group;++lane) {\n" << tileCoordinates();
   for (unsigned tile = 0; tile < tiles; ++tile) {
     w << "{\nCircularBuffer operand(" << cbIndex(tile) << ");\n"
-      << "operand.reserve_back(1);\nuint32_t tile=operand.get_write_ptr();\n";
+      << mark(kWrOperandCbWait) << "operand.reserve_back(1);\n"
+      << mark(kWrOperandCopy) << "uint32_t tile=operand.get_write_ptr();\n";
     // The high (or whole) operand writes every word; a low operand ORs in.
     for (unsigned i = 0; i < count; ++i) {
       if (placement[i].tile != tile)
@@ -1178,10 +1281,13 @@ void kernel_main() {
           const auto &d = *t[op.slot];
           if (d.rank != 1 || !unitStride(d, 0))
             throw std::invalid_argument("SFPU channel operand must be contiguous");
-          w << "uint32_t byte=byte_" << op.slot << "(n_base,0,0,0);\n"
+          w << mark(kWrOperandIssue)
+            << "uint32_t byte=byte_" << op.slot << "(n_base,0,0,0);\n"
             << "uint32_t vector=windows+byte%64u;\n"
             << "read_bytes(buf_" << i << ",byte,vector,valid_n*" << es << "u);\n"
-            << "noc_async_read_barrier();\nasm volatile(\"\" ::: \"memory\");\n";
+            << mark(kWrOperandNocWait)
+            << "noc_async_read_barrier();\nasm volatile(\"\" ::: \"memory\");\n"
+            << mark(kWrOperandCopy);
           vector = "vector";
         }
         if (transposed) {
@@ -1198,12 +1304,14 @@ void kernel_main() {
       } else {
         const auto &d = *t[op.slot];
         w << "uint32_t pending=0;\n"
-          << "auto flush=[&]() {\nnoc_async_read_barrier();\n"
+          << "auto flush=[&]() {\n" << mark(kWrOperandNocWait)
+          << "noc_async_read_barrier();\n"
              "asm volatile(\"\" ::: \"memory\");\n"
-          << "for(uint32_t p=0;p<pending;++p) "
+          << mark(kWrOperandCopy) << "for(uint32_t p=0;p<pending;++p) "
           << (lo ? "row_load_lo(tile,pr[p],pc[p],pl[p],pw[p]);\n"
                  : "row_load(tile,pr[p],pc[p],pl[p],pw[p]," + std::to_string(es) + "u);\n")
-          << "pending=0;\n};\n"
+          << "pending=0;\n" << mark(kWrOperandIssue) << "};\n"
+          << mark(kWrOperandIssue)
           << runLoop(d) << "uint32_t byte=byte_" << op.slot << "("
           << coords(d, "m", "n") << coordinatePadding(d) << ");\n"
           << "if(pending==kWindows) flush();\n"
@@ -1214,22 +1322,28 @@ void kernel_main() {
       }
       w << "}\n";
     }
-    w << "operand.push_back(1);\n}\n";
+    w << mark(kWrOther) << "operand.push_back(1);\n}\n";
   }
   w << "}\nfor(uint32_t lane=0;lane<group;++lane) {\n" << tileCoordinates()
-    << R"kernel(
+    << mark(kWrOutWait) << R"kernel(
 out.wait_front(1);
 asm volatile("" ::: "memory");
 uint32_t tile=out.get_read_ptr(), used=0;
 )kernel" << runLoop(o) << "uint32_t byte=byte_2(" << coords(o, "m", "n")
     << coordinatePadding(o) << ");\n" << R"kernel(
-if(used==kWindows) { noc_async_write_barrier(); used=0; }
+if(used==kWindows) {
+)kernel" << mark(kWrOutNocWait) << R"kernel(
+noc_async_write_barrier(); used=0; }
 uint32_t window=windows+used*kWindowBytes+byte%64u;
+)kernel" << mark(kWrOutCopy) << R"kernel(
 row_store(tile,r,c,len,window);
+)kernel" << mark(kWrOutIssue) << R"kernel(
 write_bytes(window,o_buf,byte,len*2u);
 ++used; c+=len;
 }
+)kernel" << mark(kWrOutNocWait) << R"kernel(
 noc_async_write_barrier();
+)kernel" << mark(kWrOther) << R"kernel(
 out.pop_front(1);
 }
 first+=group;
@@ -1751,11 +1865,14 @@ void kernel_main() {
 )kernel" << "  for(uint32_t block=0;block<" << kTiles << "u;++block) {\n"
              << "    uint32_t a_tile=(m_start+tm)*" << kTiles
              << "u+block, b_tile=(n_start+tn)*" << kTiles << "u+block;\n"
-             << R"kernel(
+             << mark(kRdCbWait) << R"kernel(
     tile_a.reserve_back(1); tile_b.reserve_back(1);
+)kernel" << mark(kRdNocIssue) << R"kernel(
     fetch_tile(a_buf,a_base+a_tile*2048u,tile_a.get_write_ptr(),stage);
     fetch_tile(b_buf,b_base+b_tile*2048u,tile_b.get_write_ptr(),stage);
+)kernel" << mark(kRdNocWait) << R"kernel(
     noc_async_read_barrier();
+)kernel" << mark(kRdOther) << R"kernel(
     tile_a.push_back(1); tile_b.push_back(1);
   }
 }
@@ -1812,7 +1929,9 @@ void kernel_main() {
              << R"kernel(u;++block) {
     uint32_t saved_tile_a=0,saved_tile_b=0;
     for(uint32_t lane=0;lane<group;++lane) {
+)kernel" << mark(kRdCbWait) << R"kernel(
       tile_a.reserve_back(1); tile_b.reserve_back(1);
+)kernel" << mark(kRdOther) << R"kernel(
       uint32_t tile_a_base=tile_a.get_write_ptr(),tile_b_base=tile_b.get_write_ptr();
       if(!lane) { saved_tile_a=tile_a_base; saved_tile_b=tile_b_base; }
       uint32_t tm=(first+lane)/n_count,tn=(first+lane)%n_count;
@@ -1839,9 +1958,11 @@ void kernel_main() {
       emitBF16PrefetchLoads(reader, geometry, tensors, lhsCoords, rhsCoords,
                            reuse);
     } else {
+      reader << mark(kRdNocWait);
       emitNativeInputLoads(reader, geometry, tensors, lhsCoords, rhsCoords);
-      reader << R"kernel(
+      reader << mark(kRdCbWait) << R"kernel(
     tile_a.reserve_back(1); tile_b.reserve_back(1);
+)kernel" << mark(kRdTile) << R"kernel(
     auto ta=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_a.get_write_ptr());
     auto tb=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(tile_b.get_write_ptr());
     for(uint32_t row=0;row<32;++row) for(uint32_t col=0;col<32;++col) {
@@ -1850,6 +1971,7 @@ void kernel_main() {
     }
 )kernel";
     }
+    reader << mark(kRdOther);
     if (reuse)
       reader << R"kernel(
     tile_a.push_back(1); tile_b.push_back(1);
@@ -1867,7 +1989,8 @@ void kernel_main() {
 }
 )kernel";
     sources.reader = tileReader.empty() ? reader.str() : tileReader;
-    sources.compute = R"kernel(
+    std::ostringstream compute;
+    compute << R"kernel(
 // native-v18: all K tiles accumulate in FP32 Dst before one final pack.
 #include <cstdint>
 #include "api/compute/matmul.h"
@@ -1879,20 +2002,31 @@ void kernel_main() {
   compute_kernel_hw_startup<SrcOrder::Reverse>(tt::CBIndex::c_0,tt::CBIndex::c_1,tt::CBIndex::c_16);
   matmul_init(tt::CBIndex::c_0,tt::CBIndex::c_1);
   for(uint32_t tile=0;tile<tiles;++tile) {
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_acquire();
+)kernel" << mark(kCmpOther) << R"kernel(
     for(uint32_t block=0;block<blocks;++block) {
+)kernel" << mark(kCmpCbWait) << R"kernel(
       lhs.wait_front(1); rhs.wait_front(1);
+)kernel" << mark(kCmpMatmul) << R"kernel(
       matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,0);
       lhs.pop_front(1); rhs.pop_front(1);
     }
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_commit(); tile_regs_wait();
-    out.reserve_back(1); pack_tile(0,tt::CBIndex::c_16); out.push_back(1);
+)kernel" << mark(kCmpOutWait) << R"kernel(
+    out.reserve_back(1);
+)kernel" << mark(kCmpPack) << R"kernel(
+    pack_tile(0,tt::CBIndex::c_16); out.push_back(1);
     tile_regs_release();
+)kernel" << mark(kCmpOther) << R"kernel(
   }
 }
 )kernel";
-    if (reuse)
-      sources.compute = R"kernel(
+    sources.compute = compute.str();
+    if (reuse) {
+      compute.str("");
+      compute << R"kernel(
 // Two independent FP32 Dst accumulators; each retains the original K order.
 #include <cstdint>
 #include "api/compute/matmul.h"
@@ -1905,23 +2039,33 @@ void kernel_main() {
   matmul_init(tt::CBIndex::c_0,tt::CBIndex::c_1);
   for(uint32_t tile=0;tile<tiles;) {
     uint32_t group=tiles-tile; if(group>2) group=2;
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_acquire();
+)kernel" << mark(kCmpOther) << R"kernel(
     for(uint32_t block=0;block<blocks;++block) {
       for(uint32_t lane=0;lane<group;++lane) {
+)kernel" << mark(kCmpCbWait) << R"kernel(
         lhs.wait_front(1); rhs.wait_front(1);
+)kernel" << mark(kCmpMatmul) << R"kernel(
         matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,lane);
         lhs.pop_front(1); rhs.pop_front(1);
       }
     }
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_commit(); tile_regs_wait();
+)kernel" << mark(kCmpOutWait) << R"kernel(
     out.reserve_back(group);
+)kernel" << mark(kCmpPack) << R"kernel(
     for(uint32_t lane=0;lane<group;++lane) pack_tile(lane,tt::CBIndex::c_16);
     out.push_back(group);
     tile_regs_release();
+)kernel" << mark(kCmpOther) << R"kernel(
     tile+=group;
   }
 }
 )kernel";
+      sources.compute = compute.str();
+    }
     std::ostringstream writer;
     writer << common << R"kernel(
 // Private writer scratch: never aliases the concurrently running reader.
@@ -1937,13 +2081,13 @@ void kernel_main() {
 )kernel"
       << "uint32_t valid_m=" << m << "u-m_base; if(valid_m>32) valid_m=32;\n"
       << "uint32_t valid_n=" << n << "u-n_base; if(valid_n>32) valid_n=32;\n"
-      << "out.wait_front(1);\n"
+      << mark(kWrOutWait) << "out.wait_front(1);\n" << mark(kWrOutCopy)
       << "auto packed=reinterpret_cast<volatile tt_l1_ptr float*>(out.get_read_ptr());\n"
       << "for(uint32_t row=0;row<valid_m;++row) for(uint32_t col=0;col<valid_n;++col) {\n"
       << "uint32_t m=m_base+row,n=n_base+col; float value=packed[face_index(row,col)];\n"
-      << epilogue << "acc[row*32+col]=value;\n}\n";
+      << epilogue << "acc[row*32+col]=value;\n}\n" << mark(kWrOutIssue);
     emitNativeOutputStores(writer, *tensors[2]);
-    writer << "out.pop_front(1);\n}\n}\n";
+    writer << mark(kWrOther) << "out.pop_front(1);\n}\n}\n";
     sources.writer = writer.str();
     if (sfpu) {
       auto v22 = sfpuEpilogueSources(common, tensors, *sfpu, m, n, reuse ? 2u : 1u,
@@ -1952,6 +2096,9 @@ void kernel_main() {
       sources.writer = std::move(v22.writer);
       sources.sfpuEpilogue = true;
     }
+    sources.reader = withPhases(std::move(sources.reader), kReaderPhases);
+    sources.compute = withPhases(std::move(sources.compute), kComputePhases);
+    sources.writer = withPhases(std::move(sources.writer), kWriterPhases);
     return sources;
   }
   auto sources = generateNativeSourcesImpl(geometry, false, tensors, &epilogue);
@@ -2107,11 +2254,15 @@ void kernel_main() {
            << "const uint32_t first=tile*" << perTile << "u;\n"
            << "uint32_t n=" << total << "u-first; if(n>" << perTile
            << "u) n=" << perTile << "u;\n"
-           << R"kernel(out.wait_front(1);
+           << mark(kWrOutWait) << R"kernel(out.wait_front(1);
+)kernel" << mark(kWrOutCopy) << R"kernel(
 const uint32_t byte=byte_2(first,0,0,0), window=windows+byte%64u;
 store_hi16(out.get_read_ptr(),window,n);
+)kernel" << mark(kWrOutIssue) << R"kernel(
 write_bytes(window,output,byte,n*2u);
+)kernel" << mark(kWrOutNocWait) << R"kernel(
 noc_async_write_barrier();
+)kernel" << mark(kWrOther) << R"kernel(
 out.pop_front(1);
 }
 }
@@ -2145,12 +2296,17 @@ for(uint32_t tile=begin;tile<begin+count;++tile) {
 )kernel" << "  uint32_t n=" << out->shape[0]
            << "u-first; if(n>1024u) n=1024u;\n" << R"kernel(
   const uint32_t byte=byte_0(first,0,0,0), ptr=stage+128u+byte%64u;
+)kernel" << mark(kRdNocIssue) << R"kernel(
   read_bytes(input,byte,ptr,n*2u);
+)kernel" << mark(kRdNocWait) << R"kernel(
   noc_async_read_barrier();
+)kernel" << mark(kRdCbWait) << R"kernel(
   operand.reserve_back(1);
+)kernel" << mark(kRdTile) << R"kernel(
   auto s=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptr);
   auto d=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(operand.get_write_ptr());
   for(uint32_t e=0;e<n;++e) d[e]=(uint32_t(s[e])<<16)|lo;
+)kernel" << mark(kRdOther) << R"kernel(
   operand.push_back(1);
 }
 }
@@ -2190,7 +2346,8 @@ for(uint32_t tile=begin;tile<begin+count;++tile) {
            << "for(uint32_t tile=begin;tile<begin+count;++tile) {\n"
            << "const uint32_t first=tile*64u;\n"
            << "uint32_t n=" << out->shape[0] << "u-first; if(n>64u) n=64u;\n"
-           << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1);
+           << mark(kRdCbWait) << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1);
+)kernel" << mark(kRdNocIssue) << R"kernel(
 auto d0=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o0.get_write_ptr());
 auto d1=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o1.get_write_ptr());
 auto d2=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o2.get_write_ptr());
@@ -2204,7 +2361,9 @@ for(uint32_t half=0;half<n;half+=32u) {
            << "    ptrs[j]=stage+j*192u+byte%64u;\n"
            << "    read_bytes(input,byte,ptrs[j]," << span << "u);\n"
            << R"kernel(  }
+)kernel" << mark(kRdNocWait) << R"kernel(
   noc_async_read_barrier();
+)kernel" << mark(kRdTile) << R"kernel(
   for(uint32_t j=0;j<m;++j) {
     auto s=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[j]);
     const uint32_t lane=half+j;
@@ -2213,7 +2372,9 @@ for(uint32_t half=0;half<n;half+=32u) {
       reader << "    d" << p / 16 << "[" << 64 * (p % 16) << "u+lane]=uint32_t(s["
              << (p / 7) * row + p % 7 << "u])<<16;\n";
     reader << R"kernel(  }
+)kernel" << mark(kRdNocIssue) << R"kernel(
 }
+)kernel" << mark(kRdOther) << R"kernel(
 o0.push_back(1); o1.push_back(1); o2.push_back(1); o3.push_back(1);
 }
 }
@@ -2282,7 +2443,8 @@ if(get_arg_val<uint32_t>(30)==0) {
            << "const uint32_t first=tile*" << perTile << "u;\n"
            << "uint32_t rows=" << rows << "u-first; if(rows>" << perTile
            << "u) rows=" << perTile << "u;\n"
-           << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1); o4.reserve_back(1);
+           << mark(kRdCbWait) << R"kernel(o0.reserve_back(1); o1.reserve_back(1); o2.reserve_back(1); o3.reserve_back(1); o4.reserve_back(1);
+)kernel" << mark(kRdNocIssue) << R"kernel(
 auto d0=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o0.get_write_ptr());
 auto d1=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o1.get_write_ptr());
 auto d2=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o2.get_write_ptr());
@@ -2290,9 +2452,12 @@ auto d3=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o3.get_write_ptr());
 auto d4=reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o4.get_write_ptr());
 issue(first,0);
 for(uint32_t r=0;r<rows;++r) {
+)kernel" << mark(kRdNocWait) << R"kernel(
   noc_async_read_barrier();
+)kernel" << mark(kRdNocIssue) << R"kernel(
   const uint32_t buffer=r&1u;
   if(r+1u<rows) issue(first+r+1u,buffer^1u);
+)kernel" << mark(kRdTile) << R"kernel(
   auto a=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][0]);
   auto b=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][1]);
   auto c=reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ptrs[buffer][2]);
@@ -2306,6 +2471,7 @@ for(uint32_t r=0;r<rows;++r) {
     d4[e]=uint32_t(c[x+2u])<<16;
   }
 }
+)kernel" << mark(kRdOther) << R"kernel(
 o0.push_back(1); o1.push_back(1); o2.push_back(1); o3.push_back(1); o4.push_back(1);
 }
 }
@@ -2314,18 +2480,24 @@ o0.push_back(1); o1.push_back(1); o2.push_back(1); o3.push_back(1); o4.push_back
            << "const uint32_t first=tile*" << perTile << "u;\n"
            << "uint32_t rows=" << rows << "u-first; if(rows>" << perTile
            << "u) rows=" << perTile << "u;\n"
-           << R"kernel(out.wait_front(1);
+           << mark(kWrOutWait) << R"kernel(out.wait_front(1);
+)kernel" << mark(kWrOutCopy) << R"kernel(
 const uint32_t src=out.get_read_ptr();
 uint32_t cursor=windows;
 for(uint32_t r=0;r<rows;++r) {
   const uint32_t g=first+r;
 )kernel" << "  const uint32_t byte=byte_2(" << rowCoords("g%" + std::to_string(height) + "u") << ");\n"
            << "  uint32_t window=cursor+byte%64u;\n"
-           << "  if(window+" << width * 2 << "u>windows+4032u) { noc_async_write_barrier(); cursor=windows; window=cursor+byte%64u; }\n"
+           << "  if(window+" << width * 2 << "u>windows+4032u) {\n" << mark(kWrOutNocWait)
+           << "noc_async_write_barrier(); cursor=windows; window=cursor+byte%64u; }\n"
+           << mark(kWrOutCopy)
            << "  store_hi16(src+r*" << width * 4 << "u,window," << width << "u);\n"
+           << mark(kWrOutIssue)
            << "  write_bytes(window,output,byte," << width * 2 << "u);\n"
            << "  cursor=(window+" << width * 2 << "u+63u)&~63u;\n" << R"kernel(}
+)kernel" << mark(kWrOutNocWait) << R"kernel(
 noc_async_write_barrier();
+)kernel" << mark(kWrOther) << R"kernel(
 out.pop_front(1);
 }
 }
@@ -2354,29 +2526,35 @@ void kernel_main() {
   CircularBuffer out(tt::CBIndex::c_16);
   compute_kernel_hw_startup(26,tt::CBIndex::c_16);
   for(uint32_t tile=0;tile<tiles;++tile) {
+)kernel" << mark(kCmpDstWait) << R"kernel(
     tile_regs_acquire();
+)kernel" << mark(kCmpOther) << R"kernel(
 )kernel";
+  c << mark(kCmpOperand);
   for (unsigned i = 0; i < operandTiles; ++i)
     c << "    {\n      CircularBuffer operand(" << 26 + i << ");\n"
       << "      copy_tile_to_dst_init_short(" << 26 + i << ");\n"
-      << "      operand.wait_front(1);\n"
+      << mark(kCmpCbWait) << "      operand.wait_front(1);\n" << mark(kCmpOperand)
       << "      copy_tile(" << 26 + i << ",0," << 1 + i << ");\n"
       << "      operand.pop_front(1);\n    }\n";
-  c << "    MATH((SFPU_BINARY_INIT(unused)));\n"
+  c << mark(kCmpSfpu) << "    MATH((SFPU_BINARY_INIT(unused)));\n"
     << "    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE,\n"
     << "        tt_iree_vector, 0, 1, 0, VectorMode::" << (perFace ? "RC" : "None")
-    << ")));\n" << R"kernel(    tile_regs_commit(); tile_regs_wait();
+    << ")));\n" << mark(kCmpDstWait) << R"kernel(    tile_regs_commit(); tile_regs_wait();
+)kernel" << mark(kCmpOutWait) << R"kernel(
     out.reserve_back(1);
+)kernel" << mark(kCmpPack) << R"kernel(
     pack_tile(0,tt::CBIndex::c_16);
     out.push_back(1);
     tile_regs_release();
+)kernel" << mark(kCmpOther) << R"kernel(
   }
 }
 )kernel";
   TenstorrentNativeSources sources;
-  sources.reader = reader.str();
-  sources.writer = writer.str();
-  sources.compute = c.str();
+  sources.reader = withPhases(reader.str(), kReaderPhases);
+  sources.writer = withPhases(writer.str(), kWriterPhases);
+  sources.compute = withPhases(c.str(), kComputePhases);
   sources.sfpuEpilogue = true;
   return sources;
 }

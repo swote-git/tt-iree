@@ -769,10 +769,12 @@ iree_hal_tt_create_kernel_from_embedded_precompiled(
     tt::tt_metal::Program &program, const std::string &source,
     const CoreSpec &core_spec, const KernelConfig &config,
     const std::string &artifact_root) {
+  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
+    return tt::tt_metal::CreateKernelFromString(
+        program, iree::hal::tenstorrent::ProfiledKernelSource(source),
+        core_spec, config);
   tt::tt_metal::KernelHandle kernel =
       tt::tt_metal::CreateKernelFromString(program, source, core_spec, config);
-  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
-    return kernel;
   program.impl().get_kernel(kernel)->set_precompiled_config(
       tt::tt_metal::experimental::PrecompiledKernelConfig{
           .precompiled_dir = artifact_root,
@@ -1004,6 +1006,9 @@ static iree_status_t iree_hal_tt_execute_tiled_matmul_host_matrices(
     stage_start_ns =
         profile_stages ? iree::hal::tenstorrent::RuntimeProfiler::NowNs() : 0;
     tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
+    program.set_runtime_id(iree::hal::tenstorrent::NextProgramRuntimeId());
+    if (profile_stages)
+      profile_stages->device_run_id = program.get_runtime_id();
     tt::tt_metal::CoreRange all_cores({0, 0},
                                       {num_cores_c - 1, num_cores_r - 1});
     tt::tt_metal::CoreRangeSet all_core_set(
@@ -1624,6 +1629,9 @@ static iree_status_t iree_hal_tt_execute_f32_padded_copy_dispatch_device(
   try {
     tt::tt_metal::SetRuntimeArgs(*program, params->reader_kernel_id,
                                  tt::tt_metal::CoreCoord{0, 0}, runtime_args);
+    program->set_runtime_id(iree::hal::tenstorrent::NextProgramRuntimeId());
+    if (profile_stages)
+      profile_stages->device_run_id = program->get_runtime_id();
     tt::tt_metal::distributed::MeshWorkload workload;
     auto device_range = tt::tt_metal::distributed::MeshCoordinateRange(
         device->mesh_device->shape());
@@ -2114,6 +2122,9 @@ static iree_status_t iree_hal_tt_execute_device_native_f32_matmul_like_dispatch(
     uint64_t stage_start_ns =
         profile_stages ? iree::hal::tenstorrent::RuntimeProfiler::NowNs() : 0;
     tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
+    program.set_runtime_id(iree::hal::tenstorrent::NextProgramRuntimeId());
+    if (profile_stages)
+      profile_stages->device_run_id = program.get_runtime_id();
     tt::tt_metal::CoreRange all_cores({0, 0},
                                       {num_cores_c - 1, num_cores_r - 1});
     tt::tt_metal::CoreRangeSet all_core_set(

@@ -27,6 +27,9 @@ struct RuntimeProfileStages {
   uint64_t download_ns = 0;
   uint64_t unpack_ns = 0;
   uint64_t output_staging_ns = 0;
+  // Runtime id of the device program, i.e. "run host ID" in tt-metal's
+  // profile_log_device.csv; 0 when the dispatch launched no program.
+  uint64_t device_run_id = 0;
 };
 
 struct RuntimeProfileRecord {

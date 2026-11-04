@@ -29,7 +29,7 @@ constexpr char kOperationsHeader[] =
     "UPLOAD DURATION [ns],IREE PROGRAM SETUP DURATION [ns],IREE ENQUEUE "
     "WAIT DURATION [ns],IREE DOWNLOAD DURATION [ns],IREE UNPACK DURATION "
     "[ns],IREE OUTPUT STAGING DURATION [ns],IREE INVOCATION ID,"
-    "IREE SUBMISSION ID,IREE COMMAND ORDINAL\n";
+    "IREE SUBMISSION ID,IREE COMMAND ORDINAL,IREE DEVICE RUN ID\n";
 
 constexpr char kTransfersHeader[] =
     "OPERATION,INVOCATION ID,SUBMISSION ID,COMMAND ORDINAL,WITHIN DISPATCH,"
@@ -286,7 +286,7 @@ RuntimeProfiler::AppendOperationLocked(const RuntimeProfileRecord &record) {
          << ',' << record.stages.unpack_ns << ','
          << record.stages.output_staging_ns << ',' << record.invocation_id
          << ',' << record.submission_id << ',' << record.command_ordinal
-         << '\n';
+         << ',' << record.stages.device_run_id << '\n';
   return CheckOutputStream(output, path);
 }
 

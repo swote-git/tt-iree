@@ -1225,10 +1225,12 @@ iree_hal_tt_create_kernel_from_embedded_precompiled(
     tt::tt_metal::Program &program, const std::string &source,
     const CoreSpec &core_spec, const KernelConfig &config,
     const std::string &artifact_root) {
+  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
+    return tt::tt_metal::CreateKernelFromString(
+        program, iree::hal::tenstorrent::ProfiledKernelSource(source),
+        core_spec, config);
   tt::tt_metal::KernelHandle kernel =
       tt::tt_metal::CreateKernelFromString(program, source, core_spec, config);
-  if (!iree::hal::tenstorrent::UsePrecompiledKernels())
-    return kernel;
   program.impl().get_kernel(kernel)->set_precompiled_config(
       tt::tt_metal::experimental::PrecompiledKernelConfig{
           .precompiled_dir = artifact_root,

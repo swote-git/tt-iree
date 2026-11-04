@@ -5,6 +5,7 @@
 #define IREE_HAL_DRIVERS_TENSTORRENT_TT_DEVICE_PROFILER_H_
 
 #include <cstdint>
+#include <string>
 
 namespace tt::tt_metal::distributed {
 class MeshDevice;
@@ -28,6 +29,13 @@ bool UsePrecompiledKernels();
 // Unique per-program id so profiler rows ("run host ID") separate dispatches;
 // tt-metal otherwise reports 0 for every freshly created program.
 uint64_t NextProgramRuntimeId();
+
+// Phase markers in generated kernels (TT_IREE_KERNEL_PHASES=1 while device
+// profiling): each RISC records per-phase cycle totals as "TTIREE <phase>"
+// markers. Returns the source to JIT-build, with TT_IREE_KERNEL_PHASES defined
+// when enabled.
+bool KernelPhasesEnabled();
+std::string ProfiledKernelSource(const std::string &source);
 
 // Drains device profiler buffers. Call after each blocking program so the
 // per-core buffers cannot overflow between reads.

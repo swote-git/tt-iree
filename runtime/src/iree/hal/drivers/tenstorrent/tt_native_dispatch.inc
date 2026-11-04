@@ -99,6 +99,8 @@ static iree_status_t iree_hal_tt_execute_native_descriptor(
         stages ? iree::hal::tenstorrent::RuntimeProfiler::NowNs() : 0;
     auto program = tt::tt_metal::CreateProgram();
     program.set_runtime_id(iree::hal::tenstorrent::NextProgramRuntimeId());
+    if (stages)
+      stages->device_run_id = program.get_runtime_id();
     tt::tt_metal::CoreRange range({0, 0}, {cols - 1, rows - 1});
     tt::tt_metal::CoreRangeSet cores(std::set<tt::tt_metal::CoreRange>{range});
     auto cb = [&](uint8_t index, tt::DataFormat format, uint32_t page,

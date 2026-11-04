@@ -152,6 +152,11 @@ if(Python3_Interpreter_FOUND)
       ${_TT_TRANSFER_ANALYSIS_ARGS})
   set_tests_properties(tt_runtime_transfer_analysis_test PROPERTIES
     LABELS "tt-iree;unit;profiling")
+  add_test(NAME tt_device_profile_analysis_test
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_profile_analysis_test.py")
+  set_tests_properties(tt_device_profile_analysis_test PROPERTIES
+    LABELS "tt-iree;unit;profiling")
   if(NOT TT_IREE_ENABLE_MOCK)
     add_test(NAME tt_device_fill_profile_test
       COMMAND "${Python3_EXECUTABLE}"

@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <string>
 
 namespace {
 using mlir::iree_compiler::IREE::HAL::generateNativeSources;
@@ -134,13 +136,56 @@ TEST(NativeKernelTest, Bf16TensixUsesThreeRolesAndKeepsKInDst) {
   EXPECT_TRUE(Has(sources.reader, "m_start=get_arg_val<uint32_t>(28)"));
   EXPECT_FALSE(Has(sources.reader, "value += a[row*32+inner]"));
   EXPECT_TRUE(Has(sources.compute, "matmul_tiles(tt::CBIndex::c_0,tt::CBIndex::c_1,0,0,0)"));
-  EXPECT_TRUE(Has(sources.compute, "tile_regs_acquire();\n    for(uint32_t block"));
+  EXPECT_TRUE(Has(sources.compute,
+                  "tile_regs_acquire();\nTT_PHASE(0u);\n\n    for(uint32_t block"));
   EXPECT_EQ(Count(sources.compute, "pack_tile("), 1u);
   EXPECT_FALSE(Has(sources.compute, "copy_tile("));
   EXPECT_TRUE(Has(sources.writer, "scratch_cb(tt::CBIndex::c_3)"));
   EXPECT_TRUE(Has(sources.writer, "packed[face_index(row,col)]"));
   EXPECT_TRUE(Has(sources.writer, "value=round_bf16(value)"));
   EXPECT_TRUE(Has(sources.writer, "byte_2(n,m,0,0),chunk,128u)"));
+}
+
+// Phase marks reference only declared phases and compile away unless the
+// runtime JIT-builds for the device profiler with TT_IREE_KERNEL_PHASES.
+void ExpectPhaseMarks(const std::string &source, const char *prefix,
+                      size_t phases) {
+  EXPECT_TRUE(Has(source,
+                  "#if defined(PROFILE_KERNEL) && defined(TT_IREE_KERNEL_PHASES)"));
+  EXPECT_TRUE(Has(source, "#define TT_PHASE(p) (void)0"));
+  EXPECT_TRUE(Has(source, "void kernel_main() {\n  TT_PHASES;"));
+  EXPECT_EQ(Count(source, std::string("DeviceTimestampedData(\"TTIREE ") + prefix),
+            phases);
+  size_t marks = 0;
+  for (size_t pos = 0; (pos = source.find("TT_PHASE(", pos)) != std::string::npos;
+       ++pos) {
+    const size_t digits = pos + 9;
+    if (!std::isdigit(static_cast<unsigned char>(source[digits])))
+      continue;
+    EXPECT_LT(std::stoul(source.substr(digits)), phases);
+    ++marks;
+  }
+  EXPECT_GT(marks, 2u);
+}
+
+TEST(NativeKernelTest, Bf16TensixKernelsMarkPhasesForTheDeviceProfiler) {
+  auto ep = Projection();
+  auto a = ep.matmul_like.lhs, b = ep.matmul_like.rhs, o = ep.matmul_like.output;
+  a.element_type = b.element_type = o.element_type = TT_IREE_TTEX_TENSOR_ELEMENT_TYPE_BF16;
+  const tt_iree_ttex_tensor_desc_t *t[TT_IREE_BF16_NATIVE_TENSOR_COUNT] = {&a, &b, &o};
+  // v18 writer epilogue.
+  auto v18 = generateBF16NativeMatrix(ep, t, "value=round_bf16(value);\n", true);
+  ExpectPhaseMarks(v18.reader, "rd.", 6);
+  ExpectPhaseMarks(v18.compute, "cmp.", 9);
+  ExpectPhaseMarks(v18.writer, "wr.", 9);
+  // v22 SFPU epilogue with the flipped (out^T = W x X^T) reader.
+  mlir::iree_compiler::IREE::HAL::TenstorrentSfpuEpilogue sfpu;
+  auto v22 = generateBF16NativeMatrix(ep, t, "", true, true, false, &sfpu);
+  ASSERT_TRUE(v22.sfpuEpilogue);
+  EXPECT_TRUE(Has(v22.reader, "put_row("));
+  ExpectPhaseMarks(v22.reader, "rd.", 6);
+  ExpectPhaseMarks(v22.compute, "cmp.", 9);
+  ExpectPhaseMarks(v22.writer, "wr.", 9);
 }
 
 TEST(NativeKernelTest, Bf16PrefetchRetainsArithmeticAndExistingScratchABI) {

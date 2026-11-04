@@ -4,6 +4,8 @@
 #include "iree/hal/drivers/tenstorrent/tt_device_profiler.h"
 
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 #include "impl/profiler/profiler_state.hpp"
 #include "tt-metalium/host_api.hpp"
@@ -18,6 +20,20 @@ bool UsePrecompiledKernels() { return !DeviceProfilerEnabled(); }
 uint64_t NextProgramRuntimeId() {
   static std::atomic<uint64_t> next{1};
   return next.fetch_add(1);
+}
+
+bool KernelPhasesEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("TT_IREE_KERNEL_PHASES");
+    return value && *value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled && DeviceProfilerEnabled();
+}
+
+std::string ProfiledKernelSource(const std::string &source) {
+  if (!KernelPhasesEnabled())
+    return source;
+  return "#define TT_IREE_KERNEL_PHASES 1\n" + source;
 }
 
 void ReadDeviceProfiler(tt::tt_metal::distributed::MeshDevice *mesh_device) {

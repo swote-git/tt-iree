@@ -92,6 +92,8 @@ TEST(RuntimeProfilerTest, WritesComparableOperationAndCoreMetrics) {
   const std::string operations =
       ReadFile(output_directory / "ops_perf_results.csv");
   EXPECT_NE(operations.find("DEVICE KERNEL DURATION [ns]"), std::string::npos);
+  // Joins rows with TT-Metal's device log ("run host ID").
+  EXPECT_NE(operations.find(",IREE DEVICE RUN ID\n"), std::string::npos);
   EXPECT_NE(operations.find("IREE ENQUEUE WAIT DURATION [ns]"),
             std::string::npos);
   EXPECT_NE(operations.find("IREE INPUT STAGING DURATION [ns]"),
@@ -323,7 +325,7 @@ TEST(RuntimeProfilerTest, RestoresContextAndPreservesTransferFailure) {
   }
   IREE_ASSERT_OK(profiler.Flush());
   const auto operations = ReadFile(directory / "ops_perf_results.csv");
-  EXPECT_NE(operations.find(",2,1,4\n"), std::string::npos);
+  EXPECT_NE(operations.find(",2,1,4,0\n"), std::string::npos);
   const auto transfers = ReadFile(directory / "transfer_perf_results.csv");
   EXPECT_NE(transfers.find("MAP,2,1,4,1,"), std::string::npos);
   EXPECT_NE(transfers.find(",11,invoke,0\n"),
